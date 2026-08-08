@@ -12,7 +12,7 @@ struct PairingScannerView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var cameraError: CameraError?
 
-    let onPairingCode: (String) -> Void
+    let onPairingCode: (HomeBaseEndpoint) -> Void
 
     var body: some View {
         ZStack {
@@ -27,11 +27,11 @@ struct PairingScannerView: View {
                 .foregroundStyle(.white)
             } else {
                 QRCodeScanner(cameraError: $cameraError) { payload in
-                    guard let address = HomeBasePairingCode.address(from: payload) else {
+                    guard let endpoint = HomeBasePairingCode.endpoint(from: payload) else {
                         return
                     }
 
-                    onPairingCode(address)
+                    onPairingCode(endpoint)
                 }
                 .ignoresSafeArea()
 
@@ -197,7 +197,7 @@ private final class QRCodeScannerViewController: UIViewController, AVCaptureMeta
         for case let code as AVMetadataMachineReadableCodeObject in metadataObjects {
             guard code.type == .qr,
                   let payload = code.stringValue,
-                  HomeBasePairingCode.address(from: payload) != nil else {
+                  HomeBasePairingCode.endpoint(from: payload) != nil else {
                 continue
             }
 

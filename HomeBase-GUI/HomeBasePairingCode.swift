@@ -8,21 +8,21 @@ import Foundation
 enum HomeBasePairingCode {
     static let scheme = "homebasews"
 
-    static func address(from payload: String) -> String? {
+    static func endpoint(from payload: String) -> HomeBaseEndpoint? {
         guard let url = URL(string: payload) else {
             return nil
         }
 
-        return address(from: url)
+        return endpoint(from: url)
     }
 
-    static func address(from url: URL) -> String? {
+    static func endpoint(from url: URL) -> HomeBaseEndpoint? {
         guard url.scheme?.lowercased() == scheme,
               let host = url.host,
-              !host.isEmpty else {
+              let port = url.port else {
             return nil
         }
 
-        return host
+        return HomeBaseEndpoint(host: host, port: port)
     }
 }

@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		E2CD710130269489002FCE2D /* HomeBaseProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = E2CD710330269489002FCE2D /* HomeBaseProtocol */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		E2CD70F130269489002FCE2D /* HomeBase-GUI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "HomeBase-GUI.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -36,6 +40,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				E2CD710130269489002FCE2D /* HomeBaseProtocol in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -78,6 +83,7 @@
 			);
 			name = "HomeBase-GUI";
 			packageProductDependencies = (
+				E2CD710330269489002FCE2D /* HomeBaseProtocol */,
 			);
 			productName = "HomeBase-GUI";
 			productReference = E2CD70F130269489002FCE2D /* HomeBase-GUI.app */;
@@ -107,6 +113,9 @@
 			);
 			mainGroup = E2CD70E830269489002FCE2D;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				E2CD710230269489002FCE2D /* XCLocalSwiftPackageReference "../HomeBase/HomeBaseProtocol" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = E2CD70F230269489002FCE2D /* Products */;
 			projectDirPath = "";
@@ -364,6 +373,21 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		E2CD710230269489002FCE2D /* XCLocalSwiftPackageReference "../HomeBase/HomeBaseProtocol" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../HomeBase/HomeBaseProtocol;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		E2CD710330269489002FCE2D /* HomeBaseProtocol */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = E2CD710230269489002FCE2D /* XCLocalSwiftPackageReference "../HomeBase/HomeBaseProtocol" */;
+			productName = HomeBaseProtocol;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = E2CD70E930269489002FCE2D /* Project object */;
 }

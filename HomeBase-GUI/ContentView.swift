@@ -8,19 +8,19 @@
 import SwiftUI
 
 struct ContentView: View {
+    @EnvironmentObject private var serverStore: PairedServerStore
+
     @State private var isShowingScanner = false
-    @State private var pendingPairingAddress: String?
-    @State private var pairingAddress: PairingAddress?
+    @State private var pendingPairingNotice: PairingNotice?
+    @State private var pairingNotice: PairingNotice?
 
     var body: some View {
         NavigationStack {
-            ContentUnavailableView {
-                Label("No Paired Servers", systemImage: "server.rack")
-            } description: {
-                Text("Scan a HomeBase pairing code to add a server.")
-            } actions: {
-                Button("Pair a Server", systemImage: "qrcode.viewfinder") {
-                    isShowingScanner = true
+            Group {
+                if serverStore.servers.isEmpty {
+                    emptyState
+                } else {
+                    serverList
                 }
             }
             .navigationTitle("Servers")
@@ -33,49 +33,105 @@ struct ContentView: View {
             }
         }
 #if os(iOS)
-        .fullScreenCover(isPresented: $isShowingScanner, onDismiss: scannerDidDismiss) {
-            PairingScannerView { address in
-                receivePairingAddress(address, dismissingScanner: true)
+        .fullScreenCover(
+            isPresented: $isShowingScanner,
+            onDismiss: scannerDidDismiss
+        ) {
+            PairingScannerView { endpoint in
+                receivePairingEndpoint(
+                    endpoint,
+                    dismissingScanner: true
+                )
             }
         }
 #endif
         .onOpenURL { url in
-            guard let address = HomeBasePairingCode.address(from: url) else {
+            guard let endpoint = HomeBasePairingCode.endpoint(from: url) else {
                 return
             }
 
-            receivePairingAddress(address, dismissingScanner: isShowingScanner)
+            receivePairingEndpoint(
+                endpoint,
+                dismissingScanner: isShowingScanner
+            )
         }
-        .alert(item: $pairingAddress) { pairingAddress in
+        .alert(item: $pairingNotice) { notice in
             Alert(
                 title: Text("HomeBase Server Found"),
-                message: Text(pairingAddress.value),
+                message: Text(notice.server.endpoint.host),
                 dismissButton: .default(Text("OK"))
             )
         }
     }
 
-    private func scannerDidDismiss() {
-        guard let pendingPairingAddress else { return }
-        self.pendingPairingAddress = nil
-        pairingAddress = PairingAddress(value: pendingPairingAddress)
+    private var emptyState: some View {
+        ContentUnavailableView {
+            Label("No Paired Servers", systemImage: "server.rack")
+        } description: {
+            Text("Scan a HomeBase pairing code to add a server.")
+        } actions: {
+            Button("Pair a Server", systemImage: "qrcode.viewfinder") {
+                isShowingScanner = true
+            }
+        }
     }
 
-    private func receivePairingAddress(_ address: String, dismissingScanner: Bool) {
+    private var serverList: some View {
+        List {
+            ForEach(serverStore.servers) { server in
+                NavigationLink {
+                    ServerDetailView(server: server)
+                } label: {
+                    Label {
+                        VStack(alignment: .leading) {
+                            Text(server.endpoint.host)
+                            Text("Port \(server.endpoint.port)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "server.rack")
+                    }
+                }
+            }
+            .onDelete(perform: serverStore.remove)
+
+            if let persistenceError = serverStore.persistenceError {
+                Section {
+                    Label(persistenceError, systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+    }
+
+    private func scannerDidDismiss() {
+        guard let pendingPairingNotice else { return }
+        self.pendingPairingNotice = nil
+        pairingNotice = pendingPairingNotice
+    }
+
+    private func receivePairingEndpoint(
+        _ endpoint: HomeBaseEndpoint,
+        dismissingScanner: Bool
+    ) {
+        let notice = PairingNotice(server: serverStore.add(endpoint))
         if dismissingScanner {
-            pendingPairingAddress = address
+            pendingPairingNotice = notice
             isShowingScanner = false
         } else {
-            pairingAddress = PairingAddress(value: address)
+            pairingNotice = notice
         }
     }
 }
 
-private struct PairingAddress: Identifiable {
+private struct PairingNotice: Identifiable {
     let id = UUID()
-    let value: String
+    let server: PairedServer
 }
 
 #Preview {
     ContentView()
+        .environmentObject(PairedServerStore())
 }

@@ -1,0 +1,1221 @@
+//
+//  HomeBaseWebSocketClient.swift
+//  HomeBase-GUI
+//
+
+import Foundation
+import HomeBaseProtocol
+import OSLog
+
+actor HomeBaseWebSocketClient {
+    struct ControlSubscription: Sendable {
+        let identifier: UUID
+        let controls: [HBControlWatchStreamControl]
+        let events: AsyncThrowingStream<HBControlWatchStreamEvent, Error>
+    }
+
+    struct SceneSubscription: Sendable {
+        let identifier: UUID
+        let scenes: [HBSceneStateResult]
+        let events: AsyncThrowingStream<HBSceneWatchStreamEvent, Error>
+    }
+
+    enum ClientError: Error, LocalizedError {
+        case invalidEndpoint
+        case notConnected
+        case invalidMessage(String)
+        case invalidDeliverySequence(expected: Int64, received: Int64)
+        case subscriptionEnded(String)
+        case resynchronizationRequired(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidEndpoint:
+                "The saved HomeBase endpoint is invalid."
+            case .notConnected:
+                "The HomeBase server is not connected."
+            case .invalidMessage(let reason):
+                "The HomeBase server sent an invalid message: \(reason)"
+            case .invalidDeliverySequence(let expected, let received):
+                "The HomeBase message stream skipped from sequence \(expected) to \(received)."
+            case .subscriptionEnded(let reason):
+                "The HomeBase subscription ended: \(reason)"
+            case .resynchronizationRequired(let reason):
+                "The HomeBase session must be rebuilt: \(reason)"
+            }
+        }
+    }
+
+    private static let webSocketSubprotocol = "homebase.v2"
+    private static let maximumBufferedSubscriptionEvents = 4_096
+    private static let controlWriteLogger = Logger(
+        subsystem: "io.pjb.HomeBase-GUI",
+        category: "ControlWrite"
+    )
+    private static let connectionLogger = Logger(
+        subsystem: "io.pjb.HomeBase-GUI",
+        category: "Connection"
+    )
+
+    private let endpoint: HomeBaseEndpoint
+    private let clientID: UUID
+    private let urlSession: URLSession
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+
+    private var task: URLSessionWebSocketTask?
+    private var connectionAttempt: Task<Void, Error>?
+    private var sessionID: UUID?
+    private var resumeToken: String?
+    private var serverInstanceID: UUID?
+    private var receiveTask: Task<Void, Never>?
+    private var acknowledgementTask: Task<Void, Never>?
+    private var pendingResponses: [
+        UUID: CheckedContinuation<HBProtocolEnvelope, Error>
+    ] = [:]
+    private var activeSubscriptions: Set<UUID> = []
+    private var abandonedSubscriptions: Set<UUID> = []
+    private var controlSubscriptionContinuations: [
+        UUID: AsyncThrowingStream<HBControlWatchStreamEvent, Error>.Continuation
+    ] = [:]
+    private var bufferedControlSubscriptionEvents: [
+        UUID: [HBControlWatchStreamEvent]
+    ] = [:]
+    private var sceneSubscriptionContinuations: [
+        UUID: AsyncThrowingStream<HBSceneWatchStreamEvent, Error>.Continuation
+    ] = [:]
+    private var bufferedSceneSubscriptionEvents: [
+        UUID: [HBSceneWatchStreamEvent]
+    ] = [:]
+    private var subscriptionSequences: [UUID: Int64] = [:]
+    private var latestDeliverySequence: Int64 = 0
+    private var acknowledgedDeliverySequence: Int64 = 0
+
+    init(
+        endpoint: HomeBaseEndpoint,
+        clientID: UUID = UUID(),
+        urlSession: URLSession = .shared
+    ) {
+        self.endpoint = endpoint
+        self.clientID = clientID
+        self.urlSession = urlSession
+    }
+
+    deinit {
+        connectionAttempt?.cancel()
+        receiveTask?.cancel()
+        acknowledgementTask?.cancel()
+        task?.cancel(with: .goingAway, reason: nil)
+    }
+
+    func connect() async throws {
+        if let connectionAttempt {
+            try await connectionAttempt.value
+            return
+        }
+        if sessionID != nil, task != nil {
+            return
+        }
+
+        let attempt = Task { [weak self] in
+            guard let self else {
+                throw ClientError.notConnected
+            }
+            try await self.establishConnection()
+        }
+        connectionAttempt = attempt
+        do {
+            try await attempt.value
+            connectionAttempt = nil
+        } catch {
+            connectionAttempt = nil
+            throw error
+        }
+    }
+
+    func reactivate() async throws {
+        if connectionAttempt != nil {
+            try await connect()
+            return
+        }
+
+        if task != nil, sessionID != nil {
+            do {
+                let request = try sessionRequest(
+                    operation: HBProtocolOperations.ping
+                )
+                let response = try await sendRequest(request)
+                let body = try response.decodedPayload(
+                    as: HBProtocolResponse.self
+                )
+                try body.validate()
+                if let error = body.error {
+                    throw error
+                }
+                guard body.status == .success else {
+                    throw ClientError.invalidMessage(
+                        "a connection check failed without an error"
+                    )
+                }
+                Self.logConnection("existing session is active")
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                if task != nil {
+                    failConnection(with: error)
+                }
+            }
+        }
+
+        try await connect()
+    }
+
+    private func establishConnection() async throws {
+        if sessionID != nil, task != nil {
+            return
+        }
+        guard task == nil else {
+            throw ClientError.invalidMessage(
+                "a WebSocket session is already being opened"
+            )
+        }
+        guard let url = endpoint.webSocketURL else {
+            throw ClientError.invalidEndpoint
+        }
+
+        if let sessionID,
+           let resumeToken,
+           let serverInstanceID {
+            do {
+                let task = startWebSocketTask(with: url)
+                try await resumeSession(
+                    sessionID: sessionID,
+                    resumeToken: resumeToken,
+                    serverInstanceID: serverInstanceID,
+                    using: task
+                )
+                try await cancelAbandonedSubscriptions()
+                Self.logConnection("session resumed")
+                return
+            } catch is CancellationError {
+                failConnection(
+                    with: CancellationError(),
+                    preservingSession: false
+                )
+                throw CancellationError()
+            } catch {
+                guard shouldRebuildSession(after: error) else {
+                    if task != nil {
+                        failConnection(
+                            with: error,
+                            preservingSession: true
+                        )
+                    }
+                    throw error
+                }
+                Self.logConnection(
+                    "session resume was rejected; opening a fresh session"
+                )
+                failConnection(with: error, preservingSession: false)
+            }
+        } else if sessionID != nil {
+            // A partial resume state is not usable. Rebuild from a clean
+            // session rather than attaching new work to uncertain state.
+            failConnection(
+                with: ClientError.notConnected,
+                preservingSession: false
+            )
+        }
+
+        do {
+            let task = startWebSocketTask(with: url)
+            let request = HBProtocolEnvelope(
+                messageKind: .request,
+                clientID: clientID,
+                operation: HBProtocolOperations.openSession
+            )
+            let response = try await sendRequest(request, using: task)
+            let body = try response.decodedPayload(
+                as: HBProtocolResponse.self
+            )
+            let opened = try body.decodedResult(
+                as: HBWebSocketSessionOpened.self
+            )
+            guard response.sessionID == opened.sessionID else {
+                throw ClientError.invalidMessage(
+                    "the opened session identifiers do not match"
+                )
+            }
+            sessionID = opened.sessionID
+            resumeToken = opened.resumeToken
+            serverInstanceID = opened.serverInstanceID
+            Self.logConnection("fresh session opened")
+        } catch {
+            failConnection(with: error, preservingSession: false)
+            throw error
+        }
+    }
+
+    private func startWebSocketTask(
+        with url: URL
+    ) -> URLSessionWebSocketTask {
+        let task = urlSession.webSocketTask(
+            with: url,
+            protocols: [Self.webSocketSubprotocol]
+        )
+        task.maximumMessageSize = 4 * 1_024 * 1_024
+        self.task = task
+        task.resume()
+        startReceiveLoop(using: task)
+        return task
+    }
+
+    private func resumeSession(
+        sessionID: UUID,
+        resumeToken: String,
+        serverInstanceID: UUID,
+        using task: URLSessionWebSocketTask
+    ) async throws {
+        // Every delivery at or below latestDeliverySequence has already been
+        // decoded and applied locally. Advertising that processing checkpoint
+        // prevents the replacement socket from replaying duplicate events.
+        let processingCheckpoint = latestDeliverySequence
+        let request = try HBProtocolEnvelope.request(
+            operation: HBProtocolOperations.resumeSession,
+            clientID: clientID,
+            payload: HBWebSocketSessionResumeRequest(
+                sessionID: sessionID,
+                resumeToken: resumeToken,
+                serverInstanceID: serverInstanceID,
+                acknowledgedDeliverySequence: processingCheckpoint
+            )
+        )
+        let response = try await sendRequest(request, using: task)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let resumed = try body.decodedResult(
+            as: HBWebSocketSessionResumed.self
+        )
+        guard response.sessionID == sessionID,
+              resumed.sessionID == sessionID,
+              resumed.serverInstanceID == serverInstanceID,
+              resumed.latestDeliverySequence >= processingCheckpoint else {
+            throw ClientError.invalidMessage(
+                "the resumed session metadata does not match"
+            )
+        }
+        acknowledgedDeliverySequence = processingCheckpoint
+    }
+
+    private func cancelAbandonedSubscriptions() async throws {
+        for identifier in abandonedSubscriptions.sorted(
+            by: { $0.uuidString < $1.uuidString }
+        ) {
+            guard abandonedSubscriptions.contains(identifier) else {
+                continue
+            }
+            activeSubscriptions.insert(identifier)
+            do {
+                try await cancelSubscription(identifier)
+            } catch let error as HBProtocolError
+                where error.code == HBProtocolErrorCodes.notFound {
+                finishSubscription(identifier)
+            }
+            abandonedSubscriptions.remove(identifier)
+        }
+    }
+
+    func listTopology() async throws -> HBTopologyListResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.listTopology
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        return try body.decodedResult(as: HBTopologyListResult.self)
+    }
+
+    func listScenes() async throws -> [HBSceneDescriptor] {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.listScenes
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        return try body.decodedResult(as: HBSceneListResult.self).scenes
+    }
+
+    func subscribeToScenes() async throws -> SceneSubscription {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.streamScenes,
+            payload: HBSceneWatchStreamRequest(heartbeatSeconds: 30)
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let accepted = try body.decodedResult(
+            as: HBSceneWatchStreamAccepted.self
+        )
+        if let envelopeSubscriptionID = response.subscriptionID,
+           envelopeSubscriptionID != accepted.subscriptionID {
+            throw ClientError.invalidMessage(
+                "the accepted scene subscription identifiers do not match"
+            )
+        }
+
+        let pair = AsyncThrowingStream<
+            HBSceneWatchStreamEvent,
+            Error
+        >.makeStream()
+        let subscriptionID = accepted.subscriptionID
+        activeSubscriptions.insert(subscriptionID)
+        sceneSubscriptionContinuations[subscriptionID] = pair.continuation
+        pair.continuation.onTermination = { @Sendable [weak self] _ in
+            Task {
+                await self?.sceneSubscriptionConsumerTerminated(
+                    subscriptionID
+                )
+            }
+        }
+        if let buffered = bufferedSceneSubscriptionEvents.removeValue(
+            forKey: subscriptionID
+        ) {
+            for event in buffered {
+                pair.continuation.yield(event)
+            }
+        }
+
+        return SceneSubscription(
+            identifier: subscriptionID,
+            scenes: accepted.scenes,
+            events: pair.stream
+        )
+    }
+
+    func setScene(
+        named name: String,
+        active: Bool
+    ) async throws -> HBSceneStateResult {
+        let request = try sessionRequest(
+            operation: active
+                ? HBProtocolOperations.setScene
+                : HBProtocolOperations.clearScene,
+            payload: HBSceneRequest(name: name)
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(as: HBSceneStateResult.self)
+        guard result.name.caseInsensitiveCompare(name) == .orderedSame else {
+            throw ClientError.invalidMessage(
+                "a scene update returned a different scene"
+            )
+        }
+        return result
+    }
+
+    func setControl(
+        _ control: String,
+        to value: HBJSONValue,
+        transitionSeconds: TimeInterval? = nil
+    ) async throws {
+        Self.logControlWrite(
+            stage: "intent",
+            control: control,
+            value: value,
+            transitionSeconds: transitionSeconds
+        )
+
+        do {
+            let request = try sessionRequest(
+                operation: HBProtocolOperations.setControl,
+                payload: HBControlSetRequest(
+                    control: control,
+                    value: value,
+                    transitionSeconds: transitionSeconds,
+                    writeMode: .externalOverride
+                )
+            )
+            let response = try await sendRequest(request)
+            let body = try response.decodedPayload(
+                as: HBProtocolResponse.self
+            )
+            try body.validate()
+            if let error = body.error {
+                throw error
+            }
+            guard body.status == .success else {
+                throw ClientError.invalidMessage(
+                    "a control update failed without an error"
+                )
+            }
+            Self.logControlWriteSucceeded(control: control)
+        } catch {
+            Self.logControlWriteFailed(control: control, error: error)
+            throw error
+        }
+    }
+
+    func deviceDetails(
+        for device: HBTopologyDeviceDescriptor
+    ) async throws -> HBDeviceDescriptor {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.listDevices,
+            payload: HBDeviceListRequest(
+                device: device.addressableName,
+                includeValues: true
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(as: HBDeviceListResult.self)
+        guard let details = result.devices.first else {
+            throw ClientError.invalidMessage(
+                "device discovery returned no device"
+            )
+        }
+        return details
+    }
+
+    func subscribe(
+        to device: HBTopologyDeviceDescriptor
+    ) async throws -> ControlSubscription {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.streamControls,
+            payload: HBControlWatchStreamRequest(
+                selectors: [
+                    HBControlWatchSelector(
+                        kind: .device,
+                        target: device.identifier
+                    )
+                ],
+                heartbeatSeconds: 30
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let accepted = try body.decodedResult(
+            as: HBControlWatchStreamAccepted.self
+        )
+        if let envelopeSubscriptionID = response.subscriptionID,
+           envelopeSubscriptionID != accepted.subscriptionID {
+            throw ClientError.invalidMessage(
+                "the accepted subscription identifiers do not match"
+            )
+        }
+
+        let pair = AsyncThrowingStream<
+            HBControlWatchStreamEvent,
+            Error
+        >.makeStream()
+        let subscriptionID = accepted.subscriptionID
+        activeSubscriptions.insert(subscriptionID)
+        controlSubscriptionContinuations[subscriptionID] = pair.continuation
+        pair.continuation.onTermination = { @Sendable [weak self] _ in
+            Task {
+                await self?.controlSubscriptionConsumerTerminated(
+                    subscriptionID
+                )
+            }
+        }
+        if let buffered = bufferedControlSubscriptionEvents.removeValue(
+            forKey: subscriptionID
+        ) {
+            for event in buffered {
+                pair.continuation.yield(event)
+            }
+        }
+
+        return ControlSubscription(
+            identifier: subscriptionID,
+            controls: accepted.controls,
+            events: pair.stream
+        )
+    }
+
+    func cancelSubscription(_ identifier: UUID) async throws {
+        guard activeSubscriptions.remove(identifier) != nil else {
+            finishSubscription(identifier)
+            return
+        }
+
+        do {
+            let request = try sessionRequest(
+                operation: HBProtocolOperations.cancelSubscription,
+                payload: HBSubscriptionCancelRequest(
+                    subscriptionID: identifier
+                )
+            )
+            let response = try await sendRequest(request)
+            let body = try response.decodedPayload(
+                as: HBProtocolResponse.self
+            )
+            let result = try body.decodedResult(
+                as: HBSubscriptionCancelResult.self
+            )
+            guard result.subscriptionID == identifier else {
+                throw ClientError.invalidMessage(
+                    "the cancelled subscription identifier changed"
+                )
+            }
+            finishSubscription(identifier)
+        } catch {
+            finishSubscription(identifier, throwing: error)
+            throw error
+        }
+    }
+
+    func disconnect() {
+        connectionAttempt?.cancel()
+        connectionAttempt = nil
+        failConnection(
+            with: CancellationError(),
+            preservingSession: false
+        )
+    }
+
+    private func sessionRequest(
+        operation: String
+    ) throws -> HBProtocolEnvelope {
+        guard let sessionID else {
+            throw ClientError.notConnected
+        }
+        return HBProtocolEnvelope(
+            messageKind: .request,
+            clientID: clientID,
+            operation: operation,
+            sessionID: sessionID
+        )
+    }
+
+    private func sessionRequest<Payload: Encodable>(
+        operation: String,
+        payload: Payload
+    ) throws -> HBProtocolEnvelope {
+        guard let sessionID else {
+            throw ClientError.notConnected
+        }
+        var request = try HBProtocolEnvelope.request(
+            operation: operation,
+            clientID: clientID,
+            payload: payload
+        )
+        request.sessionID = sessionID
+        return request
+    }
+
+    private func sendRequest(
+        _ request: HBProtocolEnvelope
+    ) async throws -> HBProtocolEnvelope {
+        guard let task else {
+            throw ClientError.notConnected
+        }
+        return try await sendRequest(request, using: task)
+    }
+
+    private func sendRequest(
+        _ request: HBProtocolEnvelope,
+        using task: URLSessionWebSocketTask
+    ) async throws -> HBProtocolEnvelope {
+        let encodedRequest = try encoder.encode(request)
+        logEncodedControlWriteIfPresent(
+            request,
+            encodedRequest: encodedRequest
+        )
+        let message = URLSessionWebSocketTask.Message.string(
+            String(decoding: encodedRequest, as: UTF8.self)
+        )
+        let requestID = request.requestID
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard self.task === task else {
+                    continuation.resume(throwing: ClientError.notConnected)
+                    return
+                }
+                guard pendingResponses[requestID] == nil else {
+                    continuation.resume(
+                        throwing: ClientError.invalidMessage(
+                            "a request identifier was reused"
+                        )
+                    )
+                    return
+                }
+                pendingResponses[requestID] = continuation
+                Task { [weak self, weak task] in
+                    guard let self, let task else { return }
+                    do {
+                        try await task.send(message)
+                    } catch {
+                        await self.outboundSendFailed(
+                            error,
+                            requestID: requestID,
+                            task: task
+                        )
+                    }
+                }
+            }
+        } onCancel: {
+            Task { [weak self] in
+                await self?.cancelPendingResponse(requestID)
+            }
+        }
+    }
+
+    private func logEncodedControlWriteIfPresent(
+        _ request: HBProtocolEnvelope,
+        encodedRequest: Data
+    ) {
+        guard request.operation == HBProtocolOperations.setControl else {
+            return
+        }
+
+        do {
+            let roundTrippedEnvelope = try decoder.decode(
+                HBProtocolEnvelope.self,
+                from: encodedRequest
+            )
+            let payload = try roundTrippedEnvelope.decodedPayload(
+                as: HBControlSetRequest.self
+            )
+            Self.logControlWrite(
+                stage: "encoded-roundtrip",
+                control: payload.control,
+                value: payload.value,
+                transitionSeconds: payload.transitionSeconds
+            )
+        } catch {
+            Self.printControlWriteDiagnostic(
+                "stage=encoded-roundtrip operation=control.set diagnosticDecode=failed"
+            )
+            Self.controlWriteLogger.error(
+                "stage=encoded-roundtrip operation=control.set diagnosticDecode=failed"
+            )
+        }
+    }
+
+    private static func logControlWrite(
+        stage: String,
+        control: String,
+        value: HBJSONValue,
+        transitionSeconds: TimeInterval?
+    ) {
+        let valueDescription = diagnosticDescription(of: value)
+        let transitionDescription = transitionSeconds.map {
+            diagnosticDescription(of: $0)
+        } ?? "nil"
+        let message =
+            "stage=\(stage) operation=control.set control=\(control) "
+            + "value=\(valueDescription) "
+            + "transitionSeconds=\(transitionDescription)"
+        printControlWriteDiagnostic(message)
+        controlWriteLogger.notice(
+            "stage=\(stage, privacy: .public) operation=control.set control=\(control, privacy: .public) value=\(valueDescription, privacy: .public) transitionSeconds=\(transitionDescription, privacy: .public)"
+        )
+    }
+
+    private static func logControlWriteSucceeded(control: String) {
+        printControlWriteDiagnostic(
+            "stage=response operation=control.set control=\(control) outcome=success"
+        )
+        controlWriteLogger.notice(
+            "stage=response operation=control.set control=\(control, privacy: .public) outcome=success"
+        )
+    }
+
+    private static func logControlWriteFailed(
+        control: String,
+        error: Error
+    ) {
+        if let protocolError = error as? HBProtocolError {
+            printControlWriteDiagnostic(
+                "stage=response operation=control.set control=\(control) "
+                + "outcome=failure code=\(protocolError.code) "
+                + "message=\(protocolError.message) "
+                + "retryable=\(protocolError.retryable)"
+            )
+            controlWriteLogger.error(
+                "stage=response operation=control.set control=\(control, privacy: .public) outcome=failure code=\(protocolError.code, privacy: .public) message=\(protocolError.message, privacy: .public) retryable=\(protocolError.retryable, privacy: .public)"
+            )
+            return
+        }
+
+        let errorType = String(reflecting: type(of: error))
+        printControlWriteDiagnostic(
+            "stage=response operation=control.set control=\(control) "
+            + "outcome=failure errorType=\(errorType)"
+        )
+        controlWriteLogger.error(
+            "stage=response operation=control.set control=\(control, privacy: .public) outcome=failure errorType=\(errorType, privacy: .public)"
+        )
+    }
+
+    private static func printControlWriteDiagnostic(_ message: String) {
+#if DEBUG
+        print("[HomeBase ControlWrite] \(message)")
+#endif
+    }
+
+    private static func diagnosticDescription(
+        of value: HBJSONValue
+    ) -> String {
+        switch value {
+        case .null:
+            return "null"
+        case .bool(let value):
+            return "bool(\(value))"
+        case .integer(let value):
+            return "integer(\(value))"
+        case .number(let value):
+            return "number(\(diagnosticDescription(of: value)))"
+        case .string:
+            return "string"
+        case .array(let values):
+            return "array(count=\(values.count))"
+        case .object(let values):
+            return "object(count=\(values.count))"
+        }
+    }
+
+    private static func diagnosticDescription(of value: Double) -> String {
+        let fullPrecision = String(format: "%.17g", value)
+        let bitPattern = String(value.bitPattern, radix: 16)
+        return "\(fullPrecision),finite=\(value.isFinite),bits=0x\(bitPattern)"
+    }
+
+    private func outboundSendFailed(
+        _ error: Error,
+        requestID: UUID,
+        task: URLSessionWebSocketTask
+    ) {
+        guard self.task === task else {
+            pendingResponses.removeValue(forKey: requestID)?
+                .resume(throwing: error)
+            return
+        }
+        failConnection(with: error)
+    }
+
+    private func cancelPendingResponse(_ requestID: UUID) {
+        pendingResponses.removeValue(forKey: requestID)?
+            .resume(throwing: CancellationError())
+    }
+
+    private func startReceiveLoop(using task: URLSessionWebSocketTask) {
+        receiveTask = Task { [weak self, weak task] in
+            guard let self, let task else { return }
+            await self.receiveMessages(using: task)
+        }
+    }
+
+    private func receiveMessages(using task: URLSessionWebSocketTask) async {
+        do {
+            while self.task === task, !Task.isCancelled {
+                let message = try await task.receive()
+                try process(message, from: task)
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard self.task === task else { return }
+            failConnection(with: error)
+        }
+    }
+
+    private func process(
+        _ message: URLSessionWebSocketTask.Message,
+        from task: URLSessionWebSocketTask
+    ) throws {
+        guard self.task === task else { return }
+
+        let data: Data
+        switch message {
+        case .data(let value):
+            data = value
+        case .string(let value):
+            data = Data(value.utf8)
+        @unknown default:
+            throw ClientError.invalidMessage(
+                "unsupported WebSocket frame"
+            )
+        }
+
+        let envelope = try decoder.decode(HBProtocolEnvelope.self, from: data)
+        try envelope.validate()
+        guard envelope.clientID == clientID else {
+            throw ClientError.invalidMessage(
+                "the client identifier changed"
+            )
+        }
+        if let sessionID,
+           envelope.operation != HBProtocolOperations.openSession,
+           envelope.sessionID != sessionID {
+            throw ClientError.invalidMessage(
+                "the session identifier changed"
+            )
+        }
+        if let sequence = envelope.deliverySequence {
+            try receiveDelivery(sequence)
+        }
+
+        switch envelope.messageKind {
+        case .response:
+            if let continuation = pendingResponses.removeValue(
+                forKey: envelope.requestID
+            ) {
+                continuation.resume(returning: envelope)
+            } else {
+                cancelAbandonedSubscription(from: envelope)
+            }
+        case .event:
+            try processEvent(envelope)
+        case .request:
+            throw ClientError.invalidMessage(
+                "the server sent a request envelope"
+            )
+        }
+    }
+
+    private func processEvent(_ envelope: HBProtocolEnvelope) throws {
+        switch envelope.operation {
+        case HBProtocolOperations.streamControls:
+            let event = try envelope.decodedPayload(
+                as: HBControlWatchStreamEvent.self
+            )
+            if let envelopeSubscriptionID = envelope.subscriptionID,
+               envelopeSubscriptionID != event.subscriptionID {
+                throw ClientError.invalidMessage(
+                    "a streamed event changed subscription identifiers"
+                )
+            }
+            guard try acceptSubscriptionEvent(
+                identifier: event.subscriptionID,
+                sequence: event.sequence
+            ) else { return }
+
+            if let continuation = controlSubscriptionContinuations[
+                event.subscriptionID
+            ] {
+                continuation.yield(event)
+            } else {
+                var buffered = bufferedControlSubscriptionEvents[
+                    event.subscriptionID,
+                    default: []
+                ]
+                guard buffered.count
+                        < Self.maximumBufferedSubscriptionEvents else {
+                    throw ClientError.invalidMessage(
+                        "too many subscription events arrived before acceptance"
+                    )
+                }
+                buffered.append(event)
+                bufferedControlSubscriptionEvents[event.subscriptionID] =
+                    buffered
+            }
+
+        case HBProtocolOperations.streamScenes:
+            let event = try envelope.decodedPayload(
+                as: HBSceneWatchStreamEvent.self
+            )
+            if let envelopeSubscriptionID = envelope.subscriptionID,
+               envelopeSubscriptionID != event.subscriptionID {
+                throw ClientError.invalidMessage(
+                    "a streamed scene event changed subscription identifiers"
+                )
+            }
+            guard try acceptSubscriptionEvent(
+                identifier: event.subscriptionID,
+                sequence: event.sequence
+            ) else { return }
+
+            if let continuation = sceneSubscriptionContinuations[
+                event.subscriptionID
+            ] {
+                continuation.yield(event)
+            } else {
+                var buffered = bufferedSceneSubscriptionEvents[
+                    event.subscriptionID,
+                    default: []
+                ]
+                guard buffered.count
+                        < Self.maximumBufferedSubscriptionEvents else {
+                    throw ClientError.invalidMessage(
+                        "too many scene subscription events arrived before acceptance"
+                    )
+                }
+                buffered.append(event)
+                bufferedSceneSubscriptionEvents[event.subscriptionID] =
+                    buffered
+            }
+
+        case HBProtocolOperations.subscriptionTerminated:
+            let event = try envelope.decodedPayload(
+                as: HBSubscriptionTerminatedEvent.self
+            )
+            activeSubscriptions.remove(event.subscriptionID)
+            abandonedSubscriptions.remove(event.subscriptionID)
+            finishSubscription(
+                event.subscriptionID,
+                throwing: ClientError.subscriptionEnded(event.reason)
+            )
+
+        case HBProtocolOperations.resyncSession:
+            let event = try envelope.decodedPayload(
+                as: HBWebSocketResyncRequiredEvent.self
+            )
+            throw ClientError.resynchronizationRequired(event.reason)
+
+        default:
+            break
+        }
+    }
+
+    private func acceptSubscriptionEvent(
+        identifier: UUID,
+        sequence: Int64
+    ) throws -> Bool {
+        guard !abandonedSubscriptions.contains(identifier) else {
+            return false
+        }
+        let expected = (subscriptionSequences[identifier] ?? 0) + 1
+        guard sequence == expected else {
+            throw ClientError.invalidMessage(
+                "subscription \(identifier) expected event sequence \(expected), received \(sequence)"
+            )
+        }
+        subscriptionSequences[identifier] = sequence
+        return true
+    }
+
+    private func receiveDelivery(_ sequence: Int64) throws {
+        let expected = latestDeliverySequence + 1
+        guard sequence == expected else {
+            throw ClientError.invalidDeliverySequence(
+                expected: expected,
+                received: sequence
+            )
+        }
+        latestDeliverySequence = sequence
+        scheduleAcknowledgement()
+    }
+
+    private func scheduleAcknowledgement() {
+        guard acknowledgementTask == nil else { return }
+        acknowledgementTask = Task { [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            await self?.flushAcknowledgements()
+        }
+    }
+
+    private func flushAcknowledgements() async {
+        defer {
+            acknowledgementTask = nil
+            if task != nil,
+               acknowledgedDeliverySequence < latestDeliverySequence {
+                scheduleAcknowledgement()
+            }
+        }
+
+        while acknowledgedDeliverySequence < latestDeliverySequence {
+            guard let sessionID else { return }
+            let target = latestDeliverySequence
+            do {
+                var request = try HBProtocolEnvelope.request(
+                    operation: HBProtocolOperations.acknowledgeSession,
+                    clientID: clientID,
+                    payload: HBWebSocketSessionAckRequest(
+                        deliverySequence: target
+                    )
+                )
+                request.sessionID = sessionID
+                let response = try await sendRequest(request)
+                let body = try response.decodedPayload(
+                    as: HBProtocolResponse.self
+                )
+                let result = try body.decodedResult(
+                    as: HBWebSocketSessionAckResult.self
+                )
+                guard result.acknowledgedDeliverySequence >= target,
+                      result.acknowledgedDeliverySequence
+                        <= latestDeliverySequence else {
+                    throw ClientError.invalidMessage(
+                        "the acknowledged delivery sequence is invalid"
+                    )
+                }
+                acknowledgedDeliverySequence =
+                    result.acknowledgedDeliverySequence
+            } catch is CancellationError {
+                return
+            } catch {
+                failConnection(with: error)
+                return
+            }
+        }
+    }
+
+    private func controlSubscriptionConsumerTerminated(_ identifier: UUID) {
+        controlSubscriptionContinuations.removeValue(forKey: identifier)
+        guard activeSubscriptions.contains(identifier) else { return }
+        Task { [weak self] in
+            try? await self?.cancelSubscription(identifier)
+        }
+    }
+
+    private func sceneSubscriptionConsumerTerminated(_ identifier: UUID) {
+        sceneSubscriptionContinuations.removeValue(forKey: identifier)
+        guard activeSubscriptions.contains(identifier) else { return }
+        Task { [weak self] in
+            try? await self?.cancelSubscription(identifier)
+        }
+    }
+
+    private func cancelAbandonedSubscription(
+        from envelope: HBProtocolEnvelope
+    ) {
+        guard let body = try? envelope.decodedPayload(
+            as: HBProtocolResponse.self
+        ) else {
+            return
+        }
+
+        let subscriptionID: UUID?
+        switch envelope.operation {
+        case HBProtocolOperations.streamControls:
+            subscriptionID = try? body.decodedResult(
+                as: HBControlWatchStreamAccepted.self
+            ).subscriptionID
+        case HBProtocolOperations.streamScenes:
+            subscriptionID = try? body.decodedResult(
+                as: HBSceneWatchStreamAccepted.self
+            ).subscriptionID
+        default:
+            subscriptionID = nil
+        }
+        guard let subscriptionID else { return }
+
+        activeSubscriptions.insert(subscriptionID)
+        Task { [weak self] in
+            try? await self?.cancelSubscription(subscriptionID)
+        }
+    }
+
+    private func finishSubscription(
+        _ identifier: UUID,
+        throwing error: Error? = nil
+    ) {
+        let controlContinuation = controlSubscriptionContinuations.removeValue(
+            forKey: identifier
+        )
+        let sceneContinuation = sceneSubscriptionContinuations.removeValue(
+            forKey: identifier
+        )
+        if let error {
+            controlContinuation?.finish(throwing: error)
+            sceneContinuation?.finish(throwing: error)
+        } else {
+            controlContinuation?.finish()
+            sceneContinuation?.finish()
+        }
+        bufferedControlSubscriptionEvents.removeValue(forKey: identifier)
+        bufferedSceneSubscriptionEvents.removeValue(forKey: identifier)
+        subscriptionSequences.removeValue(forKey: identifier)
+    }
+
+    private func failConnection(
+        with error: Error,
+        preservingSession requestedPreservation: Bool? = nil
+    ) {
+        let preserveSession = requestedPreservation
+            ?? shouldPreserveSession(after: error)
+        let hasResumeState = sessionID != nil
+            && resumeToken != nil
+            && serverInstanceID != nil
+        let willPreserveSession = preserveSession && hasResumeState
+
+        receiveTask?.cancel()
+        receiveTask = nil
+        acknowledgementTask?.cancel()
+        acknowledgementTask = nil
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+
+        if willPreserveSession {
+            abandonedSubscriptions.formUnion(activeSubscriptions)
+        } else {
+            sessionID = nil
+            resumeToken = nil
+            serverInstanceID = nil
+            abandonedSubscriptions.removeAll()
+            latestDeliverySequence = 0
+            acknowledgedDeliverySequence = 0
+        }
+
+        let pending = pendingResponses.values
+        pendingResponses.removeAll()
+        for continuation in pending {
+            continuation.resume(throwing: error)
+        }
+
+        let controlSubscriptions = controlSubscriptionContinuations.values
+        let sceneSubscriptions = sceneSubscriptionContinuations.values
+        controlSubscriptionContinuations.removeAll()
+        sceneSubscriptionContinuations.removeAll()
+        activeSubscriptions.removeAll()
+        bufferedControlSubscriptionEvents.removeAll()
+        bufferedSceneSubscriptionEvents.removeAll()
+        subscriptionSequences.removeAll()
+        for continuation in controlSubscriptions {
+            continuation.finish(throwing: error)
+        }
+        for continuation in sceneSubscriptions {
+            continuation.finish(throwing: error)
+        }
+    }
+
+    private func shouldPreserveSession(after error: Error) -> Bool {
+        if error is CancellationError {
+            return false
+        }
+        if let error = error as? ClientError {
+            switch error {
+            case .invalidMessage,
+                 .invalidDeliverySequence,
+                 .resynchronizationRequired:
+                return false
+            case .invalidEndpoint,
+                 .notConnected,
+                 .subscriptionEnded:
+                return true
+            }
+        }
+        if let error = error as? HBProtocolError,
+           error.code == HBProtocolErrorCodes.resyncRequired {
+            return false
+        }
+        return true
+    }
+
+    private func shouldRebuildSession(after error: Error) -> Bool {
+        if let error = error as? HBProtocolError {
+            return error.code == HBProtocolErrorCodes.resyncRequired
+                || !error.retryable
+        }
+        if let error = error as? ClientError {
+            switch error {
+            case .invalidMessage,
+                 .invalidDeliverySequence,
+                 .resynchronizationRequired:
+                return true
+            case .invalidEndpoint,
+                 .notConnected,
+                 .subscriptionEnded:
+                return false
+            }
+        }
+        return false
+    }
+
+    private static func logConnection(_ message: String) {
+#if DEBUG
+        print("[HomeBase Connection] \(message)")
+#endif
+        connectionLogger.notice("\(message, privacy: .public)")
+    }
+}
