@@ -30,9 +30,9 @@ Usage:
   bin/run-on-phone.sh [--device <name-or-id>] [--dry-run]
 
 Options:
-  --device <name-or-id>  Select a connected iPhone by its name, UDID, or
-                         CoreDevice identifier. The default is the first
-                         available physical iPhone, sorted by name.
+  --device <name-or-id>  Select a paired iPhone by its name, UDID, or CoreDevice
+                         identifier. The default is the first reachable paired
+                         physical iPhone, sorted by name.
   --dry-run              Discover the iPhone and print what would run without
                          building or installing anything.
   -h, --help             Show this help.
@@ -103,9 +103,9 @@ TEMPORARY_DIRECTORY="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/homebase-run-on-phone
 trap '/bin/rm -rf -- "$TEMPORARY_DIRECTORY"' EXIT
 readonly DEVICES_JSON="${TEMPORARY_DIRECTORY}/devices.json"
 
-log "Looking for an available physical iPhone"
+log "Looking for a paired physical iPhone"
 if ! xcrun devicectl list devices \
-    --filter "hardwareProperties.platform == 'iOS' AND connectionProperties.tunnelState == 'connected'" \
+    --filter "hardwareProperties.platform == 'iOS' AND connectionProperties.pairingState == 'paired'" \
     --sort-by deviceProperties.name \
     --timeout "$DISCOVERY_TIMEOUT" \
     --json-output "$DEVICES_JSON" \
@@ -117,15 +117,54 @@ device_name=""
 device_identifier=""
 device_udid=""
 device_index=0
+matched_requested_device=false
+
+establish_developer_tunnel() {
+    local identifier="$1"
+    local index="$2"
+    local details_json="${TEMPORARY_DIRECTORY}/device-details-${index}.json"
+    local tunnel_state=""
+
+    if ! xcrun devicectl device info details \
+        --device "$identifier" \
+        --timeout "$DISCOVERY_TIMEOUT" \
+        --json-output "$details_json" \
+        --quiet; then
+        return 1
+    fi
+
+    tunnel_state="$(/usr/bin/plutil \
+        -extract result.connectionProperties.tunnelState \
+        raw \
+        "$details_json" 2>/dev/null || true)"
+    [[ "$tunnel_state" == "connected" ]]
+}
 
 while candidate_name="$(/usr/bin/plutil -extract "result.devices.${device_index}.deviceProperties.name" raw "$DEVICES_JSON" 2>/dev/null)"; do
     candidate_identifier="$(/usr/bin/plutil -extract "result.devices.${device_index}.identifier" raw "$DEVICES_JSON")"
     candidate_udid="$(/usr/bin/plutil -extract "result.devices.${device_index}.hardwareProperties.udid" raw "$DEVICES_JSON" 2>/dev/null || true)"
+    candidate_tunnel_state="$(/usr/bin/plutil -extract "result.devices.${device_index}.connectionProperties.tunnelState" raw "$DEVICES_JSON" 2>/dev/null || true)"
 
     if [[ -z "$DEVICE_REQUEST" || \
           "$DEVICE_REQUEST" == "$candidate_name" || \
           "$DEVICE_REQUEST" == "$candidate_identifier" || \
           "$DEVICE_REQUEST" == "$candidate_udid" ]]; then
+        if [[ -n "$DEVICE_REQUEST" ]]; then
+            matched_requested_device=true
+        fi
+
+        if [[ "$candidate_tunnel_state" != "connected" ]]; then
+            log "Connecting to ${candidate_name}"
+            if ! establish_developer_tunnel "$candidate_identifier" "$device_index"; then
+                if [[ -n "$DEVICE_REQUEST" ]]; then
+                    fail "could not establish a developer connection to '${DEVICE_REQUEST}'"
+                fi
+                log "Skipping ${candidate_name}; a developer connection could not be established"
+                (( device_index += 1 ))
+                continue
+            fi
+        fi
+
         device_name="$candidate_name"
         device_identifier="$candidate_identifier"
         device_udid="${candidate_udid:-$candidate_identifier}"
@@ -137,9 +176,12 @@ done
 
 if [[ -z "$device_identifier" ]]; then
     if [[ -n "$DEVICE_REQUEST" ]]; then
-        fail "no available physical iPhone matched '$DEVICE_REQUEST'"
+        if $matched_requested_device; then
+            fail "could not establish a developer connection to '${DEVICE_REQUEST}'"
+        fi
+        fail "no paired physical iPhone matched '$DEVICE_REQUEST'"
     fi
-    fail "no available physical iPhone was found; pair it once by cable, then keep it on the same network"
+    fail "no reachable paired physical iPhone was found; unlock it or connect it by cable"
 fi
 
 log "Using ${device_name} (${device_udid})"

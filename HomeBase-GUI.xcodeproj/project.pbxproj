@@ -10,9 +10,22 @@
 		E2CD70F130269489002FCE2D /* HomeBase-GUI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "HomeBase-GUI.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		E2CD710030269489002FCE2D /* Exceptions for "HomeBase-GUI" folder in "HomeBase-GUI" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = E2CD70F030269489002FCE2D /* HomeBase-GUI */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		E2CD70F330269489002FCE2D /* HomeBase-GUI */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				E2CD710030269489002FCE2D /* Exceptions for "HomeBase-GUI" folder in "HomeBase-GUI" target */,
+			);
 			path = "HomeBase-GUI";
 			sourceTree = "<group>";
 		};
@@ -251,6 +264,8 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "HomeBase-GUI/Info.plist";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Scan HomeBase server pairing codes.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -294,6 +309,8 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "HomeBase-GUI/Info.plist";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Scan HomeBase server pairing codes.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
