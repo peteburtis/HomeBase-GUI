@@ -42,17 +42,22 @@ struct ServerDetailView: View {
     }
 
     private var homeView: some View {
-        List {
+        let topology = connection.presentedTopology
+        let topLevelGroups = TopologyGroupPlacement(
+            topology: topology
+        ).topLevelGroups
+
+        return List {
             Section {
-                if connection.rooms.isEmpty {
+                if topology.rooms.isEmpty {
                     Text(emptyRoomsMessage)
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(connection.rooms, id: \.identifier) { room in
+                    ForEach(topology.rooms, id: \.identifier) { room in
                         NavigationLink {
                             RoomDetailView(
                                 room: room,
-                                topology: connection.topology,
+                                topology: topology,
                                 client: connection.client
                             )
                         } label: {
@@ -73,13 +78,13 @@ struct ServerDetailView: View {
                 Text("Rooms")
             }
 
-            if !connection.topLevelGroups.isEmpty {
+            if !topLevelGroups.isEmpty {
                 Section {
-                    ForEach(connection.topLevelGroups, id: \.identifier) { group in
+                    ForEach(topLevelGroups, id: \.identifier) { group in
                         NavigationLink {
                             GroupDetailView(
                                 group: group,
-                                topology: connection.topology,
+                                topology: topology,
                                 client: connection.client
                             )
                         } label: {
@@ -144,12 +149,32 @@ final class ServerConnectionModel: ObservableObject {
         groups: []
     )
 
-    var rooms: [HBTopologyRoomDescriptor] {
-        topology.rooms
-    }
+    var presentedTopology: HBTopologyListResult {
+        let assignedDeviceIdentifiers = Set(
+            topology.rooms.flatMap(\.resolvedDeviceIdentifiers)
+        )
+        let unassignedDevices = topology.devices.filter {
+            !assignedDeviceIdentifiers.contains($0.identifier)
+        }
+        guard !unassignedDevices.isEmpty else { return topology }
 
-    var topLevelGroups: [HBTopologyGroupDescriptor] {
-        TopologyGroupPlacement(topology: topology).topLevelGroups
+        var presentedTopology = topology
+        presentedTopology.rooms.append(
+            HBTopologyRoomDescriptor(
+                identifier: Self.otherRoomIdentifier(
+                    avoiding: topology.rooms.map(\.identifier)
+                ),
+                displayName: "Other",
+                members: unassignedDevices.map {
+                    HBTopologyMemberDescriptor(
+                        kind: .device,
+                        identifier: $0.identifier
+                    )
+                },
+                resolvedDeviceIdentifiers: unassignedDevices.map(\.identifier)
+            )
+        )
+        return presentedTopology
     }
 
     let client: HomeBaseWebSocketClient
@@ -214,5 +239,21 @@ final class ServerConnectionModel: ObservableObject {
             await client.disconnect()
         }
         state = .disconnected
+    }
+
+    private static func otherRoomIdentifier(
+        avoiding roomIdentifiers: [String]
+    ) -> String {
+        let existingIdentifiers = Set(roomIdentifiers)
+        let baseIdentifier = "homebase-gui.other-room"
+        guard existingIdentifiers.contains(baseIdentifier) else {
+            return baseIdentifier
+        }
+
+        var suffix = 2
+        while existingIdentifiers.contains("\(baseIdentifier).\(suffix)") {
+            suffix += 1
+        }
+        return "\(baseIdentifier).\(suffix)"
     }
 }
