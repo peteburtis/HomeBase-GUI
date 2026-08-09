@@ -17,31 +17,39 @@ struct ConnectionStatusOverlay: View {
     let retry: (() -> Void)?
 
     var body: some View {
+        surfacedStatus
+            .shadow(
+                color: .black.opacity(0.14),
+                radius: 12,
+                x: 0,
+                y: 6
+            )
+    }
+
+    private var paddedStatus: some View {
         statusContent
             .font(.footnote)
             .padding(.horizontal, 13)
             .padding(.vertical, 9)
+    }
+
+    @ViewBuilder
+    private var surfacedStatus: some View {
+#if os(visionOS)
+        paddedStatus
             .background(.regularMaterial, in: backgroundShape)
             .overlay {
                 backgroundShape
                     .strokeBorder(.white.opacity(0.32), lineWidth: 0.5)
             }
-            .shadow(
-                color: .black.opacity(0.38),
-                radius: 24,
-                x: 0,
-                y: 12
-            )
-            .shadow(
-                color: .black.opacity(0.20),
-                radius: 5,
-                x: 0,
-                y: 2
-            )
+#else
+        paddedStatus
+            .glassEffect(.regular, in: backgroundShape)
+#endif
     }
 
-    private var backgroundShape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: 18, style: .continuous)
+    private var backgroundShape: Capsule {
+        Capsule(style: .continuous)
     }
 
     @ViewBuilder
@@ -96,46 +104,20 @@ struct ConnectionStatusOverlay: View {
 private struct ConnectionStatusOverlayModifier: ViewModifier {
     let presentation: ConnectionStatusPresentation?
     let retry: (() -> Void)?
-    @State private var insetHeight: CGFloat = 0
 
     func body(content: Content) -> some View {
-        content
-            .safeAreaInset(edge: .bottom, spacing: -insetHeight) {
-                if let presentation {
-                    ConnectionStatusOverlay(
-                        presentation: presentation,
-                        retry: retry
-                    )
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 12)
-                    .frame(maxWidth: .infinity)
-                    .background {
-                        GeometryReader { proxy in
-                            Color.clear.preference(
-                                key: ConnectionStatusOverlayHeightKey.self,
-                                value: proxy.size.height
-                            )
-                        }
-                    }
-                    .zIndex(100)
-                }
+        content.safeAreaInset(edge: .bottom, spacing: 0) {
+            if let presentation {
+                ConnectionStatusOverlay(
+                    presentation: presentation,
+                    retry: retry
+                )
+                .padding(.horizontal, 20)
+                .padding(.bottom, 12)
+                .frame(maxWidth: .infinity)
+                .zIndex(100)
             }
-            .onPreferenceChange(ConnectionStatusOverlayHeightKey.self) {
-                insetHeight = presentation == nil ? 0 : $0
-            }
-            .onChange(of: presentation) { _, presentation in
-                if presentation == nil {
-                    insetHeight = 0
-                }
-            }
-    }
-}
-
-private struct ConnectionStatusOverlayHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
+        }
     }
 }
 
