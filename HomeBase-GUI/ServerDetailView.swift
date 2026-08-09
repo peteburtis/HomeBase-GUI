@@ -71,10 +71,6 @@ struct ServerDetailView: View {
                 }
             } header: {
                 Text("Rooms")
-            } footer: {
-                if connection.topLevelGroups.isEmpty {
-                    connectionStatus
-                }
             }
 
             if !connection.topLevelGroups.isEmpty {
@@ -92,8 +88,6 @@ struct ServerDetailView: View {
                     }
                 } header: {
                     Text("Groups")
-                } footer: {
-                    connectionStatus
                 }
             }
         }
@@ -101,39 +95,23 @@ struct ServerDetailView: View {
         .refreshable {
             await connection.refresh()
         }
+        .connectionStatusOverlay(connectionStatus) {
+            Task {
+                await connection.load()
+            }
+        }
     }
 
-    @ViewBuilder
-    private var connectionStatus: some View {
+    private var connectionStatus: ConnectionStatusPresentation {
         switch connection.state {
         case .disconnected:
-            Label("Disconnected", systemImage: "network.slash")
-                .foregroundStyle(.secondary)
+            .disconnected("Disconnected", systemImage: "network.slash")
         case .connecting:
-            HStack(spacing: 6) {
-                ProgressView()
-                    .controlSize(.mini)
-                Text("Connecting…")
-            }
-            .foregroundStyle(.secondary)
+            .pending("Connecting…")
         case .connected:
-            Label(
-                "Connected",
-                systemImage: "dot.radiowaves.left.and.right"
-            )
-                .foregroundStyle(.green)
+            .connected
         case .failed(let message):
-            VStack(alignment: .leading, spacing: 5) {
-                Label("Connection Failed", systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.red)
-                Text(message)
-                    .foregroundStyle(.red)
-                Button("Try Again") {
-                    Task {
-                        await connection.load()
-                    }
-                }
-            }
+            .failed(title: "Connection Failed", message: message)
         }
     }
 

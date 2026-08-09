@@ -234,6 +234,191 @@ enum HomeBaseColorReadoutPresentation: Equatable {
     case unavailable
 }
 
+struct HomeBaseChromaticPickerSample {
+    let color: CGColor
+    let xy: CGPoint
+    let rgb: [Double]
+}
+
+/// The shared color-space boundary between the picker, HomeBase wire values,
+/// and display output. The chromatic field is a conventional hue/saturation
+/// disc, displayed in tagged Display P3, and emitted as CIE xy whenever the
+/// control supports it.
+enum HomeBaseColorPickerMapping {
+    static let coldestKelvin = 6_500.0
+    static let warmestKelvin = 2_200.0
+
+    static let chromaticImage = HomeBaseColorMath.makeColorWheelImage(
+        size: 360
+    )
+
+    static let whiteGradient: [HomeBaseColorPresentation] = {
+        let coldMirek = 1_000_000 / coldestKelvin
+        let warmMirek = 1_000_000 / warmestKelvin
+        return (0 ... 16).compactMap { index in
+            let position = Double(index) / 16
+            let mirek = coldMirek + ((warmMirek - coldMirek) * position)
+            return HomeBaseColorPresentation(whiteKelvin: 1_000_000 / mirek)
+        }
+    }()
+
+    static func chromaticSample(
+        at requestedLocation: CGPoint
+    ) -> HomeBaseChromaticPickerSample? {
+        let location = clampedToCircle(requestedLocation)
+        guard let sample = HomeBaseColorMath.colorWheelSample(
+            normalizedLocation: location
+        ),
+        let colorSpace = CGColorSpace(
+            name: CGColorSpace.extendedLinearDisplayP3
+        ) else {
+            return nil
+        }
+
+        guard let color = CGColor(
+            colorSpace: colorSpace,
+            components: [
+                CGFloat(sample.displayP3.red),
+                CGFloat(sample.displayP3.green),
+                CGFloat(sample.displayP3.blue),
+                1,
+            ]
+        ) else {
+            return nil
+        }
+        return HomeBaseChromaticPickerSample(
+            color: color,
+            xy: CGPoint(x: sample.xy.x, y: sample.xy.y),
+            rgb: sample.sRGB
+        )
+    }
+
+    static func chromaticLocation(for wireValue: HBJSONValue) -> CGPoint? {
+        guard let parsed = HomeBaseColorMath.parse(wireValue),
+              parsed.whiteKelvin == nil,
+              let point = HomeBaseColorMath.colorWheelLocation(
+                from: parsed.xyz
+              ) else {
+            return nil
+        }
+        return clampedToCircle(point)
+    }
+
+    static func chromaticWireValue(
+        at location: CGPoint,
+        supportsXY: Bool,
+        supportsRGB: Bool
+    ) -> HBJSONValue? {
+        guard let sample = chromaticSample(at: location) else { return nil }
+        if supportsXY {
+            return .object([
+                "XY": .array([
+                    .number(Double(sample.xy.x)),
+                    .number(Double(sample.xy.y)),
+                ]),
+            ])
+        }
+        if supportsRGB {
+            return .object([
+                "RGB": .array(sample.rgb.map(HBJSONValue.number)),
+            ])
+        }
+        return nil
+    }
+
+    static func htmlRGB(at location: CGPoint) -> String? {
+        guard let sample = chromaticSample(at: location),
+              sample.rgb.count == 3 else {
+            return nil
+        }
+        let components = sample.rgb.map { component in
+            Int((min(1, max(0, component)) * 255).rounded())
+        }
+        return String(
+            format: "#%02X%02X%02X",
+            components[0],
+            components[1],
+            components[2]
+        )
+    }
+
+    static func chromaticLocation(htmlRGB text: String) -> CGPoint? {
+        var digits = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if digits.hasPrefix("#") {
+            digits.removeFirst()
+        }
+        if digits.count == 3 {
+            digits = digits.map { character in
+                String(repeating: String(character), count: 2)
+            }
+            .joined()
+        }
+        guard digits.count == 6,
+              let encoded = Int(digits, radix: 16) else {
+            return nil
+        }
+
+        let red = Double((encoded >> 16) & 0xff) / 255
+        let green = Double((encoded >> 8) & 0xff) / 255
+        let blue = Double(encoded & 0xff) / 255
+        guard max(red, green, blue) > 0 else { return nil }
+        return chromaticLocation(
+            for: .object([
+                "RGB": .array([
+                    .number(red),
+                    .number(green),
+                    .number(blue),
+                ]),
+            ])
+        )
+    }
+
+    static func whiteColor(at location: CGPoint) -> CGColor? {
+        HomeBaseColorPresentation(
+            whiteKelvin: kelvin(at: location)
+        )?.cgColor
+    }
+
+    static func kelvin(at location: CGPoint) -> Double {
+        let vertical = min(1, max(-1, Double(location.y)))
+        let position = (vertical + 1) / 2
+        let coldMirek = 1_000_000 / coldestKelvin
+        let warmMirek = 1_000_000 / warmestKelvin
+        let mirek = coldMirek + ((warmMirek - coldMirek) * position)
+        return 1_000_000 / mirek
+    }
+
+    static func whiteLocation(kelvin requestedKelvin: Double) -> CGPoint {
+        let kelvin = min(
+            coldestKelvin,
+            max(warmestKelvin, requestedKelvin)
+        )
+        let coldMirek = 1_000_000 / coldestKelvin
+        let warmMirek = 1_000_000 / warmestKelvin
+        let position = ((1_000_000 / kelvin) - coldMirek)
+            / (warmMirek - coldMirek)
+        return CGPoint(x: 0, y: (position * 2) - 1)
+    }
+
+    static func whiteWireValue(at location: CGPoint) -> HBJSONValue {
+        .object([
+            "White": .number(kelvin(at: location).rounded()),
+        ])
+    }
+
+    static func whiteKelvin(from wireValue: HBJSONValue) -> Double? {
+        wireValue.objectValue?["White"]?.numberValue
+    }
+
+    static func clampedToCircle(_ location: CGPoint) -> CGPoint {
+        let x = min(1, max(-1, location.x))
+        let y = min(1, max(-1, location.y))
+        let radius = hypot(x, y)
+        guard radius > 1 else { return CGPoint(x: x, y: y) }
+        return CGPoint(x: x / radius, y: y / radius)
+    }
+}
+
 struct HomeBaseColorReadout: View {
     let presentation: HomeBaseColorReadoutPresentation
     let accessibilityValue: String
@@ -421,6 +606,12 @@ private enum HomeBaseColorMath {
         let whiteKelvin: Double?
     }
 
+    struct PickerSample {
+        let displayP3: RGB
+        let xy: Point
+        let sRGB: [Double]
+    }
+
     static func parse(_ wireValue: HBJSONValue) -> ParsedColor? {
         guard let object = wireValue.objectValue,
               object.count == 1,
@@ -577,6 +768,174 @@ private enum HomeBaseColorMath {
             shouldInterpolate: true,
             intent: .relativeColorimetric
         )
+    }
+
+    static func makeColorWheelImage(size: Int) -> CGImage? {
+        guard size > 0 else { return nil }
+        var pixels = [UInt8](repeating: 0, count: size * size * 4)
+
+        for row in 0 ..< size {
+            let vertical = ((Double(row) + 0.5) / Double(size) * 2) - 1
+            for column in 0 ..< size {
+                let horizontal = ((Double(column) + 0.5)
+                    / Double(size) * 2) - 1
+                guard hypot(horizontal, vertical) <= 1,
+                      let sample = colorWheelSample(
+                        normalizedLocation: CGPoint(
+                            x: horizontal,
+                            y: vertical
+                        )
+                      ) else {
+                    continue
+                }
+                let offset = ((row * size) + column) * 4
+                pixels[offset] = encodedByte(
+                    fromLinear: sample.displayP3.red
+                )
+                pixels[offset + 1] = encodedByte(
+                    fromLinear: sample.displayP3.green
+                )
+                pixels[offset + 2] = encodedByte(
+                    fromLinear: sample.displayP3.blue
+                )
+                pixels[offset + 3] = 255
+            }
+        }
+
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.displayP3),
+              let provider = CGDataProvider(
+                data: Data(pixels) as CFData
+              ) else {
+            return nil
+        }
+        return CGImage(
+            width: size,
+            height: size,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: size * 4,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo(
+                rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+            ),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: true,
+            intent: .relativeColorimetric
+        )
+    }
+
+    static func colorWheelSample(
+        normalizedLocation: CGPoint
+    ) -> PickerSample? {
+        guard normalizedLocation.x.isFinite,
+              normalizedLocation.y.isFinite,
+              hypot(normalizedLocation.x, normalizedLocation.y) <= 1.000_001
+        else {
+            return nil
+        }
+
+        let horizontal = Double(normalizedLocation.x)
+        let vertical = Double(normalizedLocation.y)
+        let saturation = min(1, hypot(horizontal, vertical))
+        var hue = atan2(vertical, horizontal) / (2 * .pi)
+        if hue < 0 {
+            hue += 1
+        }
+        let encodedSRGB = hsvColor(hue: hue, saturation: saturation)
+        let linearSRGB = RGB(
+            red: sRGBToLinear(encodedSRGB.red),
+            green: sRGBToLinear(encodedSRGB.green),
+            blue: sRGBToLinear(encodedSRGB.blue)
+        )
+        let xyz = XYZ(
+            x: (0.4124564 * linearSRGB.red)
+                + (0.3575761 * linearSRGB.green)
+                + (0.1804375 * linearSRGB.blue),
+            y: (0.2126729 * linearSRGB.red)
+                + (0.7151522 * linearSRGB.green)
+                + (0.0721750 * linearSRGB.blue),
+            z: (0.0193339 * linearSRGB.red)
+                + (0.1191920 * linearSRGB.green)
+                + (0.9503041 * linearSRGB.blue)
+        )
+        let total = xyz.x + xyz.y + xyz.z
+        guard total.isFinite,
+              total > 0,
+              let convertedDisplayP3 = displayP3(from: xyz) else {
+            return nil
+        }
+        let displayP3 = RGB(
+            red: min(1, max(0, convertedDisplayP3.red)),
+            green: min(1, max(0, convertedDisplayP3.green)),
+            blue: min(1, max(0, convertedDisplayP3.blue))
+        )
+
+        return PickerSample(
+            displayP3: displayP3,
+            xy: Point(x: xyz.x / total, y: xyz.y / total),
+            sRGB: encodedSRGB.components
+        )
+    }
+
+    static func colorWheelLocation(from xyz: XYZ) -> CGPoint? {
+        guard let linear = linearSRGB(from: xyz),
+              let mapped = brightestInGamut(linear) else {
+            return nil
+        }
+        let encoded = [
+            encodedComponent(fromLinear: mapped.red),
+            encodedComponent(fromLinear: mapped.green),
+            encodedComponent(fromLinear: mapped.blue),
+        ]
+        guard let maximum = encoded.max(),
+              let minimum = encoded.min(),
+              maximum > 0 else {
+            return nil
+        }
+        let difference = maximum - minimum
+        let saturation = difference / maximum
+        guard difference > 0 else { return .zero }
+
+        let hueSector: Double
+        if maximum == encoded[0] {
+            hueSector = ((encoded[1] - encoded[2]) / difference)
+                .truncatingRemainder(dividingBy: 6)
+        } else if maximum == encoded[1] {
+            hueSector = ((encoded[2] - encoded[0]) / difference) + 2
+        } else {
+            hueSector = ((encoded[0] - encoded[1]) / difference) + 4
+        }
+        var hue = hueSector / 6
+        if hue < 0 {
+            hue += 1
+        }
+        let angle = hue * 2 * .pi
+        return CGPoint(
+            x: cos(angle) * saturation,
+            y: sin(angle) * saturation
+        )
+    }
+
+    private static func hsvColor(
+        hue: Double,
+        saturation: Double
+    ) -> RGB {
+        let huePosition = hue * 6
+        let sector = Int(floor(huePosition)) % 6
+        let fraction = huePosition - floor(huePosition)
+        let low = 1 - saturation
+        let falling = 1 - (saturation * fraction)
+        let rising = 1 - (saturation * (1 - fraction))
+
+        return switch sector {
+        case 0: RGB(red: 1, green: rising, blue: low)
+        case 1: RGB(red: falling, green: 1, blue: low)
+        case 2: RGB(red: low, green: 1, blue: rising)
+        case 3: RGB(red: low, green: falling, blue: 1)
+        case 4: RGB(red: rising, green: low, blue: 1)
+        default: RGB(red: 1, green: low, blue: falling)
+        }
     }
 
     static func displayP3(from xyz: XYZ) -> RGB? {
@@ -789,10 +1148,14 @@ private enum HomeBaseColorMath {
     }
 
     private static func encodedByte(fromLinear component: Double) -> UInt8 {
+        UInt8((encodedComponent(fromLinear: component) * 255).rounded())
+    }
+
+    private static func encodedComponent(fromLinear component: Double) -> Double {
         let encoded = component <= 0.0031308
             ? 12.92 * component
             : (1.055 * pow(component, 1 / 2.4)) - 0.055
-        return UInt8((min(1, max(0, encoded)) * 255).rounded())
+        return min(1, max(0, encoded))
     }
 
     private static func sRGBToLinear(_ component: Double) -> Double {

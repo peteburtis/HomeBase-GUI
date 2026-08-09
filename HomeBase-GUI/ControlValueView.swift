@@ -131,6 +131,13 @@ struct ControlValueView: View {
     let control: LiveDeviceControl
     let interactionEnabled: Bool
     let setValue: (Double) async -> Void
+    let setColorValue: (HBJSONValue) async throws -> Void
+    let colorValues: () -> AsyncThrowingStream<
+        HomeBaseColorPickerObservation,
+        Error
+    >
+
+    @State private var isShowingColorPicker = false
 
     var body: some View {
         HStack(spacing: 8) {
@@ -169,11 +176,40 @@ struct ControlValueView: View {
                 )
 
             case .color(let presentation):
-                HomeBaseColorReadout(
-                    presentation: presentation,
-                    accessibilityValue: control.presentedValue,
-                    isStale: control.valid == false
-                )
+                if let capabilities = HomeBaseColorPickerCapabilities(
+                    controlKind: control.descriptor.kind
+                ),
+                control.details?.metadata["writable"]?.boolValue == true {
+                    Button {
+                        isShowingColorPicker = true
+                    } label: {
+                        colorReadout(presentation)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!interactionEnabled || control.isUpdating)
+                    .accessibilityHint("Opens the color picker")
+                    .navigationDestination(
+                        isPresented: $isShowingColorPicker
+                    ) {
+                        HomeBaseColorPickerView(
+                            capabilities: capabilities,
+                            initialValue: control.aggregateState == .mixed
+                                ? nil
+                                : control.pendingValue ?? control.value,
+                            aggregateState: control.aggregateState,
+                            aggregateValues: control.aggregateValues,
+                            aggregateValueCount: control.aggregateValueCount,
+                            liveValues: colorValues,
+                            setValue: setColorValue
+                        )
+                        .navigationTitle(control.displayName)
+#if os(iOS)
+                        .navigationBarTitleDisplayMode(.inline)
+#endif
+                    }
+                } else {
+                    colorReadout(presentation)
+                }
 
             case .text(let value):
                 Text(value)
@@ -186,6 +222,16 @@ struct ControlValueView: View {
                     .controlSize(.small)
             }
         }
+    }
+
+    private func colorReadout(
+        _ presentation: HomeBaseColorReadoutPresentation
+    ) -> some View {
+        HomeBaseColorReadout(
+            presentation: presentation,
+            accessibilityValue: control.presentedValue,
+            isStale: control.valid == false
+        )
     }
 
     private func submit(

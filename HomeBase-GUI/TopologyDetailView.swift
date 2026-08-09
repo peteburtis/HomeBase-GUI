@@ -96,6 +96,15 @@ struct TopologyDetailView: View {
             }
         }
         .navigationTitle(title)
+        .connectionStatusOverlay(
+            hasControlDevice
+                ? controlModel.state.connectionStatusPresentation
+                : nil
+        ) {
+            Task {
+                await controlModel.run()
+            }
+        }
         .task(id: scenePhase) {
             if scenePhase == .active {
                 await controlModel.run(reactivating: true)

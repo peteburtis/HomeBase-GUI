@@ -35,7 +35,9 @@ struct ScenesView: View {
                             scene.name,
                             isOn: Binding(
                                 get: {
-                                    model.isActive(sceneNamed: scene.name)
+                                    model.isPresented(
+                                        sceneNamed: scene.name
+                                    )
                                 },
                                 set: { isActive in
                                     Task {
@@ -47,9 +49,22 @@ struct ScenesView: View {
                                 }
                             )
                         )
+                        .tint(
+                            model.isMatchedOnly(sceneNamed: scene.name)
+                                ? .orange
+                                : .accentColor
+                        )
                         .disabled(
                             model.state != .live
                                 || model.isUpdating(sceneNamed: scene.name)
+                                || !model.canToggle(
+                                    sceneNamed: scene.name
+                                )
+                        )
+                        .accessibilityValue(
+                            model.accessibilityValue(
+                                sceneNamed: scene.name
+                            )
                         )
                     }
                 }
@@ -66,11 +81,14 @@ struct ScenesView: View {
                 }
             } header: {
                 Text("Scenes")
-            } footer: {
-                connectionStatus
             }
         }
         .navigationTitle(server.endpoint.host)
+        .connectionStatusOverlay(connectionStatus) {
+            Task {
+                await model.run()
+            }
+        }
         .task(id: scenePhase) {
             if scenePhase == .active {
                 await model.run(reactivating: true)
@@ -85,43 +103,19 @@ struct ScenesView: View {
         }
     }
 
-    @ViewBuilder
-    private var connectionStatus: some View {
+    private var connectionStatus: ConnectionStatusPresentation {
         switch model.state {
         case .idle:
-            Label("Not Monitoring", systemImage: "pause.circle")
-                .foregroundStyle(.secondary)
+            .disconnected("Not Monitoring", systemImage: "pause.circle")
 
         case .loading:
-            HStack(spacing: 6) {
-                ProgressView()
-                    .controlSize(.mini)
-                Text("Loading scenes…")
-            }
-            .foregroundStyle(.secondary)
+            .pending("Loading scenes…")
 
         case .live:
-            Label(
-                "Connected",
-                systemImage: "dot.radiowaves.left.and.right"
-            )
-            .foregroundStyle(.green)
+            .connected
 
         case .failed(let message):
-            VStack(alignment: .leading, spacing: 5) {
-                Label(
-                    "Monitoring Failed",
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-                .foregroundStyle(.red)
-                Text(message)
-                    .foregroundStyle(.red)
-                Button("Try Again") {
-                    Task {
-                        await model.run()
-                    }
-                }
-            }
+            .failed(title: "Monitoring Failed", message: message)
         }
     }
 
@@ -150,6 +144,7 @@ private final class ServerScenesModel: ObservableObject {
     @Published private(set) var scenes: [HBSceneStateResult] = []
     @Published private(set) var updatingSceneNames: Set<String> = []
     @Published private(set) var actionError: String?
+    @Published private var optimisticPresentation: [String: Bool] = [:]
 
     private let client: HomeBaseWebSocketClient
     private var subscriptionID: UUID?
@@ -205,10 +200,34 @@ private final class ServerScenesModel: ObservableObject {
         await stopSubscription()
     }
 
-    func isActive(sceneNamed name: String) -> Bool {
-        scenes.first(where: {
-            $0.name.caseInsensitiveCompare(name) == .orderedSame
-        })?.isActive ?? false
+    func isPresented(sceneNamed name: String) -> Bool {
+        let normalizedName = name.lowercased()
+        if let optimistic = optimisticPresentation[normalizedName] {
+            return optimistic
+        }
+        return scene(named: name)?.isPresented ?? false
+    }
+
+    func isMatchedOnly(sceneNamed name: String) -> Bool {
+        scene(named: name)?.isMatchedOnly ?? false
+    }
+
+    func canToggle(sceneNamed name: String) -> Bool {
+        guard let scene = scene(named: name) else { return false }
+        return !scene.isMatchedOnly || scene.matchedDismissible
+    }
+
+    func accessibilityValue(sceneNamed name: String) -> String {
+        guard let scene = scene(named: name) else { return "Off" }
+        if scene.isActive {
+            return "Active"
+        }
+        if scene.isMatchedOnly {
+            return scene.matchedDismissible
+                ? "Matched and dismissible"
+                : "Matched and cannot be dismissed"
+        }
+        return "Off"
     }
 
     func isUpdating(sceneNamed name: String) -> Bool {
@@ -225,29 +244,32 @@ private final class ServerScenesModel: ObservableObject {
             return
         }
 
-        let previousState = scenes[sceneIndex].isActive
-        scenes[sceneIndex].isActive = active
+        let scene = scenes[sceneIndex]
+        let dismissMatchedScene = !active && scene.isMatchedOnly
+        guard !dismissMatchedScene || scene.matchedDismissible else {
+            updatingSceneNames.remove(normalizedName)
+            return
+        }
+
+        optimisticPresentation[normalizedName] = active
         actionError = nil
 
         defer {
+            optimisticPresentation.removeValue(forKey: normalizedName)
             updatingSceneNames.remove(normalizedName)
         }
 
         do {
             let result = try await client.setScene(
                 named: name,
-                active: active
+                active: active,
+                allowMatchedDismissal: dismissMatchedScene
             )
             guard let updatedIndex = index(ofSceneNamed: result.name) else {
                 return
             }
-            scenes[updatedIndex].isActive = result.isActive
-            scenes[updatedIndex].discoveredActivation =
-                result.discoveredActivation
+            scenes[updatedIndex] = result
         } catch {
-            if let currentIndex = index(ofSceneNamed: name) {
-                scenes[currentIndex].isActive = previousState
-            }
             actionError = "Could not update \(name): \(error.localizedDescription)"
         }
     }
@@ -286,6 +308,12 @@ private final class ServerScenesModel: ObservableObject {
         })
     }
 
+    private func scene(named name: String) -> HBSceneStateResult? {
+        scenes.first(where: {
+            $0.name.caseInsensitiveCompare(name) == .orderedSame
+        })
+    }
+
     private static func sceneOrder(
         _ lhs: HBSceneStateResult,
         _ rhs: HBSceneStateResult
@@ -301,5 +329,15 @@ private final class ServerScenesModel: ObservableObject {
         guard let subscriptionID else { return }
         self.subscriptionID = nil
         try? await client.cancelSubscription(subscriptionID)
+    }
+}
+
+private extension HBSceneStateResult {
+    var isPresented: Bool {
+        isActive || application.status == .applied
+    }
+
+    var isMatchedOnly: Bool {
+        !isActive && application.status == .applied
     }
 }

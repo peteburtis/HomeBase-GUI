@@ -35,6 +35,11 @@ struct DeviceDetailView: View {
             )
         }
         .navigationTitle(device.displayName)
+        .connectionStatusOverlay(model.state.connectionStatusPresentation) {
+            Task {
+                await model.run()
+            }
+        }
         .task(id: scenePhase) {
             if scenePhase == .active {
                 await model.run(reactivating: true)
@@ -64,56 +69,21 @@ struct LiveDeviceControlSections: View {
                 ForEach(model.controls) { control in
                     ControlStateRow(
                         control: control,
-                        interactionEnabled: model.state == .live
-                    ) { value in
-                        await model.setNumericValue(value, for: control)
-                    }
+                        interactionEnabled: model.state == .live,
+                        setValue: { value in
+                            await model.setNumericValue(value, for: control)
+                        },
+                        setColorValue: { value in
+                            try await model.setColorValue(value, for: control)
+                        },
+                        colorValues: {
+                            model.colorValueStream(for: control)
+                        }
+                    )
                 }
             }
         } header: {
             Text("Controls")
-        } footer: {
-            connectionStatus
-        }
-    }
-
-    @ViewBuilder
-    private var connectionStatus: some View {
-        switch model.state {
-        case .idle:
-            Label("Not Monitoring", systemImage: "pause.circle")
-                .foregroundStyle(.secondary)
-
-        case .loading:
-            HStack(spacing: 6) {
-                ProgressView()
-                    .controlSize(.mini)
-                Text("Loading controls…")
-            }
-            .foregroundStyle(.secondary)
-
-        case .live:
-            Label(
-                "Connected",
-                systemImage: "dot.radiowaves.left.and.right"
-            )
-            .foregroundStyle(.green)
-
-        case .failed(let message):
-            VStack(alignment: .leading, spacing: 5) {
-                Label(
-                    "Monitoring Failed",
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-                .foregroundStyle(.red)
-                Text(message)
-                    .foregroundStyle(.red)
-                Button("Try Again") {
-                    Task {
-                        await model.run()
-                    }
-                }
-            }
         }
     }
 
@@ -133,6 +103,11 @@ private struct ControlStateRow: View {
     let control: LiveDeviceControl
     let interactionEnabled: Bool
     let setValue: (Double) async -> Void
+    let setColorValue: (HBJSONValue) async throws -> Void
+    let colorValues: () -> AsyncThrowingStream<
+        HomeBaseColorPickerObservation,
+        Error
+    >
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -150,7 +125,9 @@ private struct ControlStateRow: View {
                     ControlValueView(
                         control: control,
                         interactionEnabled: interactionEnabled,
-                        setValue: setValue
+                        setValue: setValue,
+                        setColorValue: setColorValue,
+                        colorValues: colorValues
                     )
                     if control.valid == false,
                        !control.valuePresentation.presentsStaleness {
@@ -238,6 +215,20 @@ final class LiveDeviceControlsModel: ObservableObject {
         case loading
         case live
         case failed(String)
+    }
+
+    private enum UpdateError: LocalizedError {
+        case unavailable
+        case unsupportedColor
+
+        var errorDescription: String? {
+            switch self {
+            case .unavailable:
+                "This control is not currently available."
+            case .unsupportedColor:
+                "This color value is not supported by the control."
+            }
+        }
     }
 
     @Published private(set) var state: State = .idle
@@ -332,6 +323,149 @@ final class LiveDeviceControlsModel: ObservableObject {
         }
 
         await setValue(protocolValue, for: control)
+    }
+
+    func setColorValue(
+        _ value: HBJSONValue,
+        for control: LiveDeviceControl
+    ) async throws {
+        guard let capabilities = HomeBaseColorPickerCapabilities(
+            controlKind: control.descriptor.kind
+        ),
+        let key = value.objectValue?.keys.first?.lowercased(),
+        (key == "xy" && capabilities.supportsXY)
+            || (key == "rgb" && capabilities.supportsRGB)
+            || (key == "white" && capabilities.supportsWhite) else {
+            throw UpdateError.unsupportedColor
+        }
+
+        ControlWriteDiagnostics.log(
+            stage: "model-color-entry",
+            control: control.descriptor.control,
+            value: value
+        )
+        let identity = control.id
+        guard var current = controlsByIdentity[identity],
+              !current.isUpdating else {
+            throw UpdateError.unavailable
+        }
+
+        current.pendingValue = value
+        current.isUpdating = true
+        current.updateError = nil
+        controlsByIdentity[identity] = current
+        publishControls()
+
+        do {
+            do {
+                try await client.setControl(
+                    current.descriptor.control,
+                    to: value
+                )
+            } catch let protocolError as HBProtocolError {
+                throw protocolError
+            } catch {
+                // A picker remains useful as a pushed screen even though the
+                // originating detail view may no longer be monitoring. If its
+                // session went away during that transition, rebuild it once
+                // and repeat this idempotent color write.
+                try await client.reactivate()
+                try await client.setControl(
+                    current.descriptor.control,
+                    to: value
+                )
+            }
+
+            guard var updated = controlsByIdentity[identity] else { return }
+            updated.value = value
+            updated.displayValue = nil
+            updated.pendingValue = nil
+            updated.isUpdating = false
+            updated.updateError = nil
+            controlsByIdentity[identity] = updated
+            publishControls()
+        } catch {
+            if var updated = controlsByIdentity[identity] {
+                updated.pendingValue = nil
+                updated.isUpdating = false
+                updated.updateError =
+                    "Could not update: \(error.localizedDescription)"
+                controlsByIdentity[identity] = updated
+                publishControls()
+            }
+            throw error
+        }
+    }
+
+    func colorValueStream(
+        for control: LiveDeviceControl
+    ) -> AsyncThrowingStream<HomeBaseColorPickerObservation, Error> {
+        let client = client
+        let deviceIdentifier = control.descriptor.deviceIdentifier
+        let controlIdentifier = control.descriptor.controlIdentifier
+        let subscriptionDevice = HBTopologyDeviceDescriptor(
+            identifier: deviceIdentifier,
+            addressableName: deviceIdentifier,
+            displayName: control.displayName
+        )
+
+        return AsyncThrowingStream { continuation in
+            let producer = Task {
+                var subscriptionID: UUID?
+                do {
+                    try await client.reactivate()
+                    let subscription = try await client.subscribe(
+                        to: subscriptionDevice
+                    )
+                    subscriptionID = subscription.identifier
+
+                    for try await event in subscription.events {
+                        try Task.checkCancellation()
+                        guard event.kind == .initial
+                                || event.kind == .change
+                                || event.kind == .controlAdded,
+                              let descriptor = event.control,
+                              descriptor.deviceIdentifier
+                                .caseInsensitiveCompare(deviceIdentifier)
+                                == .orderedSame,
+                              descriptor.controlIdentifier
+                                .caseInsensitiveCompare(controlIdentifier)
+                                == .orderedSame,
+                              event.valid != false,
+                              event.aggregateState != .unavailable else {
+                            continue
+                        }
+                        continuation.yield(
+                            HomeBaseColorPickerObservation(
+                                value: event.value,
+                                aggregateState: event.aggregateState,
+                                aggregateValues: event.aggregateValues,
+                                aggregateValueCount: event.aggregateValueCount
+                            )
+                        )
+                    }
+
+                    if let subscriptionID {
+                        try? await client.cancelSubscription(subscriptionID)
+                    }
+                    continuation.finish()
+                } catch is CancellationError {
+                    if let subscriptionID {
+                        try? await client.cancelSubscription(subscriptionID)
+                    }
+                    continuation.finish()
+                } catch {
+                    if let subscriptionID {
+                        try? await client.cancelSubscription(subscriptionID)
+                    }
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { @Sendable _ in
+                producer.cancel()
+            }
+        }
     }
 
     private func setValue(
@@ -504,6 +638,21 @@ final class LiveDeviceControlsModel: ObservableObject {
         guard let subscriptionID else { return }
         self.subscriptionID = nil
         try? await client.cancelSubscription(subscriptionID)
+    }
+}
+
+extension LiveDeviceControlsModel.State {
+    var connectionStatusPresentation: ConnectionStatusPresentation {
+        switch self {
+        case .idle:
+            .disconnected("Not Monitoring", systemImage: "pause.circle")
+        case .loading:
+            .pending("Loading controls…")
+        case .live:
+            .connected
+        case .failed(let message):
+            .failed(title: "Monitoring Failed", message: message)
+        }
     }
 }
 

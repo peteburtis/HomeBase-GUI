@@ -391,17 +391,27 @@ actor HomeBaseWebSocketClient {
 
     func setScene(
         named name: String,
-        active: Bool
+        active: Bool,
+        allowMatchedDismissal: Bool = false
     ) async throws -> HBSceneStateResult {
         let request = try sessionRequest(
             operation: active
                 ? HBProtocolOperations.setScene
                 : HBProtocolOperations.clearScene,
-            payload: HBSceneRequest(name: name)
+            payload: HBSceneRequest(
+                name: name,
+                allowMatchedDismissal:
+                    !active && allowMatchedDismissal ? true : nil
+            )
         )
         let response = try await sendRequest(request)
         let body = try response.decodedPayload(as: HBProtocolResponse.self)
-        let result = try body.decodedResult(as: HBSceneStateResult.self)
+        let result: HBSceneStateResult
+        if active {
+            result = try body.decodedResult(as: HBSceneStateResult.self)
+        } else {
+            result = try body.decodedResult(as: HBSceneClearResult.self).scene
+        }
         guard result.name.caseInsensitiveCompare(name) == .orderedSame else {
             throw ClientError.invalidMessage(
                 "a scene update returned a different scene"
