@@ -80,6 +80,12 @@ struct LiveDeviceControlSections: View {
                             model.colorValueStream(for: control)
                         }
                     )
+                    .alignmentGuide(.listRowSeparatorLeading) {
+                        $0[.leading]
+                    }
+                    .alignmentGuide(.listRowSeparatorTrailing) {
+                        $0[.trailing]
+                    }
                 }
             }
         } header: {
