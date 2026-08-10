@@ -9,10 +9,12 @@ import Foundation
 @MainActor
 final class PairedServerStore: ObservableObject {
     @Published private(set) var servers: [PairedServer]
+    @Published private(set) var selectedServerID: UUID?
     @Published private(set) var persistenceError: String?
 
     private let defaults: UserDefaults
     private let storageKey: String
+    private let selectionStorageKey: String
 
     private struct Snapshot: Codable {
         let version: Int
@@ -21,13 +23,16 @@ final class PairedServerStore: ObservableObject {
 
     init(
         defaults: UserDefaults = .standard,
-        storageKey: String = "pairedServers"
+        storageKey: String = "pairedServers",
+        selectionStorageKey: String = "selectedPairedServerID"
     ) {
         self.defaults = defaults
         self.storageKey = storageKey
+        self.selectionStorageKey = selectionStorageKey
 
         guard let data = defaults.data(forKey: storageKey) else {
             servers = []
+            selectedServerID = nil
             return
         }
 
@@ -35,14 +40,28 @@ final class PairedServerStore: ObservableObject {
             let snapshot = try JSONDecoder().decode(Snapshot.self, from: data)
             guard snapshot.version == 1 else {
                 servers = []
+                selectedServerID = nil
                 persistenceError = "The saved server list uses an unsupported format."
                 return
             }
             servers = snapshot.servers
+            let persistedSelection = defaults
+                .string(forKey: selectionStorageKey)
+                .flatMap(UUID.init(uuidString:))
+            selectedServerID = snapshot.servers.contains {
+                $0.id == persistedSelection
+            } ? persistedSelection : snapshot.servers.first?.id
+            persistSelection()
         } catch {
             servers = []
+            selectedServerID = nil
             persistenceError = "The saved server list could not be read: \(error.localizedDescription)"
         }
+    }
+
+    var selectedServer: PairedServer? {
+        guard let selectedServerID else { return nil }
+        return servers.first { $0.id == selectedServerID }
     }
 
     @discardableResult
@@ -57,13 +76,30 @@ final class PairedServerStore: ObservableObject {
 
         let server = PairedServer(endpoint: endpoint)
         servers.append(server)
+        if selectedServerID == nil {
+            selectedServerID = server.id
+            persistSelection()
+        }
         persist()
         return server
+    }
+
+    func select(_ server: PairedServer) {
+        guard servers.contains(where: { $0.id == server.id }),
+              selectedServerID != server.id else {
+            return
+        }
+        selectedServerID = server.id
+        persistSelection()
     }
 
     func remove(at offsets: IndexSet) {
         for index in offsets.sorted(by: >) {
             servers.remove(at: index)
+        }
+        if !servers.contains(where: { $0.id == selectedServerID }) {
+            selectedServerID = servers.first?.id
+            persistSelection()
         }
         persist()
     }
@@ -77,6 +113,14 @@ final class PairedServerStore: ObservableObject {
             persistenceError = nil
         } catch {
             persistenceError = "The server list could not be saved: \(error.localizedDescription)"
+        }
+    }
+
+    private func persistSelection() {
+        if let selectedServerID {
+            defaults.set(selectedServerID.uuidString, forKey: selectionStorageKey)
+        } else {
+            defaults.removeObject(forKey: selectionStorageKey)
         }
     }
 }

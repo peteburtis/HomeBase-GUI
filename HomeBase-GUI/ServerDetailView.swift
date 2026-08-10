@@ -11,10 +11,15 @@ struct ServerDetailView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     let server: PairedServer
+    let showServers: () -> Void
     @StateObject private var connection: ServerConnectionModel
 
-    init(server: PairedServer) {
+    init(
+        server: PairedServer,
+        showServers: @escaping () -> Void
+    ) {
         self.server = server
+        self.showServers = showServers
         _connection = StateObject(
             wrappedValue: ServerConnectionModel(endpoint: server.endpoint)
         )
@@ -22,15 +27,25 @@ struct ServerDetailView: View {
 
     var body: some View {
         TabView {
-            homeView
+            NavigationStack {
+                homeView
+                    .toolbar {
+                        ToolbarItem(placement: .navigation) {
+                            Button("Servers", systemImage: "list.bullet") {
+                                showServers()
+                            }
+                        }
+                    }
+            }
                 .tabItem {
                     Label("Home", systemImage: "house")
                 }
 
-            ScenesView(
-                server: server,
-                client: connection.client
-            )
+            NavigationStack {
+                ScenesView(
+                    client: connection.client
+                )
+            }
                 .tabItem {
                     Label("Scenes", systemImage: "sparkles")
                 }
@@ -96,7 +111,7 @@ struct ServerDetailView: View {
                 }
             }
         }
-        .navigationTitle(server.endpoint.host)
+        .navigationTitle("Home")
         .refreshable {
             await connection.refresh()
         }

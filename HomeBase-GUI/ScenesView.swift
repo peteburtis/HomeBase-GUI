@@ -10,14 +10,9 @@ import SwiftUI
 struct ScenesView: View {
     @Environment(\.scenePhase) private var scenePhase
 
-    let server: PairedServer
     @StateObject private var model: ServerScenesModel
 
-    init(
-        server: PairedServer,
-        client: HomeBaseWebSocketClient
-    ) {
-        self.server = server
+    init(client: HomeBaseWebSocketClient) {
         _model = StateObject(
             wrappedValue: ServerScenesModel(client: client)
         )
@@ -83,7 +78,7 @@ struct ScenesView: View {
                 Text("Scenes")
             }
         }
-        .navigationTitle(server.endpoint.host)
+        .navigationTitle("Scenes")
         .connectionStatusOverlay(connectionStatus) {
             Task {
                 await model.run()
