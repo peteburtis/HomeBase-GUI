@@ -20,6 +20,15 @@ actor HomeBaseWebSocketClient {
         let events: AsyncThrowingStream<HBSceneWatchStreamEvent, Error>
     }
 
+    struct ControlStackSubscription: Sendable {
+        let identifier: UUID
+        let controls: [String]
+        let events: AsyncThrowingStream<
+            HBControlStackWatchStreamEvent,
+            Error
+        >
+    }
+
     enum ClientError: Error, LocalizedError {
         case invalidEndpoint
         case notConnected
@@ -86,6 +95,15 @@ actor HomeBaseWebSocketClient {
     ] = [:]
     private var bufferedSceneSubscriptionEvents: [
         UUID: [HBSceneWatchStreamEvent]
+    ] = [:]
+    private var controlStackSubscriptionContinuations: [
+        UUID: AsyncThrowingStream<
+            HBControlStackWatchStreamEvent,
+            Error
+        >.Continuation
+    ] = [:]
+    private var bufferedControlStackSubscriptionEvents: [
+        UUID: [HBControlStackWatchStreamEvent]
     ] = [:]
     private var subscriptionSequences: [UUID: Int64] = [:]
     private var latestDeliverySequence: Int64 = 0
@@ -483,8 +501,90 @@ actor HomeBaseWebSocketClient {
         return details
     }
 
+    func controlHistory(
+        for control: String,
+        limit: Int = 50,
+        cursor: String? = nil
+    ) async throws -> HBControlHistoryResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.getControlHistory,
+            payload: HBControlHistoryRequest(
+                control: control,
+                limit: limit,
+                cursor: cursor
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(as: HBControlHistoryResult.self)
+        guard result.control.caseInsensitiveCompare(control) == .orderedSame
+        else {
+            throw ClientError.invalidMessage(
+                "control history returned a different control"
+            )
+        }
+        return result
+    }
+
+    func subscribeToControlStacks(
+        for device: HBTopologyDeviceDescriptor,
+        controlIdentifiers: [String]? = nil,
+        includeCompatibility: Bool = false
+    ) async throws -> ControlStackSubscription {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.streamControlStacks,
+            payload: HBControlStackWatchStreamRequest(
+                device: device.addressableName,
+                controlIdentifiers: controlIdentifiers,
+                includeCompatibility: includeCompatibility,
+                heartbeatSeconds: 30
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let accepted = try body.decodedResult(
+            as: HBControlStackWatchStreamAccepted.self
+        )
+        if let envelopeSubscriptionID = response.subscriptionID,
+           envelopeSubscriptionID != accepted.subscriptionID {
+            throw ClientError.invalidMessage(
+                "the accepted control-stack subscription identifiers do not match"
+            )
+        }
+
+        let pair = AsyncThrowingStream<
+            HBControlStackWatchStreamEvent,
+            Error
+        >.makeStream()
+        let subscriptionID = accepted.subscriptionID
+        activeSubscriptions.insert(subscriptionID)
+        controlStackSubscriptionContinuations[subscriptionID] =
+            pair.continuation
+        pair.continuation.onTermination = { @Sendable [weak self] _ in
+            Task {
+                await self?.controlStackSubscriptionConsumerTerminated(
+                    subscriptionID
+                )
+            }
+        }
+        if let buffered = bufferedControlStackSubscriptionEvents.removeValue(
+            forKey: subscriptionID
+        ) {
+            for event in buffered {
+                pair.continuation.yield(event)
+            }
+        }
+
+        return ControlStackSubscription(
+            identifier: subscriptionID,
+            controls: accepted.controls,
+            events: pair.stream
+        )
+    }
+
     func subscribe(
-        to device: HBTopologyDeviceDescriptor
+        to device: HBTopologyDeviceDescriptor,
+        includeCompatibility: Bool = false
     ) async throws -> ControlSubscription {
         let request = try sessionRequest(
             operation: HBProtocolOperations.streamControls,
@@ -495,6 +595,7 @@ actor HomeBaseWebSocketClient {
                         target: device.identifier
                     )
                 ],
+                includeCompatibility: includeCompatibility,
                 heartbeatSeconds: 30
             )
         )
@@ -954,6 +1055,42 @@ actor HomeBaseWebSocketClient {
                     buffered
             }
 
+        case HBProtocolOperations.streamControlStacks:
+            let event = try envelope.decodedPayload(
+                as: HBControlStackWatchStreamEvent.self
+            )
+            if let envelopeSubscriptionID = envelope.subscriptionID,
+               envelopeSubscriptionID != event.subscriptionID {
+                throw ClientError.invalidMessage(
+                    "a streamed control-stack event changed subscription identifiers"
+                )
+            }
+            guard try acceptSubscriptionEvent(
+                identifier: event.subscriptionID,
+                sequence: event.sequence
+            ) else { return }
+
+            if let continuation = controlStackSubscriptionContinuations[
+                event.subscriptionID
+            ] {
+                continuation.yield(event)
+            } else {
+                var buffered = bufferedControlStackSubscriptionEvents[
+                    event.subscriptionID,
+                    default: []
+                ]
+                guard buffered.count
+                        < Self.maximumBufferedSubscriptionEvents else {
+                    throw ClientError.invalidMessage(
+                        "too many control-stack events arrived before acceptance"
+                    )
+                }
+                buffered.append(event)
+                bufferedControlStackSubscriptionEvents[
+                    event.subscriptionID
+                ] = buffered
+            }
+
         case HBProtocolOperations.subscriptionTerminated:
             let event = try envelope.decodedPayload(
                 as: HBSubscriptionTerminatedEvent.self
@@ -1076,6 +1213,16 @@ actor HomeBaseWebSocketClient {
         }
     }
 
+    private func controlStackSubscriptionConsumerTerminated(
+        _ identifier: UUID
+    ) {
+        controlStackSubscriptionContinuations.removeValue(forKey: identifier)
+        guard activeSubscriptions.contains(identifier) else { return }
+        Task { [weak self] in
+            try? await self?.cancelSubscription(identifier)
+        }
+    }
+
     private func cancelAbandonedSubscription(
         from envelope: HBProtocolEnvelope
     ) {
@@ -1094,6 +1241,10 @@ actor HomeBaseWebSocketClient {
         case HBProtocolOperations.streamScenes:
             subscriptionID = try? body.decodedResult(
                 as: HBSceneWatchStreamAccepted.self
+            ).subscriptionID
+        case HBProtocolOperations.streamControlStacks:
+            subscriptionID = try? body.decodedResult(
+                as: HBControlStackWatchStreamAccepted.self
             ).subscriptionID
         default:
             subscriptionID = nil
@@ -1116,15 +1267,22 @@ actor HomeBaseWebSocketClient {
         let sceneContinuation = sceneSubscriptionContinuations.removeValue(
             forKey: identifier
         )
+        let controlStackContinuation =
+            controlStackSubscriptionContinuations.removeValue(
+                forKey: identifier
+            )
         if let error {
             controlContinuation?.finish(throwing: error)
             sceneContinuation?.finish(throwing: error)
+            controlStackContinuation?.finish(throwing: error)
         } else {
             controlContinuation?.finish()
             sceneContinuation?.finish()
+            controlStackContinuation?.finish()
         }
         bufferedControlSubscriptionEvents.removeValue(forKey: identifier)
         bufferedSceneSubscriptionEvents.removeValue(forKey: identifier)
+        bufferedControlStackSubscriptionEvents.removeValue(forKey: identifier)
         subscriptionSequences.removeValue(forKey: identifier)
     }
 
@@ -1165,16 +1323,23 @@ actor HomeBaseWebSocketClient {
 
         let controlSubscriptions = controlSubscriptionContinuations.values
         let sceneSubscriptions = sceneSubscriptionContinuations.values
+        let controlStackSubscriptions =
+            controlStackSubscriptionContinuations.values
         controlSubscriptionContinuations.removeAll()
         sceneSubscriptionContinuations.removeAll()
+        controlStackSubscriptionContinuations.removeAll()
         activeSubscriptions.removeAll()
         bufferedControlSubscriptionEvents.removeAll()
         bufferedSceneSubscriptionEvents.removeAll()
+        bufferedControlStackSubscriptionEvents.removeAll()
         subscriptionSequences.removeAll()
         for continuation in controlSubscriptions {
             continuation.finish(throwing: error)
         }
         for continuation in sceneSubscriptions {
+            continuation.finish(throwing: error)
+        }
+        for continuation in controlStackSubscriptions {
             continuation.finish(throwing: error)
         }
     }

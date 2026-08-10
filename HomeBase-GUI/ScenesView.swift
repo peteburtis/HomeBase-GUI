@@ -4,6 +4,7 @@
 //
 
 import Combine
+import Foundation
 import HomeBaseProtocol
 import SwiftUI
 
@@ -27,7 +28,6 @@ struct ScenesView: View {
                 } else {
                     ForEach(model.scenes, id: \.name) { scene in
                         Toggle(
-                            scene.name,
                             isOn: Binding(
                                 get: {
                                     model.isPresented(
@@ -43,7 +43,21 @@ struct ScenesView: View {
                                     }
                                 }
                             )
-                        )
+                        ) {
+                            HStack(spacing: 8) {
+                                Text(scene.name)
+                                Spacer(minLength: 8)
+                                SceneActivationAccessory(
+                                    countdownDeadline:
+                                        model.activationDeadline(
+                                            sceneNamed: scene.name
+                                        ),
+                                    priority: model.activePriority(
+                                        sceneNamed: scene.name
+                                    )
+                                )
+                            }
+                        }
                         .tint(
                             model.isMatchedOnly(sceneNamed: scene.name)
                                 ? .orange
@@ -126,6 +140,77 @@ struct ScenesView: View {
     }
 }
 
+private struct SceneActivationAccessory: View {
+    private static let userPriority = Int(Int32.max)
+    private static let userPriorityLabel = "P-User"
+
+    let countdownDeadline: Date?
+    let priority: Int?
+
+    @State private var now = Date()
+
+    var body: some View {
+        Group {
+            if remainingSeconds > 0 {
+                Text(countdownText)
+                    .accessibilityLabel(
+                        "\(remainingSeconds) seconds remaining"
+                    )
+            } else if let priority {
+                Text(priorityText(priority))
+                    .accessibilityLabel(priorityAccessibilityText(priority))
+            }
+        }
+        .font(.subheadline)
+        .foregroundStyle(.secondary)
+        .monospacedDigit()
+        .task(id: countdownDeadline) {
+            await runCountdown()
+        }
+    }
+
+    private var remainingSeconds: Int {
+        guard let countdownDeadline else { return 0 }
+        return max(
+            0,
+            Int(ceil(countdownDeadline.timeIntervalSince(now)))
+        )
+    }
+
+    private var countdownText: String {
+        String(
+            format: "%d:%02d",
+            remainingSeconds / 60,
+            remainingSeconds % 60
+        )
+    }
+
+    private func priorityText(_ priority: Int) -> String {
+        priority == Self.userPriority
+            ? Self.userPriorityLabel
+            : "P-\(priority)"
+    }
+
+    private func priorityAccessibilityText(_ priority: Int) -> String {
+        priority == Self.userPriority
+            ? "User priority"
+            : "Priority \(priority)"
+    }
+
+    private func runCountdown() async {
+        now = Date()
+        guard let countdownDeadline else { return }
+        while !Task.isCancelled, countdownDeadline > now {
+            do {
+                try await Task<Never, Never>.sleep(for: .seconds(1))
+            } catch {
+                return
+            }
+            now = Date()
+        }
+    }
+}
+
 @MainActor
 private final class ServerScenesModel: ObservableObject {
     enum State: Equatable {
@@ -140,9 +225,11 @@ private final class ServerScenesModel: ObservableObject {
     @Published private(set) var updatingSceneNames: Set<String> = []
     @Published private(set) var actionError: String?
     @Published private var optimisticPresentation: [String: Bool] = [:]
+    @Published private var activationDeadlines: [String: Date] = [:]
 
     private let client: HomeBaseWebSocketClient
     private var subscriptionID: UUID?
+    private var activationDurations: [String: TimeInterval] = [:]
 
     init(client: HomeBaseWebSocketClient) {
         self.client = client
@@ -168,6 +255,9 @@ private final class ServerScenesModel: ObservableObject {
                 throw CancellationError()
             }
             subscriptionID = subscription.identifier
+            let sceneDefinitions = (try? await client.listScenes()) ?? []
+            try Task.checkCancellation()
+            installDefinitions(sceneDefinitions)
             install(subscription.scenes)
             state = .live
 
@@ -229,6 +319,17 @@ private final class ServerScenesModel: ObservableObject {
         updatingSceneNames.contains(name.lowercased())
     }
 
+    func activationDeadline(sceneNamed name: String) -> Date? {
+        activationDeadlines[name.lowercased()]
+    }
+
+    func activePriority(sceneNamed name: String) -> Int? {
+        guard let scene = scene(named: name), scene.isActive else {
+            return nil
+        }
+        return scene.owners.map(\.priority).max()
+    }
+
     func setScene(named name: String, active: Bool) async {
         let normalizedName = name.lowercased()
         guard state == .live,
@@ -246,6 +347,10 @@ private final class ServerScenesModel: ObservableObject {
             return
         }
 
+        updateActivationCountdown(
+            sceneNamed: name,
+            activating: active
+        )
         optimisticPresentation[normalizedName] = active
         actionError = nil
 
@@ -265,8 +370,34 @@ private final class ServerScenesModel: ObservableObject {
             }
             scenes[updatedIndex] = result
         } catch {
+            activationDeadlines.removeValue(forKey: normalizedName)
             actionError = "Could not update \(name): \(error.localizedDescription)"
         }
+    }
+
+    private func installDefinitions(_ definitions: [HBSceneDescriptor]) {
+        activationDurations.removeAll(keepingCapacity: true)
+        for definition in definitions {
+            guard let timing = definition.timing else { continue }
+            let duration = max(0, timing.delay) + max(0, timing.duration)
+            guard duration.isFinite else { continue }
+            activationDurations[definition.name.lowercased()] = duration
+        }
+    }
+
+    private func updateActivationCountdown(
+        sceneNamed name: String,
+        activating: Bool
+    ) {
+        let normalizedName = name.lowercased()
+        guard activating,
+              let duration = activationDurations[normalizedName],
+              duration > 5 else {
+            activationDeadlines.removeValue(forKey: normalizedName)
+            return
+        }
+        activationDeadlines[normalizedName] = Date()
+            .addingTimeInterval(duration)
     }
 
     private func install(_ scenes: [HBSceneStateResult]) {
@@ -282,6 +413,11 @@ private final class ServerScenesModel: ObservableObject {
             } else {
                 scenes.append(scene)
             }
+            if !scene.isActive {
+                activationDeadlines.removeValue(
+                    forKey: scene.name.lowercased()
+                )
+            }
             scenes.sort(by: Self.sceneOrder)
 
         case .sceneRemoved:
@@ -291,6 +427,9 @@ private final class ServerScenesModel: ObservableObject {
             }
             scenes.remove(at: index)
             updatingSceneNames.remove(scene.name.lowercased())
+            activationDeadlines.removeValue(
+                forKey: scene.name.lowercased()
+            )
 
         case .heartbeat:
             break

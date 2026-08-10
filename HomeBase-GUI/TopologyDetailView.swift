@@ -146,14 +146,10 @@ private struct TopologyDeviceRows: View {
                 NavigationLink {
                     DeviceDetailView(device: device, client: client)
                 } label: {
-                    VStack(alignment: .leading) {
-                        Text(device.displayName)
-                        if device.addressableName != device.displayName {
-                            Text(device.addressableName)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
+                    TopologyRowLabel(
+                        title: device.displayName,
+                        technicalName: device.addressableName
+                    )
                 }
             }
         }

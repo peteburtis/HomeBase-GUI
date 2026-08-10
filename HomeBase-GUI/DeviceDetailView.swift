@@ -12,6 +12,7 @@ struct DeviceDetailView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     let device: HBTopologyDeviceDescriptor
+    private let client: HomeBaseWebSocketClient
     @StateObject private var model: LiveDeviceControlsModel
 
     init(
@@ -19,6 +20,7 @@ struct DeviceDetailView: View {
         client: HomeBaseWebSocketClient
     ) {
         self.device = device
+        self.client = client
         _model = StateObject(
             wrappedValue: LiveDeviceControlsModel(
                 device: device,
@@ -33,6 +35,17 @@ struct DeviceDetailView: View {
                 model: model,
                 subjectKind: "device"
             )
+
+            Section {
+                NavigationLink {
+                    DeviceAdvancedView(
+                        device: device,
+                        client: client
+                    )
+                } label: {
+                    Label("Advanced", systemImage: "slider.horizontal.3")
+                }
+            }
         }
         .navigationTitle(device.displayName)
         .connectionStatusOverlay(model.state.connectionStatusPresentation) {
@@ -120,7 +133,7 @@ private struct ControlStateRow: View {
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(control.displayName)
-                    Text(control.detailText)
+                    Text(control.subtitleText)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -188,12 +201,8 @@ struct LiveDeviceControl: Identifiable {
             || details?.tags.contains(Self.primaryControlTag) == true
     }
 
-    var detailText: String {
-        var parts = [descriptor.kind]
-        if let writable = details?.metadata["writable"]?.boolValue {
-            parts.append(writable ? "Read and write" : "Read only")
-        }
-        return parts.joined(separator: " · ")
+    var subtitleText: String {
+        descriptor.controlIdentifier
     }
 
     var presentedValue: String {

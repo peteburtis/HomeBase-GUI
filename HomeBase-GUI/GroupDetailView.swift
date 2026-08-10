@@ -24,45 +24,52 @@ struct TopologyGroupRow: View {
     let group: HBTopologyGroupDescriptor
 
     var body: some View {
+        TopologyRowLabel(
+            title: group.displayName,
+            technicalName: group.controlDeviceIdentifier,
+            detail: TopologyRowLabel.deviceCountDescription(
+                group.resolvedDeviceIdentifiers.count
+            )
+        )
+    }
+}
+
+struct TopologyRowLabel: View {
+    let title: String
+    let technicalName: String?
+    let detail: String?
+
+    init(
+        title: String,
+        technicalName: String? = nil,
+        detail: String? = nil
+    ) {
+        self.title = title
+        self.technicalName = technicalName
+        self.detail = detail
+    }
+
+    var body: some View {
         VStack(alignment: .leading) {
-            Text(group.displayName)
-            Text(summary)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text(title)
+            if !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
-    private var summary: String {
-        let deviceCount = group.resolvedDeviceIdentifiers.count
-        let devices = deviceCount == 1 ? "1 device" : "\(deviceCount) devices"
-        return "\(group.role.displayName) · \(group.origin.displayName) · \(devices)"
+    static func deviceCountDescription(_ count: Int) -> String {
+        count == 1 ? "1 device" : "\(count) devices"
     }
-}
 
-private extension HBTopologyGroupOrigin {
-    var displayName: String {
-        switch self {
-        case .configured:
-            "Configured"
-        case .roomSynthesized:
-            "Room generated"
-        case .globalSynthesized:
-            "Global generated"
-        }
-    }
-}
-
-private extension HBTopologyGroupRole {
-    var displayName: String {
-        switch self {
-        case .general:
-            "General"
-        case .lights:
-            "Lights"
-        case .coloredLights:
-            "Colored lights"
-        case .temperatureLights:
-            "Temperature lights"
-        }
+    private var subtitle: String {
+        [technicalName, detail]
+            .compactMap { value in
+                guard let value, !value.isEmpty else { return nil }
+                return value
+            }
+            .joined(separator: " · ")
     }
 }

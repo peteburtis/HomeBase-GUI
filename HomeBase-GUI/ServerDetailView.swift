@@ -76,16 +76,13 @@ struct ServerDetailView: View {
                                 client: connection.client
                             )
                         } label: {
-                            VStack(alignment: .leading) {
-                                Text(room.displayName)
-                                Text(
-                                    room.resolvedDeviceIdentifiers.count == 1
-                                        ? "1 device"
-                                        : "\(room.resolvedDeviceIdentifiers.count) devices"
+                            TopologyRowLabel(
+                                title: room.displayName,
+                                technicalName: roomTechnicalName(room),
+                                detail: TopologyRowLabel.deviceCountDescription(
+                                    room.resolvedDeviceIdentifiers.count
                                 )
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            }
+                            )
                         }
                     }
                 }
@@ -146,6 +143,20 @@ struct ServerDetailView: View {
         }
     }
 
+    private func roomTechnicalName(
+        _ room: HBTopologyRoomDescriptor
+    ) -> String? {
+        connection.topology.containsRoom(identifier: room.identifier)
+            ? room.identifier
+            : nil
+    }
+
+}
+
+private extension HBTopologyListResult {
+    func containsRoom(identifier: String) -> Bool {
+        rooms.contains { $0.identifier == identifier }
+    }
 }
 
 @MainActor
