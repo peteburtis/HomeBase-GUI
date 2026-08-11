@@ -7,6 +7,13 @@ import Foundation
 import HomeBaseProtocol
 import SwiftUI
 
+protocol AutomationControlRepository: Sendable {
+    func editableDeviceCatalog() async throws
+        -> SceneConfigurationDeviceCatalog
+}
+
+extension SceneConfigurationRepository: AutomationControlRepository {}
+
 enum SceneControlSetValueSource: Equatable, Sendable {
     case currentPresentation
     case explicit(HBJSONValue)
@@ -397,7 +404,7 @@ private typealias SceneControlPickerChooseRawValue = (
     HBJSONValue
 ) async throws -> Void
 
-struct SceneControlPickerView: View {
+struct SceneControlPickerView<Repository: AutomationControlRepository>: View {
     private struct PresentedError: Identifiable {
         let id = UUID()
         let title: String
@@ -406,7 +413,8 @@ struct SceneControlPickerView: View {
 
     @Environment(\.dismiss) private var dismiss
 
-    let repository: SceneConfigurationRepository
+    let repository: Repository
+    let configurationKind: String
     let excludedControlPaths: Set<String>
     let onSelect:
         (
@@ -414,6 +422,22 @@ struct SceneControlPickerView: View {
             HBControlDescriptor,
             SceneControlSetValueSource
         ) async throws -> Void
+
+    init(
+        repository: Repository,
+        excludedControlPaths: Set<String>,
+        configurationKind: String = "scene",
+        onSelect: @escaping (
+            HBDeviceDescriptor,
+            HBControlDescriptor,
+            SceneControlSetValueSource
+        ) async throws -> Void
+    ) {
+        self.repository = repository
+        self.excludedControlPaths = excludedControlPaths
+        self.configurationKind = configurationKind
+        self.onSelect = onSelect
+    }
 
     @State private var catalog: SceneControlPickerCatalog?
     @State private var hasLoaded = false
@@ -476,7 +500,7 @@ struct SceneControlPickerView: View {
                 Label("No Controls to Add", systemImage: "slider.horizontal.3")
             } description: {
                 Text(
-                    "Every writable control is already in the scene, or no writable controls are available."
+                    "Every writable control is already in the \(configurationKind), or no writable controls are available."
                 )
             }
         } else if let catalog {

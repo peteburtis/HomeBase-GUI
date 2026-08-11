@@ -1,5 +1,5 @@
 //
-//  SceneConfigurationDetailView.swift
+//  TriggerConfigurationDetailView.swift
 //  HomeBase-GUI
 //
 
@@ -8,47 +8,42 @@ import Foundation
 import HomeBaseProtocol
 import SwiftUI
 
-private enum SceneConfigurationEditingSource {
-    case existing(sceneName: String)
-    case newScene(suggestedIdentifier: String)
+private enum TriggerConfigurationEditingSource {
+    case existing(triggerName: String)
+    case newTrigger(suggestedIdentifier: String)
 }
 
-struct SceneConfigurationDetailView: View {
+struct TriggerConfigurationDetailView: View {
     @Environment(\.dismiss) private var dismiss
 
     private let navigationTitle: String
-    private let repository: SceneConfigurationRepository
-    @StateObject private var model: SceneConfigurationDetailModel
+    private let repository: TriggerConfigurationRepository
+    @StateObject private var model: TriggerConfigurationDetailModel
     @State private var isShowingControlPicker = false
+    @State private var isShowingNewConditionEditor = false
     @State private var pendingAddedActionIndex: Int?
     @State private var newlyAddedActionIndex: Int?
 
-    init(
-        sceneName: String,
-        client: HomeBaseWebSocketClient
-    ) {
-        navigationTitle = sceneName
-        let repository = SceneConfigurationRepository(client: client)
+    init(triggerName: String, client: HomeBaseWebSocketClient) {
+        navigationTitle = triggerName
+        let repository = TriggerConfigurationRepository(client: client)
         self.repository = repository
         _model = StateObject(
-            wrappedValue: SceneConfigurationDetailModel(
-                source: .existing(sceneName: sceneName),
+            wrappedValue: TriggerConfigurationDetailModel(
+                source: .existing(triggerName: triggerName),
                 repository: repository
             )
         )
     }
 
-    init(
-        newSceneIdentifier: String,
-        client: HomeBaseWebSocketClient
-    ) {
-        navigationTitle = "Untitled Scene"
-        let repository = SceneConfigurationRepository(client: client)
+    init(newTriggerIdentifier: String, client: HomeBaseWebSocketClient) {
+        navigationTitle = "Untitled Trigger"
+        let repository = TriggerConfigurationRepository(client: client)
         self.repository = repository
         _model = StateObject(
-            wrappedValue: SceneConfigurationDetailModel(
-                source: .newScene(
-                    suggestedIdentifier: newSceneIdentifier
+            wrappedValue: TriggerConfigurationDetailModel(
+                source: .newTrigger(
+                    suggestedIdentifier: newTriggerIdentifier
                 ),
                 repository: repository
             )
@@ -59,32 +54,31 @@ struct SceneConfigurationDetailView: View {
         Group {
             switch model.state {
             case .idle, .loading:
-                ProgressView("Loading scene…")
+                ProgressView("Loading trigger…")
                     .foregroundStyle(.secondary)
 
             case .loaded:
-                SceneConfigurationContents(
+                TriggerConfigurationContents(
                     model: model,
                     newlyAddedActionIndex: $newlyAddedActionIndex,
+                    addCondition: { isShowingNewConditionEditor = true },
                     addAction: beginAddingAction
                 )
-                    .refreshable {
-                        await model.reload()
-                    }
+                .refreshable {
+                    await model.reload()
+                }
 
             case .failed(let message):
                 ContentUnavailableView {
                     Label(
-                        "Scene Could Not Be Loaded",
+                        "Trigger Could Not Be Loaded",
                         systemImage: "exclamationmark.triangle"
                     )
                 } description: {
                     Text(message)
                 } actions: {
                     Button("Try Again") {
-                        Task {
-                            await model.forceReload()
-                        }
+                        Task { await model.forceReload() }
                     }
                 }
             }
@@ -111,8 +105,8 @@ struct SceneConfigurationDetailView: View {
                         ProgressView()
                             .accessibilityLabel(
                                 model.isDeleting
-                                    ? "Deleting scene"
-                                    : "Saving scene"
+                                    ? "Deleting trigger"
+                                    : "Saving trigger"
                             )
                     } else {
                         Button {
@@ -136,13 +130,31 @@ struct SceneConfigurationDetailView: View {
         ) {
             SceneControlPickerView(
                 repository: repository,
-                excludedControlPaths: model.configuredControlPaths
+                excludedControlPaths: [],
+                configurationKind: "trigger"
             ) { device, control, valueSource in
                 pendingAddedActionIndex = try await model.addControlSet(
                     device: device,
                     control: control,
                     valueSource: valueSource
                 )
+            }
+        }
+        .sheet(isPresented: $isShowingNewConditionEditor) {
+            NavigationStack {
+                TriggerConditionJSONEditor(
+                    title: "New Condition",
+                    initialValue: .object([
+                        "Compare": .array([
+                            .integer(0),
+                            .string("=="),
+                            .integer(1),
+                        ])
+                    ]),
+                    actionLabel: "Add"
+                ) { value in
+                    try model.appendCondition(value)
+                }
             }
         }
         .task {
@@ -170,16 +182,14 @@ struct SceneConfigurationDetailView: View {
         }
     }
 
-    private func makeAlert(_ alert: SceneEditorAlert) -> Alert {
+    private func makeAlert(_ alert: TriggerEditorAlert) -> Alert {
         switch alert.kind {
         case .discardChanges:
             Alert(
                 title: Text(alert.title),
                 message: Text(alert.message),
                 primaryButton: .destructive(Text("Discard Changes")) {
-                    Task {
-                        await model.forceReload()
-                    }
+                    Task { await model.forceReload() }
                 },
                 secondaryButton: .cancel()
             )
@@ -194,13 +204,13 @@ struct SceneConfigurationDetailView: View {
                 secondaryButton: .cancel(Text("Keep Editing"))
             )
 
-        case .deleteScene:
+        case .deleteTrigger:
             Alert(
                 title: Text(alert.title),
                 message: Text(alert.message),
-                primaryButton: .destructive(Text("Delete Scene")) {
+                primaryButton: .destructive(Text("Delete Trigger")) {
                     Task {
-                        if await model.deleteScene() {
+                        if await model.deleteTrigger() {
                             dismiss()
                         }
                     }
@@ -213,9 +223,7 @@ struct SceneConfigurationDetailView: View {
                 title: Text(alert.title),
                 message: Text(alert.message),
                 primaryButton: .default(Text("Reload")) {
-                    Task {
-                        await model.forceReload()
-                    }
+                    Task { await model.forceReload() }
                 },
                 secondaryButton: .cancel()
             )
@@ -225,9 +233,7 @@ struct SceneConfigurationDetailView: View {
                 title: Text(alert.title),
                 message: Text(alert.message),
                 primaryButton: .default(Text("Restore Original")) {
-                    Task {
-                        await model.restoreOriginal()
-                    }
+                    Task { await model.restoreOriginal() }
                 },
                 secondaryButton: .cancel(Text("Keep Saved File"))
             )
@@ -242,9 +248,10 @@ struct SceneConfigurationDetailView: View {
     }
 }
 
-private struct SceneConfigurationContents: View {
-    @ObservedObject var model: SceneConfigurationDetailModel
+private struct TriggerConfigurationContents: View {
+    @ObservedObject var model: TriggerConfigurationDetailModel
     @Binding var newlyAddedActionIndex: Int?
+    let addCondition: () -> Void
     let addAction: () -> Void
 
     @State private var highlightedActionIndex: Int?
@@ -252,60 +259,80 @@ private struct SceneConfigurationContents: View {
     var body: some View {
         ScrollViewReader { scrollProxy in
             List {
-                if let scene = model.scene {
+                if let trigger = model.trigger {
                     Section {
-                        SceneConfigurationEditableTextRow(
+                        TriggerEditableTextRow(
                             label: "Identifier",
                             text: Binding(
                                 get: { model.identifierInput },
                                 set: model.setIdentifierInput
                             ),
                             prompt: "Required",
-                            kind: .identifier,
                             validationMessage:
                                 model.identifierValidationMessage
                         )
-                        SceneConfigurationEditableTextRow(
-                            label: "Priority",
-                            text: Binding(
-                                get: { model.priorityInput },
-                                set: model.setPriorityInput
-                            ),
-                            prompt: "Default",
-                            kind: .integer,
-                            validationMessage: model.priorityValidationMessage
-                        )
-                        SceneConfigurationEditableTextRow(
-                            label: "Timing",
-                            text: Binding(
-                                get: { model.timingInput },
-                                set: model.setTimingInput
-                            ),
-                            prompt: "Default (seconds)",
-                            kind: .decimal,
-                            validationMessage: model.timingValidationMessage
-                        )
 
-                        ForEach(scene.additionalFields, id: \.key) { field in
+                        Picker(
+                            "Type",
+                            selection: Binding(
+                                get: { model.triggerTypeInput },
+                                set: model.setTriggerTypeInput
+                            )
+                        ) {
+                            Text("When").tag("When")
+                            Text("While").tag("While")
+                        }
+
+                        ForEach(trigger.additionalFields, id: \.key) { field in
                             SceneConfigurationValueRow(
                                 label: field.key,
                                 value: field.value
                             )
                         }
                     } header: {
-                        SceneConfigurationSectionHeader("Scene")
+                        SceneConfigurationSectionHeader("Trigger")
                     }
 
-                    if scene.actions.isEmpty {
+                    if trigger.conditions.isEmpty {
                         Section {
-                            Text("This scene contains no actions.")
+                            Text(
+                                "This trigger has no conditions. It remains inactive unless fired manually."
+                            )
+                            .foregroundStyle(.secondary)
+                            newConditionButton
+                        } header: {
+                            SceneConfigurationSectionHeader("Conditions")
+                        }
+                    } else {
+                        ForEach(trigger.conditions) { condition in
+                            Section {
+                                TriggerConditionRows(
+                                    condition: condition,
+                                    model: model
+                                )
+                            } header: {
+                                TriggerConditionSectionHeader(
+                                    condition: condition,
+                                    model: model
+                                )
+                            }
+                        }
+
+                        Section {
+                            newConditionButton
+                        }
+                    }
+
+                    if trigger.actions.isEmpty {
+                        Section {
+                            Text("This trigger contains no actions.")
                                 .foregroundStyle(.secondary)
                             newActionButton
                         } header: {
                             SceneConfigurationSectionHeader("Actions")
                         }
                     } else {
-                        ForEach(scene.actions) { action in
+                        ForEach(trigger.actions) { action in
                             Section {
                                 AutomationActionConfigurationRows(
                                     action: action,
@@ -339,10 +366,10 @@ private struct SceneConfigurationContents: View {
                         )
                         SceneConfigurationTextRow(
                             label: "JSON location",
-                            value: scene.jsonPath
+                            value: trigger.jsonPath
                         )
 
-                        if model.isAwaitingCreatedSceneReload {
+                        if model.isAwaitingCreatedTriggerReload {
                             Label(
                                 "File created; reload pending",
                                 systemImage: "arrow.clockwise.circle"
@@ -354,25 +381,28 @@ private struct SceneConfigurationContents: View {
                                 systemImage: "pencil.circle"
                             )
                             .foregroundStyle(.secondary)
-                        } else if let saveConfirmation = model.saveConfirmation {
+                        } else if let confirmation = model.saveConfirmation {
                             Label(
-                                saveConfirmation,
+                                confirmation,
                                 systemImage: "checkmark.circle"
                             )
                             .foregroundStyle(.green)
                         }
+
                         if model.showsDeleteAction {
                             Button(role: .destructive) {
                                 model.confirmDeletion()
                             } label: {
                                 if model.isDeleting {
                                     HStack(spacing: 10) {
-                                        ProgressView()
-                                            .controlSize(.small)
-                                        Text("Deleting Scene…")
+                                        ProgressView().controlSize(.small)
+                                        Text("Deleting Trigger…")
                                     }
                                 } else {
-                                    Label("Delete Scene", systemImage: "trash")
+                                    Label(
+                                        "Delete Trigger",
+                                        systemImage: "trash"
+                                    )
                                 }
                             }
                             .disabled(!model.canDelete)
@@ -390,6 +420,13 @@ private struct SceneConfigurationContents: View {
         }
     }
 
+    private var newConditionButton: some View {
+        Button(action: addCondition) {
+            Label("New Condition", systemImage: "plus")
+        }
+        .disabled(!model.canMutateStructure)
+    }
+
     private var newActionButton: some View {
         Button(action: addAction) {
             Label("New Action", systemImage: "plus")
@@ -398,27 +435,17 @@ private struct SceneConfigurationContents: View {
     }
 
     private func actionScrollID(_ actionIndex: Int) -> String {
-        "scene-action-\(actionIndex)"
+        "trigger-action-\(actionIndex)"
     }
 
-    private func reveal(
-        _ actionIndex: Int,
-        using scrollProxy: ScrollViewProxy
-    ) {
+    private func reveal(_ actionIndex: Int, using proxy: ScrollViewProxy) {
         withAnimation(.easeInOut(duration: 0.3)) {
             highlightedActionIndex = actionIndex
-            scrollProxy.scrollTo(
-                actionScrollID(actionIndex),
-                anchor: .center
-            )
+            proxy.scrollTo(actionScrollID(actionIndex), anchor: .center)
         }
 
         Task { @MainActor in
-            do {
-                try await Task<Never, Never>.sleep(for: .seconds(1))
-            } catch {
-                return
-            }
+            try? await Task<Never, Never>.sleep(for: .seconds(1))
             guard highlightedActionIndex == actionIndex else { return }
             withAnimation(.easeOut(duration: 0.35)) {
                 highlightedActionIndex = nil
@@ -427,247 +454,10 @@ private struct SceneConfigurationContents: View {
     }
 }
 
-struct AutomationActionSectionHeader<Model: AutomationActionEditingModel>: View {
-    let action: SceneActionConfiguration
-    @ObservedObject var model: Model
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(action.type ?? "Unrecognized action")
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                Text("Action \(action.index + 1)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer(minLength: 8)
-
-            if action.controlSet != nil {
-                Button(role: .destructive) {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        model.removeControlSet(
-                            actionIndex: action.index
-                        )
-                    }
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .disabled(!model.canMutateStructure)
-                .accessibilityLabel("Remove Control Set")
-            }
-        }
-        .textCase(nil)
-    }
-}
-
-struct AutomationActionConfigurationRows<Model: AutomationActionEditingModel>: View {
-    let action: SceneActionConfiguration
-    @ObservedObject var model: Model
-
-    @ViewBuilder
-    var body: some View {
-        if let controlSet = action.controlSet {
-            SceneConfigurationTextRow(
-                label: "Device",
-                value: controlSet.device
-            )
-            SceneConfigurationTextRow(
-                label: "Control",
-                value: controlSet.control
-            )
-            AutomationControlSetValueRow(
-                controlSet: controlSet,
-                model: model
-            )
-
-            ForEach(
-                Array(controlSet.trailingValues.enumerated()),
-                id: \.offset
-            ) { offset, value in
-                SceneConfigurationValueRow(
-                    label: controlSetTrailingLabel(
-                        value: value,
-                        absoluteIndex: offset + 3
-                    ),
-                    value: value
-                )
-            }
-        } else if let payload = action.payload {
-            SceneConfigurationValueRow(
-                label: "Configuration",
-                value: payload
-            )
-        } else {
-            SceneConfigurationValueRow(
-                label: "Raw action",
-                value: action.rawValue
-            )
-        }
-    }
-
-    private func controlSetTrailingLabel(
-        value: HBJSONValue,
-        absoluteIndex: Int
-    ) -> String {
-        if value.objectValue != nil {
-            return "Options"
-        }
-        if absoluteIndex == 3 {
-            return "Priority"
-        }
-        return "Element \(absoluteIndex + 1)"
-    }
-}
-
-struct AutomationControlSetValueRow<Model: AutomationActionEditingModel>: View {
-    let controlSet: SceneControlSetConfiguration
-    @ObservedObject var model: Model
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text("Value")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            switch model.controlResolution(for: controlSet.actionIndex) {
-            case .resolving:
-                HStack(spacing: 10) {
-                    rawValue
-                    Spacer(minLength: 8)
-                    ProgressView()
-                        .controlSize(.small)
-                }
-
-            case .unavailable(let message):
-                rawValue
-                Text(message)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-            case .resolved(let target):
-                resolvedValue(target)
-            }
-
-            if let error = model.actionError(
-                for: controlSet.actionIndex
-            ) {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-        }
-        .padding(.vertical, 2)
-    }
-
-    @ViewBuilder
-    private func resolvedValue(_ target: SceneResolvedControl) -> some View {
-        let context = target.presentationContext(
-            value: controlSet.value,
-            isEnabled: !model.isBusy
-                && !model.isLoadingCurrentValue(
-                    actionIndex: controlSet.actionIndex
-                ),
-            commit: { value, _ in
-                try await model.setControlValue(
-                    actionIndex: controlSet.actionIndex,
-                    value: value
-                )
-            }
-        )
-        let plugin = ControlValueTypeRegistry.standard
-            .resolve(context.schema)
-            .plugin
-
-        if plugin.supportsEditing(context: context) {
-            HStack(spacing: 12) {
-                ControlValuePluginView(context: context)
-
-                Spacer(minLength: 4)
-
-                Button {
-                    Task {
-                        await model.useCurrentValue(
-                            actionIndex: controlSet.actionIndex
-                        )
-                    }
-                } label: {
-                    if model.isLoadingCurrentValue(
-                        actionIndex: controlSet.actionIndex
-                    ) {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Label("Current", systemImage: "arrow.down.circle")
-                    }
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .disabled(model.isBusy)
-                .accessibilityLabel("Use Current Value")
-            }
-        } else {
-            rawValue
-            NavigationLink {
-                SceneRawControlValueEditor(
-                    control: target.descriptor,
-                    initialValue: controlSet.value,
-                    actionLabel: "Done"
-                ) { value in
-                    try await model.setControlValue(
-                        actionIndex: controlSet.actionIndex,
-                        value: value
-                    )
-                }
-            } label: {
-                Label("Edit JSON", systemImage: "curlybraces")
-            }
-            .disabled(model.isBusy)
-
-            Text(
-                "This control does not have a dedicated editor."
-            )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private var rawValue: some View {
-        Text(controlSet.value.prettyConfigurationJSON)
-            .font(.body.monospaced())
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-struct SceneConfigurationSectionHeader: View {
-    let title: String
-
-    init(_ title: String) {
-        self.title = title
-    }
-
-    var body: some View {
-        Text(title)
-            .textCase(nil)
-            .font(.headline)
-            .foregroundStyle(.primary)
-    }
-}
-
-private struct SceneConfigurationEditableTextRow: View {
-    enum InputKind {
-        case identifier
-        case integer
-        case decimal
-    }
-
+private struct TriggerEditableTextRow: View {
     let label: String
     @Binding var text: String
     let prompt: String
-    let kind: InputKind
     let validationMessage: String?
 
     var body: some View {
@@ -675,9 +465,13 @@ private struct SceneConfigurationEditableTextRow: View {
             Text(label)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-
-            configuredTextField
-
+            TextField(prompt, text: $text)
+                .font(.body.monospaced())
+                .autocorrectionDisabled()
+#if os(iOS)
+                .keyboardType(.asciiCapable)
+                .textInputAutocapitalization(.never)
+#endif
             if let validationMessage {
                 Label(
                     validationMessage,
@@ -689,144 +483,216 @@ private struct SceneConfigurationEditableTextRow: View {
         }
         .padding(.vertical, 2)
     }
+}
 
-    @ViewBuilder
-    private var configuredTextField: some View {
-#if os(iOS)
-        switch kind {
-        case .identifier:
-            textField
-                .keyboardType(.asciiCapable)
-                .textInputAutocapitalization(.never)
-        case .integer:
-            textField
-                .keyboardType(.numbersAndPunctuation)
-        case .decimal:
-            textField
-                .keyboardType(.decimalPad)
+private struct TriggerConditionSectionHeader: View {
+    let condition: TriggerConditionConfiguration
+    @ObservedObject var model: TriggerConfigurationDetailModel
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(condition.type ?? "Unrecognized condition")
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                Text("Condition \(condition.index + 1)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Button(role: .destructive) {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    model.removeCondition(at: condition.index)
+                }
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .disabled(!model.canMutateStructure)
+            .accessibilityLabel("Remove Condition")
         }
-#else
-        textField
-#endif
-    }
-
-    private var textField: some View {
-        TextField(prompt, text: $text)
-            .font(.body.monospaced())
-            .autocorrectionDisabled()
+        .textCase(nil)
     }
 }
 
-struct SceneConfigurationFileRow: View {
-    let path: String
-    let note: String?
-    let renamePending: Bool
-    let creatingFile: Bool
+private struct TriggerConditionRows: View {
+    let condition: TriggerConditionConfiguration
+    @ObservedObject var model: TriggerConfigurationDetailModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text("File")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(path)
-                .font(.body.monospaced())
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        if let payload = condition.payload {
+            SceneConfigurationValueRow(
+                label: "Configuration",
+                value: payload
+            )
+        } else {
+            SceneConfigurationValueRow(
+                label: "Raw condition",
+                value: condition.rawValue
+            )
+        }
 
-            if let note {
-                Label(
-                    note,
-                    systemImage: statusSystemImage
+        NavigationLink {
+            TriggerConditionJSONEditor(
+                title: condition.type ?? "Condition",
+                initialValue: condition.rawValue,
+                actionLabel: "Done"
+            ) { value in
+                try model.setCondition(
+                    at: condition.index,
+                    rawValue: value
                 )
-                .font(.caption)
-                .foregroundStyle(statusColor)
+            }
+        } label: {
+            Label("Edit JSON", systemImage: "curlybraces")
+        }
+        .disabled(model.isBusy)
+    }
+}
+
+private struct TriggerConditionJSONEditor: View {
+    private enum ValidationError: LocalizedError {
+        case empty
+        case invalidJSON(String)
+        case invalidCondition
+
+        var errorDescription: String? {
+            switch self {
+            case .empty:
+                "Enter one complete JSON condition."
+            case .invalidJSON(let message):
+                "The condition is not valid JSON: \(message)"
+            case .invalidCondition:
+                "A condition must be an object with exactly one nonempty key."
             }
         }
-        .padding(.vertical, 2)
     }
 
-    private var statusSystemImage: String {
-        if creatingFile { return "doc.badge.plus" }
-        return renamePending ? "arrow.right" : "doc.on.doc"
-    }
+    @Environment(\.dismiss) private var dismiss
 
-    private var statusColor: Color {
-        if creatingFile { return .accentColor }
-        return renamePending ? .orange : .secondary
-    }
-}
+    let title: String
+    let actionLabel: String
+    let onCommit: (HBJSONValue) throws -> Void
 
-struct SceneConfigurationTextRow: View {
-    let label: String
-    let value: String
+    @State private var source: String
+    @State private var submissionError: String?
+
+    init(
+        title: String,
+        initialValue: HBJSONValue,
+        actionLabel: String,
+        onCommit: @escaping (HBJSONValue) throws -> Void
+    ) {
+        self.title = title
+        self.actionLabel = actionLabel
+        self.onCommit = onCommit
+        _source = State(initialValue: initialValue.prettyConfigurationJSON)
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(label)
+        Form {
+            Section("JSON Condition") {
+                TextEditor(text: $source)
+                    .font(.body.monospaced())
+                    .frame(minHeight: 180)
+                    .autocorrectionDisabled()
+#if os(iOS)
+                    .textInputAutocapitalization(.never)
+#endif
+
+                if let validationMessage {
+                    Label(
+                        validationMessage,
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                }
+                if let submissionError {
+                    Label(
+                        submissionError,
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                }
+            }
+
+            Section {
+                Text(
+                    "Condition types are source-authored. Unknown and nested condition forms are preserved exactly unless you edit this value."
+                )
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text(value)
-                .font(.body.monospaced())
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
-        .padding(.vertical, 2)
+        .navigationTitle(title)
+#if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+#endif
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel") { dismiss() }
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button(actionLabel, action: submit)
+                    .disabled(parsedValue == nil)
+            }
+        }
+        .onChange(of: source) {
+            submissionError = nil
+        }
+    }
+
+    private var parsedValue: HBJSONValue? {
+        try? parse(source)
+    }
+
+    private var validationMessage: String? {
+        do {
+            _ = try parse(source)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    private func parse(_ source: String) throws -> HBJSONValue {
+        let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw ValidationError.empty }
+        let value: HBJSONValue
+        do {
+            value = try JSONDecoder().decode(
+                HBJSONValue.self,
+                from: Data(trimmed.utf8)
+            )
+        } catch {
+            throw ValidationError.invalidJSON(error.localizedDescription)
+        }
+        guard let object = value.objectValue,
+              object.count == 1,
+              object.keys.first?.isEmpty == false else {
+            throw ValidationError.invalidCondition
+        }
+        return value
+    }
+
+    private func submit() {
+        do {
+            let value = try parse(source)
+            try onCommit(value)
+            dismiss()
+        } catch {
+            submissionError = error.localizedDescription
+        }
     }
 }
 
-struct SceneConfigurationValueRow: View {
-    let label: String
-    let value: HBJSONValue
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(presentedValue)
-                .font(.body.monospaced())
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.vertical, 2)
-    }
-
-    private var presentedValue: String {
-        switch value {
-        case .string(let value):
-            value
-        case .array, .object:
-            value.prettyConfigurationJSON
-        default:
-            value.compactConfigurationJSON
-        }
-    }
-}
-
-enum AutomationControlResolution: Equatable, Sendable {
-    case resolving
-    case resolved(SceneResolvedControl)
-    case unavailable(String)
-}
-
-@MainActor
-protocol AutomationActionEditingModel: ObservableObject {
-    var isBusy: Bool { get }
-    var canMutateStructure: Bool { get }
-
-    func controlResolution(for actionIndex: Int) -> AutomationControlResolution
-    func isLoadingCurrentValue(actionIndex: Int) -> Bool
-    func actionError(for actionIndex: Int) -> String?
-    func setControlValue(actionIndex: Int, value: HBJSONValue) async throws
-    func useCurrentValue(actionIndex: Int) async
-    func removeControlSet(actionIndex: Int)
-}
-
-private struct SceneEditorAlert: Identifiable {
+private struct TriggerEditorAlert: Identifiable {
     enum Kind {
         case discardChanges
         case discardAndClose
-        case deleteScene
+        case deleteTrigger
         case conflict
         case reloadFailed
         case message
@@ -839,7 +705,9 @@ private struct SceneEditorAlert: Identifiable {
 }
 
 @MainActor
-private final class SceneConfigurationDetailModel: AutomationActionEditingModel {
+private final class TriggerConfigurationDetailModel:
+    AutomationActionEditingModel
+{
     enum State: Equatable {
         case idle
         case loading
@@ -852,7 +720,6 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         case invalidCurrentValue
         case mixedCurrentValue
         case staleCurrentValue
-        case duplicateControl
 
         var errorDescription: String? {
             switch self {
@@ -864,67 +731,56 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
                 "This control currently represents multiple different values."
             case .staleCurrentValue:
                 "HomeBase does not currently have a valid presented value for this control."
-            case .duplicateControl:
-                "This scene already contains a set for that control."
             }
         }
     }
 
-    private enum ParsedOptionalField<Value> {
-        case value(Value?)
-        case invalid(String)
-    }
-
     @Published private(set) var state: State = .idle
-    @Published private(set) var draft: SceneConfigurationDraft?
+    @Published private(set) var draft: TriggerConfigurationDraft?
     @Published private(set) var isSaving = false
     @Published private(set) var isDeleting = false
     @Published private(set) var saveConfirmation: String?
     @Published private(set) var identifierInput = ""
-    @Published private(set) var priorityInput = ""
-    @Published private(set) var timingInput = ""
-    @Published var presentedAlert: SceneEditorAlert?
+    @Published private(set) var triggerTypeInput = "When"
+    @Published var presentedAlert: TriggerEditorAlert?
 
-    private let source: SceneConfigurationEditingSource
-    private let repository: SceneConfigurationRepository
+    private let source: TriggerConfigurationEditingSource
+    private let repository: TriggerConfigurationRepository
     private var resolutions: [Int: AutomationControlResolution] = [:]
     private var loadingCurrentValues: Set<Int> = []
     private var actionErrors: [Int: String] = [:]
-    private var pendingRecovery: SceneConfigurationRecovery?
-    private var pendingCreatedScene: SceneConfigurationDocument?
+    private var pendingRecovery: TriggerConfigurationRecovery?
+    private var pendingCreatedTrigger: TriggerConfigurationDocument?
     private var initialIdentifierInput = ""
-    private var initialPriorityInput = ""
-    private var initialTimingInput = ""
+    private var initialTriggerTypeInput = "When"
 
     init(
-        source: SceneConfigurationEditingSource,
-        repository: SceneConfigurationRepository
+        source: TriggerConfigurationEditingSource,
+        repository: TriggerConfigurationRepository
     ) {
         self.source = source
         self.repository = repository
 
-        guard case .newScene(let suggestedIdentifier) = source else {
+        guard case .newTrigger(let suggestedIdentifier) = source else {
             return
         }
         do {
-            let newDraft = try SceneConfigurationDraft.newScene(
+            let newDraft = try TriggerConfigurationDraft.newTrigger(
                 identifier: suggestedIdentifier
             )
             draft = newDraft
             identifierInput = suggestedIdentifier
-            priorityInput = "0"
-            timingInput = "1"
+            triggerTypeInput = "When"
             initialIdentifierInput = identifierInput
-            initialPriorityInput = priorityInput
-            initialTimingInput = timingInput
+            initialTriggerTypeInput = triggerTypeInput
             state = .loaded
         } catch {
             state = .failed(error.localizedDescription)
         }
     }
 
-    var scene: SceneConfigurationDocument? {
-        draft?.scene
+    var trigger: TriggerConfigurationDocument? {
+        draft?.trigger
     }
 
     var isBusy: Bool {
@@ -933,28 +789,19 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
 
     var isDirty: Bool {
         draft?.isDirty == true
-            || pendingCreatedScene != nil
+            || pendingCreatedTrigger != nil
             || identifierInput != initialIdentifierInput
-            || priorityInput != initialPriorityInput
-            || timingInput != initialTimingInput
+            || triggerTypeInput != initialTriggerTypeInput
     }
 
     var hasChangesToDiscard: Bool {
         draft?.hasSemanticChanges == true
             || identifierInput != initialIdentifierInput
-            || priorityInput != initialPriorityInput
-            || timingInput != initialTimingInput
+            || triggerTypeInput != initialTriggerTypeInput
     }
 
-    var isAwaitingCreatedSceneReload: Bool {
-        pendingCreatedScene != nil
-    }
-
-    var canSave: Bool {
-        state == .loaded
-            && (draft?.isDirty == true || pendingCreatedScene != nil)
-            && metadataValidationMessage == nil
-            && !isBusy
+    var isAwaitingCreatedTriggerReload: Bool {
+        pendingCreatedTrigger != nil
     }
 
     var canMutateStructure: Bool {
@@ -967,14 +814,6 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
 
     var canDelete: Bool {
         state == .loaded && showsDeleteAction && !isBusy
-    }
-
-    var configuredControlPaths: Set<String> {
-        Set(
-            scene?.actions.compactMap(\.controlSet).map {
-                Self.normalizedControlPath($0.controlPath)
-            } ?? []
-        )
     }
 
     var identifierValidationMessage: String? {
@@ -992,16 +831,6 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         return nil
     }
 
-    var priorityValidationMessage: String? {
-        guard case .invalid(let message) = parsedPriority else { return nil }
-        return message
-    }
-
-    var timingValidationMessage: String? {
-        guard case .invalid(let message) = parsedTiming else { return nil }
-        return message
-    }
-
     var presentedFilePath: String {
         guard let draft else { return "—" }
         return draft.proposedSourcePath ?? draft.original.source.path
@@ -1012,11 +841,11 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         if draft.isNew {
             return draft.proposedSourcePath == nil
                 ? "Enter an identifier to choose the new file name."
-                : "A new scene file will be created when saved."
+                : "A new trigger file will be created when saved."
         }
         guard draft.identifierChanged else { return nil }
         if !draft.derivesSourcePathFromIdentifier {
-            return "This file contains multiple scenes, so its name will remain unchanged."
+            return "This file contains multiple triggers, so its name will remain unchanged."
         }
         guard let proposedPath = draft.proposedSourcePath,
               proposedPath != draft.original.source.path else {
@@ -1033,38 +862,6 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         draft?.isNew == true
     }
 
-    private var parsedPriority: ParsedOptionalField<Int32> {
-        let input = priorityInput.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        )
-        guard !input.isEmpty else { return .value(nil) }
-        guard let value = Double(input),
-              value.isFinite,
-              value.rounded(.towardZero) == value,
-              value >= Double(Int32.min),
-              value <= Double(Int32.max) else {
-            return .invalid("Priority must be a signed 32-bit integer.")
-        }
-        return .value(Int32(value))
-    }
-
-    private var parsedTiming: ParsedOptionalField<Double> {
-        let input = timingInput.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        )
-        guard !input.isEmpty else { return .value(nil) }
-        guard let value = Double(input), value.isFinite, value >= 0 else {
-            return .invalid("Timing must be a nonnegative number of seconds.")
-        }
-        return .value(value)
-    }
-
-    private var metadataValidationMessage: String? {
-        identifierValidationMessage
-            ?? priorityValidationMessage
-            ?? timingValidationMessage
-    }
-
     func loadIfNeeded() async {
         guard state == .idle else { return }
         await forceReload()
@@ -1072,26 +869,26 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
 
     func confirmDiscardAndClose() {
         guard !isBusy else { return }
-        presentedAlert = SceneEditorAlert(
+        presentedAlert = TriggerEditorAlert(
             kind: .discardAndClose,
-            title: "Discard Scene Changes?",
-            message: "Your unsaved scene changes will be lost."
+            title: "Discard Trigger Changes?",
+            message: "Your unsaved trigger changes will be lost."
         )
     }
 
     func confirmDeletion() {
         guard canDelete, let original = draft?.original else { return }
-        let name = original.identifier ?? "this scene"
+        let name = original.identifier ?? "this trigger"
         let message: String
         if original.occupiesEntireSourceFile {
             message =
-                "This permanently deletes the scene and its configuration file, \(original.source.path). This cannot be undone."
+                "This permanently deletes the trigger and its configuration file, \(original.source.path). This cannot be undone."
         } else {
             message =
-                "This permanently removes the scene from \(original.source.path). Other scenes in that file will be preserved. This cannot be undone."
+                "This permanently removes the trigger from \(original.source.path). Other triggers in that file will be preserved. This cannot be undone."
         }
-        presentedAlert = SceneEditorAlert(
-            kind: .deleteScene,
+        presentedAlert = TriggerEditorAlert(
+            kind: .deleteTrigger,
             title: "Delete \"\(name)\"?",
             message: hasChangesToDiscard
                 ? message + " Unsaved changes will also be discarded."
@@ -1102,11 +899,11 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
     func reload() async {
         guard case .existing = source else { return }
         guard !isDirty else {
-            presentedAlert = SceneEditorAlert(
+            presentedAlert = TriggerEditorAlert(
                 kind: .discardChanges,
                 title: "Discard Changes?",
                 message:
-                    "Reloading will discard the scene values edited on this screen."
+                    "Reloading will discard the trigger values edited on this screen."
             )
             return
         }
@@ -1115,7 +912,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
 
     func forceReload() async {
         guard !isBusy,
-              case .existing(let sceneName) = source else {
+              case .existing(let triggerName) = source else {
             return
         }
         state = .loading
@@ -1128,8 +925,8 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         objectWillChange.send()
 
         do {
-            let scene = try await repository.loadScene(named: sceneName)
-            install(scene, retainingResolutions: false)
+            let trigger = try await repository.loadTrigger(named: triggerName)
+            install(trigger, retainingResolutions: false)
             state = .loaded
             await resolveControls()
         } catch is CancellationError {
@@ -1142,41 +939,50 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
     func setIdentifierInput(_ input: String) {
         identifierInput = input
         saveConfirmation = nil
-        updateSceneMetadata { draft in
+        updateTrigger { draft in
             try draft.setIdentifier(input)
         }
     }
 
-    func setPriorityInput(_ input: String) {
-        priorityInput = input
+    func setTriggerTypeInput(_ input: String) {
+        triggerTypeInput = input
         saveConfirmation = nil
-        guard case .value(let priority) = parsedPriority else { return }
-        updateSceneMetadata { draft in
-            try draft.setPriority(priority)
+        updateTrigger { draft in
+            try draft.setTriggerType(input)
         }
     }
 
-    func setTimingInput(_ input: String) {
-        timingInput = input
-        saveConfirmation = nil
-        guard case .value(let timing) = parsedTiming else { return }
-        updateSceneMetadata { draft in
-            try draft.setTiming(timing)
+    func setCondition(at index: Int, rawValue: HBJSONValue) throws {
+        guard canMutateStructure, var updated = draft else {
+            throw EditorError.unavailable
         }
+        try updated.setCondition(at: index, rawValue: rawValue)
+        draft = updated
+        saveConfirmation = nil
+        objectWillChange.send()
     }
 
-    private func updateSceneMetadata(
-        _ mutation: (inout SceneConfigurationDraft) throws -> Void
-    ) {
-        guard !isBusy, var updated = draft else { return }
+    func appendCondition(_ value: HBJSONValue) throws {
+        guard canMutateStructure, var updated = draft else {
+            throw EditorError.unavailable
+        }
+        _ = try updated.appendCondition(value)
+        draft = updated
+        saveConfirmation = nil
+        objectWillChange.send()
+    }
+
+    func removeCondition(at index: Int) {
+        guard canMutateStructure, var updated = draft else { return }
         do {
-            try mutation(&updated)
+            try updated.removeCondition(at: index)
             draft = updated
+            saveConfirmation = nil
             objectWillChange.send()
         } catch {
-            presentedAlert = SceneEditorAlert(
+            presentedAlert = TriggerEditorAlert(
                 kind: .message,
-                title: "Scene Field Could Not Be Changed",
+                title: "Condition Could Not Be Removed",
                 message: error.localizedDescription
             )
         }
@@ -1198,7 +1004,6 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
 
     func removeControlSet(actionIndex: Int) {
         guard canMutateStructure, var updated = draft else { return }
-
         do {
             try updated.removeControlSet(actionIndex: actionIndex)
             draft = updated
@@ -1213,7 +1018,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
             saveConfirmation = nil
             objectWillChange.send()
         } catch {
-            presentedAlert = SceneEditorAlert(
+            presentedAlert = TriggerEditorAlert(
                 kind: .message,
                 title: "Control Set Could Not Be Removed",
                 message: error.localizedDescription
@@ -1234,12 +1039,6 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
             device: device,
             descriptor: control
         )
-        guard !configuredControlPaths.contains(
-            Self.normalizedControlPath(resolved.path)
-        ) else {
-            throw EditorError.duplicateControl
-        }
-
         let value: HBJSONValue
         switch valueSource {
         case .currentPresentation:
@@ -1254,15 +1053,11 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
             )
             value = explicitValue
         }
+
         guard canMutateStructure,
               let latestDraft = draft,
               latestDraft.root == updated.root else {
             throw EditorError.unavailable
-        }
-        guard !configuredControlPaths.contains(
-            Self.normalizedControlPath(resolved.path)
-        ) else {
-            throw EditorError.duplicateControl
         }
         updated = latestDraft
         let actionIndex = try updated.appendControlSet(
@@ -1270,7 +1065,6 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
             control: control.identifier,
             value: value
         )
-
         draft = updated
         resolutions[actionIndex] = .resolved(resolved)
         actionErrors[actionIndex] = nil
@@ -1310,132 +1104,6 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         }
     }
 
-    func saveIfNeeded() async -> Bool {
-        guard state == .loaded, !isBusy else { return false }
-        if let metadataValidationMessage {
-            presentedAlert = SceneEditorAlert(
-                kind: .message,
-                title: "Scene Fields Need Attention",
-                message: metadataValidationMessage
-            )
-            return false
-        }
-        guard draft?.isDirty == true || pendingCreatedScene != nil else {
-            return true
-        }
-        return await save()
-    }
-
-    func deleteScene() async -> Bool {
-        guard canDelete, let original = draft?.original else { return false }
-        isDeleting = true
-        actionErrors = [:]
-        saveConfirmation = nil
-        defer { isDeleting = false }
-
-        do {
-            _ = try await repository.delete(original)
-            return true
-        } catch let error as SceneConfigurationDeleteError {
-            if case .conflict = error {
-                presentedAlert = conflictAlert(
-                    message: error.localizedDescription
-                )
-            } else {
-                presentedAlert = SceneEditorAlert(
-                    kind: .message,
-                    title: "Scene Could Not Be Deleted",
-                    message: error.localizedDescription
-                )
-            }
-        } catch is CancellationError {
-            return false
-        } catch {
-            presentedAlert = SceneEditorAlert(
-                kind: .message,
-                title: "Scene Could Not Be Deleted",
-                message: error.localizedDescription
-            )
-        }
-        return false
-    }
-
-    private func save() async -> Bool {
-        guard canSave, let draft else { return false }
-        isSaving = true
-        actionErrors = [:]
-        saveConfirmation = nil
-        defer { isSaving = false }
-
-        do {
-            let outcome: SceneConfigurationSaveOutcome
-            if let pendingCreatedScene, !draft.isDirty {
-                outcome = try await repository.reloadCreatedScene(
-                    pendingCreatedScene
-                )
-            } else {
-                outcome = try await repository.save(draft)
-            }
-
-            switch outcome {
-            case .unchanged(let scene):
-                install(scene, retainingResolutions: true)
-                pendingRecovery = nil
-                pendingCreatedScene = nil
-
-            case .saved(let scene, let reload):
-                install(scene, retainingResolutions: true)
-                pendingRecovery = nil
-                pendingCreatedScene = nil
-                saveConfirmation = reload.reloadStrategy
-                    == .fullAutomationGraph
-                    ? "Saved and reloaded"
-                    : "Saved"
-            }
-            return true
-        } catch let error as SceneConfigurationSaveError {
-            handleSaveError(error)
-        } catch is CancellationError {
-            return false
-        } catch {
-            presentedAlert = SceneEditorAlert(
-                kind: .message,
-                title: "Scene Could Not Be Saved",
-                message: error.localizedDescription
-            )
-        }
-        return false
-    }
-
-    func restoreOriginal() async {
-        guard let recovery = pendingRecovery, !isBusy else { return }
-        isSaving = true
-        defer { isSaving = false }
-
-        do {
-            let restored = try await repository.restore(recovery)
-            install(restored, retainingResolutions: true)
-            pendingRecovery = nil
-            saveConfirmation = "Original file restored and reloaded"
-        } catch let error as SceneConfigurationSaveError {
-            if case .conflict = error {
-                presentedAlert = conflictAlert(message: error.localizedDescription)
-            } else {
-                presentedAlert = SceneEditorAlert(
-                    kind: .message,
-                    title: "Original Could Not Be Restored",
-                    message: error.localizedDescription
-                )
-            }
-        } catch {
-            presentedAlert = SceneEditorAlert(
-                kind: .message,
-                title: "Original Could Not Be Restored",
-                message: error.localizedDescription
-            )
-        }
-    }
-
     func controlResolution(
         for actionIndex: Int
     ) -> AutomationControlResolution {
@@ -1450,6 +1118,150 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
 
     func actionError(for actionIndex: Int) -> String? {
         actionErrors[actionIndex]
+    }
+
+    func saveIfNeeded() async -> Bool {
+        guard state == .loaded, !isBusy else { return false }
+        if let identifierValidationMessage {
+            presentedAlert = TriggerEditorAlert(
+                kind: .message,
+                title: "Trigger Fields Need Attention",
+                message: identifierValidationMessage
+            )
+            return false
+        }
+        guard draft?.isDirty == true || pendingCreatedTrigger != nil else {
+            return true
+        }
+        return await save()
+    }
+
+    func deleteTrigger() async -> Bool {
+        guard canDelete, let original = draft?.original else { return false }
+        isDeleting = true
+        actionErrors = [:]
+        saveConfirmation = nil
+        defer { isDeleting = false }
+
+        do {
+            _ = try await repository.delete(original)
+            return true
+        } catch let error as TriggerConfigurationDeleteError {
+            if case .conflict = error {
+                presentedAlert = conflictAlert(
+                    message: error.localizedDescription
+                )
+            } else {
+                presentedAlert = TriggerEditorAlert(
+                    kind: .message,
+                    title: "Trigger Could Not Be Deleted",
+                    message: error.localizedDescription
+                )
+            }
+        } catch is CancellationError {
+            return false
+        } catch {
+            presentedAlert = TriggerEditorAlert(
+                kind: .message,
+                title: "Trigger Could Not Be Deleted",
+                message: error.localizedDescription
+            )
+        }
+        return false
+    }
+
+    func restoreOriginal() async {
+        guard let recovery = pendingRecovery, !isBusy else { return }
+        isSaving = true
+        defer { isSaving = false }
+        do {
+            let restored = try await repository.restore(recovery)
+            install(restored, retainingResolutions: true)
+            pendingRecovery = nil
+            saveConfirmation = "Original file restored and reloaded"
+        } catch let error as TriggerConfigurationSaveError {
+            if case .conflict = error {
+                presentedAlert = conflictAlert(
+                    message: error.localizedDescription
+                )
+            } else {
+                presentedAlert = TriggerEditorAlert(
+                    kind: .message,
+                    title: "Original Could Not Be Restored",
+                    message: error.localizedDescription
+                )
+            }
+        } catch {
+            presentedAlert = TriggerEditorAlert(
+                kind: .message,
+                title: "Original Could Not Be Restored",
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    private func save() async -> Bool {
+        guard let draft else { return false }
+        isSaving = true
+        actionErrors = [:]
+        saveConfirmation = nil
+        defer { isSaving = false }
+
+        do {
+            let outcome: TriggerConfigurationSaveOutcome
+            if let pendingCreatedTrigger, !draft.isDirty {
+                outcome = try await repository.reloadCreatedTrigger(
+                    pendingCreatedTrigger
+                )
+            } else {
+                outcome = try await repository.save(draft)
+            }
+
+            switch outcome {
+            case .unchanged(let trigger):
+                install(trigger, retainingResolutions: true)
+                pendingRecovery = nil
+                pendingCreatedTrigger = nil
+
+            case .saved(let trigger, let reload):
+                install(trigger, retainingResolutions: true)
+                pendingRecovery = nil
+                pendingCreatedTrigger = nil
+                saveConfirmation = reload.reloadStrategy
+                    == .fullAutomationGraph
+                    ? "Saved and reloaded"
+                    : "Saved"
+            }
+            return true
+        } catch let error as TriggerConfigurationSaveError {
+            handleSaveError(error)
+        } catch is CancellationError {
+            return false
+        } catch {
+            presentedAlert = TriggerEditorAlert(
+                kind: .message,
+                title: "Trigger Could Not Be Saved",
+                message: error.localizedDescription
+            )
+        }
+        return false
+    }
+
+    private func updateTrigger(
+        _ mutation: (inout TriggerConfigurationDraft) throws -> Void
+    ) {
+        guard !isBusy, var updated = draft else { return }
+        do {
+            try mutation(&updated)
+            draft = updated
+            objectWillChange.send()
+        } catch {
+            presentedAlert = TriggerEditorAlert(
+                kind: .message,
+                title: "Trigger Field Could Not Be Changed",
+                message: error.localizedDescription
+            )
+        }
     }
 
     private func validatedCurrentValue(
@@ -1483,23 +1295,19 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         return shifted
     }
 
-    private static func normalizedControlPath(_ path: String) -> String {
-        path.folding(
-            options: [.caseInsensitive, .diacriticInsensitive],
-            locale: Locale(identifier: "en_US_POSIX")
-        )
-    }
-
     private func install(
-        _ scene: SceneConfigurationDocument,
+        _ trigger: TriggerConfigurationDocument,
         retainingResolutions: Bool
     ) {
-        draft = SceneConfigurationDraft(scene: scene)
-        pendingCreatedScene = nil
-        installMetadataInputs(from: scene)
+        draft = TriggerConfigurationDraft(trigger: trigger)
+        pendingCreatedTrigger = nil
+        identifierInput = trigger.identifier ?? ""
+        triggerTypeInput = trigger.triggerType ?? "When"
+        initialIdentifierInput = identifierInput
+        initialTriggerTypeInput = triggerTypeInput
         if !retainingResolutions {
             resolutions = Dictionary(
-                uniqueKeysWithValues: scene.actions.compactMap { action in
+                uniqueKeysWithValues: trigger.actions.compactMap { action in
                     guard action.controlSet != nil else { return nil }
                     return (action.index, .resolving)
                 }
@@ -1509,21 +1317,9 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         loadingCurrentValues = []
     }
 
-    private func installMetadataInputs(
-        from scene: SceneConfigurationDocument
-    ) {
-        identifierInput = scene.identifier ?? ""
-        priorityInput = scene.fields["Priority"]?.compactConfigurationJSON
-            ?? ""
-        timingInput = scene.fields["Timing"]?.compactConfigurationJSON ?? ""
-        initialIdentifierInput = identifierInput
-        initialPriorityInput = priorityInput
-        initialTimingInput = timingInput
-    }
-
     private func resolveControls() async {
-        guard let scene else { return }
-        let controlSets = scene.actions.compactMap(\.controlSet)
+        guard let trigger else { return }
+        let controlSets = trigger.actions.compactMap(\.controlSet)
         let grouped = Dictionary(grouping: controlSets) {
             $0.device.lowercased()
         }
@@ -1533,7 +1329,6 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
                   let requestedDevice = configurations.first?.device else {
                 continue
             }
-
             do {
                 let device = try await repository.deviceDetails(
                     named: requestedDevice
@@ -1569,74 +1364,71 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         }
     }
 
-    private func handleSaveError(_ error: SceneConfigurationSaveError) {
+    private func handleSaveError(_ error: TriggerConfigurationSaveError) {
         switch error {
         case .conflict:
             presentedAlert = conflictAlert(message: error.localizedDescription)
 
         case .invalidDerivedFilename:
-            presentedAlert = SceneEditorAlert(
+            presentedAlert = TriggerEditorAlert(
                 kind: .message,
                 title: draft?.isNew == true
-                    ? "Scene Cannot Be Created"
-                    : "Scene File Cannot Be Renamed",
+                    ? "Trigger Cannot Be Created"
+                    : "Trigger File Cannot Be Renamed",
                 message: error.localizedDescription
             )
 
         case .renameRollbackFailed:
-            presentedAlert = SceneEditorAlert(
+            presentedAlert = TriggerEditorAlert(
                 kind: .conflict,
-                title: "Scene File Rename Needs Attention",
+                title: "Trigger File Rename Needs Attention",
                 message: error.localizedDescription
             )
 
-        case .fileAlreadyExists, .sceneAlreadyExists,
+        case .fileAlreadyExists, .triggerAlreadyExists,
              .creationPreflightFailed:
-            presentedAlert = SceneEditorAlert(
+            presentedAlert = TriggerEditorAlert(
                 kind: .message,
-                title: "Scene Could Not Be Created",
+                title: "Trigger Could Not Be Created",
                 message: error.localizedDescription
             )
 
-        case .creationReloadFailed(
-            let message,
-            let presumedScene
-        ):
-            install(presumedScene, retainingResolutions: true)
-            pendingCreatedScene = presumedScene
-            presentedAlert = SceneEditorAlert(
+        case .creationReloadFailed(let message, let presumedTrigger):
+            install(presumedTrigger, retainingResolutions: true)
+            pendingCreatedTrigger = presumedTrigger
+            presentedAlert = TriggerEditorAlert(
                 kind: .message,
-                title: "Scene File Created but Not Loaded",
+                title: "Trigger File Created but Not Loaded",
                 message: message
                     + " The file remains on the server. You can retry with the checkmark or continue editing it."
             )
 
-        case .reloadFailed(let message, let recovery, let presumedScene):
-            install(presumedScene, retainingResolutions: true)
+        case .reloadFailed(let message, let recovery, let presumedTrigger):
+            install(presumedTrigger, retainingResolutions: true)
             pendingRecovery = recovery
-            presentedAlert = SceneEditorAlert(
+            presentedAlert = TriggerEditorAlert(
                 kind: .reloadFailed,
-                title: "Scene Saved but Not Loaded",
+                title: "Trigger Saved but Not Loaded",
                 message: message
-                    + " The previous scene remains active. You can restore the original file or keep editing the saved file."
+                    + " The previous trigger remains active. You can restore the original file or keep editing the saved file."
             )
 
-        case .verificationFailed(let message, let presumedScene):
-            install(presumedScene, retainingResolutions: true)
+        case .verificationFailed(let message, let presumedTrigger):
+            install(presumedTrigger, retainingResolutions: true)
             pendingRecovery = nil
             saveConfirmation = "Saved and reloaded; verification pending"
-            presentedAlert = SceneEditorAlert(
+            presentedAlert = TriggerEditorAlert(
                 kind: .message,
-                title: "Scene Saved",
+                title: "Trigger Saved",
                 message: message
             )
         }
     }
 
-    private func conflictAlert(message: String) -> SceneEditorAlert {
-        SceneEditorAlert(
+    private func conflictAlert(message: String) -> TriggerEditorAlert {
+        TriggerEditorAlert(
             kind: .conflict,
-            title: "Scene Changed on Server",
+            title: "Trigger Changed on Server",
             message: message
         )
     }

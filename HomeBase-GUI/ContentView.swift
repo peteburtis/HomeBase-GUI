@@ -247,6 +247,15 @@ private struct UnconfiguredServerTabView: View {
             .tabItem {
                 Label("Scenes", systemImage: "sparkles")
             }
+
+            NavigationStack {
+                unavailableView
+                    .navigationTitle("Triggers")
+                    .toolbar { serverToolbar }
+            }
+            .tabItem {
+                Label("Triggers", systemImage: "bolt")
+            }
         }
     }
 

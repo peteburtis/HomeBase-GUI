@@ -20,6 +20,12 @@ actor HomeBaseWebSocketClient {
         let events: AsyncThrowingStream<HBSceneWatchStreamEvent, Error>
     }
 
+    struct TriggerSubscription: Sendable {
+        let identifier: UUID
+        let triggers: [HBTriggerStateResult]
+        let events: AsyncThrowingStream<HBTriggerWatchStreamEvent, Error>
+    }
+
     struct ControlStackSubscription: Sendable {
         let identifier: UUID
         let controls: [String]
@@ -95,6 +101,15 @@ actor HomeBaseWebSocketClient {
     ] = [:]
     private var bufferedSceneSubscriptionEvents: [
         UUID: [HBSceneWatchStreamEvent]
+    ] = [:]
+    private var triggerSubscriptionContinuations: [
+        UUID: AsyncThrowingStream<
+            HBTriggerWatchStreamEvent,
+            Error
+        >.Continuation
+    ] = [:]
+    private var bufferedTriggerSubscriptionEvents: [
+        UUID: [HBTriggerWatchStreamEvent]
     ] = [:]
     private var controlStackSubscriptionContinuations: [
         UUID: AsyncThrowingStream<
@@ -361,6 +376,32 @@ actor HomeBaseWebSocketClient {
         return try body.decodedResult(as: HBSceneListResult.self).scenes
     }
 
+    func listTriggers() async throws -> [HBTriggerSummaryDescriptor] {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.listTriggers
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        return try body.decodedResult(as: HBTriggerListResult.self).triggers
+    }
+
+    func triggerState(named name: String) async throws -> HBTriggerStateResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.getTriggerState,
+            payload: HBTriggerRequest(name: name)
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(as: HBTriggerStateResult.self)
+        guard result.trigger.name.caseInsensitiveCompare(name) == .orderedSame
+        else {
+            throw ClientError.invalidMessage(
+                "a trigger state read returned a different trigger"
+            )
+        }
+        return result
+    }
+
     func listConfigurationFiles(
         at path: String? = nil
     ) async throws -> HBConfigurationFileListResult {
@@ -518,6 +559,80 @@ actor HomeBaseWebSocketClient {
         )
     }
 
+    func subscribeToTriggers(
+        scope: HBTriggerWatchScope = .catalog,
+        detail: HBTriggerWatchDetail = .summary,
+        triggerNames: [String]? = nil
+    ) async throws -> TriggerSubscription {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.streamTriggers,
+            payload: HBTriggerWatchStreamRequest(
+                scope: scope,
+                detail: detail,
+                triggers: triggerNames,
+                heartbeatSeconds: 30
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let accepted = try body.decodedResult(
+            as: HBTriggerWatchStreamAccepted.self
+        )
+        if let envelopeSubscriptionID = response.subscriptionID,
+           envelopeSubscriptionID != accepted.subscriptionID {
+            throw ClientError.invalidMessage(
+                "the accepted trigger subscription identifiers do not match"
+            )
+        }
+        guard accepted.scope == scope, accepted.detail == detail else {
+            throw ClientError.invalidMessage(
+                "the accepted trigger subscription changed its requested scope or detail"
+            )
+        }
+        if scope == .triggers {
+            let requestedNames = Set(
+                (triggerNames ?? []).map { $0.lowercased() }
+            )
+            let acceptedNames = Set(
+                accepted.triggers.map { $0.trigger.name.lowercased() }
+            )
+            guard !requestedNames.isEmpty,
+                  acceptedNames == requestedNames else {
+                throw ClientError.invalidMessage(
+                    "the accepted trigger subscription changed its selected triggers"
+                )
+            }
+        }
+
+        let pair = AsyncThrowingStream<
+            HBTriggerWatchStreamEvent,
+            Error
+        >.makeStream()
+        let subscriptionID = accepted.subscriptionID
+        activeSubscriptions.insert(subscriptionID)
+        triggerSubscriptionContinuations[subscriptionID] = pair.continuation
+        pair.continuation.onTermination = { @Sendable [weak self] _ in
+            Task {
+                await self?.triggerSubscriptionConsumerTerminated(
+                    subscriptionID
+                )
+            }
+        }
+        if let buffered = bufferedTriggerSubscriptionEvents.removeValue(
+            forKey: subscriptionID
+        ) {
+            for event in buffered {
+                pair.continuation.yield(event)
+            }
+        }
+
+        return TriggerSubscription(
+            identifier: subscriptionID,
+            triggers: accepted.triggers,
+            events: pair.stream
+        )
+    }
+
     func setScene(
         named name: String,
         active: Bool,
@@ -560,6 +675,22 @@ actor HomeBaseWebSocketClient {
         guard result.name.caseInsensitiveCompare(name) == .orderedSame else {
             throw ClientError.invalidMessage(
                 "a scene reload returned a different scene"
+            )
+        }
+        return result
+    }
+
+    func reloadTrigger(named name: String) async throws -> HBTriggerReloadResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.reloadTrigger,
+            payload: HBTriggerReloadRequest(name: name)
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(as: HBTriggerReloadResult.self)
+        guard result.name.caseInsensitiveCompare(name) == .orderedSame else {
+            throw ClientError.invalidMessage(
+                "a trigger reload returned a different trigger"
             )
         }
         return result
@@ -1245,6 +1376,41 @@ actor HomeBaseWebSocketClient {
                     buffered
             }
 
+        case HBProtocolOperations.streamTriggers:
+            let event = try envelope.decodedPayload(
+                as: HBTriggerWatchStreamEvent.self
+            )
+            if let envelopeSubscriptionID = envelope.subscriptionID,
+               envelopeSubscriptionID != event.subscriptionID {
+                throw ClientError.invalidMessage(
+                    "a streamed trigger event changed subscription identifiers"
+                )
+            }
+            guard try acceptSubscriptionEvent(
+                identifier: event.subscriptionID,
+                sequence: event.sequence
+            ) else { return }
+
+            if let continuation = triggerSubscriptionContinuations[
+                event.subscriptionID
+            ] {
+                continuation.yield(event)
+            } else {
+                var buffered = bufferedTriggerSubscriptionEvents[
+                    event.subscriptionID,
+                    default: []
+                ]
+                guard buffered.count
+                        < Self.maximumBufferedSubscriptionEvents else {
+                    throw ClientError.invalidMessage(
+                        "too many trigger subscription events arrived before acceptance"
+                    )
+                }
+                buffered.append(event)
+                bufferedTriggerSubscriptionEvents[event.subscriptionID] =
+                    buffered
+            }
+
         case HBProtocolOperations.streamControlStacks:
             let event = try envelope.decodedPayload(
                 as: HBControlStackWatchStreamEvent.self
@@ -1403,6 +1569,14 @@ actor HomeBaseWebSocketClient {
         }
     }
 
+    private func triggerSubscriptionConsumerTerminated(_ identifier: UUID) {
+        triggerSubscriptionContinuations.removeValue(forKey: identifier)
+        guard activeSubscriptions.contains(identifier) else { return }
+        Task { [weak self] in
+            try? await self?.cancelSubscription(identifier)
+        }
+    }
+
     private func controlStackSubscriptionConsumerTerminated(
         _ identifier: UUID
     ) {
@@ -1432,6 +1606,10 @@ actor HomeBaseWebSocketClient {
             subscriptionID = try? body.decodedResult(
                 as: HBSceneWatchStreamAccepted.self
             ).subscriptionID
+        case HBProtocolOperations.streamTriggers:
+            subscriptionID = try? body.decodedResult(
+                as: HBTriggerWatchStreamAccepted.self
+            ).subscriptionID
         case HBProtocolOperations.streamControlStacks:
             subscriptionID = try? body.decodedResult(
                 as: HBControlStackWatchStreamAccepted.self
@@ -1457,6 +1635,10 @@ actor HomeBaseWebSocketClient {
         let sceneContinuation = sceneSubscriptionContinuations.removeValue(
             forKey: identifier
         )
+        let triggerContinuation =
+            triggerSubscriptionContinuations.removeValue(
+                forKey: identifier
+            )
         let controlStackContinuation =
             controlStackSubscriptionContinuations.removeValue(
                 forKey: identifier
@@ -1464,14 +1646,17 @@ actor HomeBaseWebSocketClient {
         if let error {
             controlContinuation?.finish(throwing: error)
             sceneContinuation?.finish(throwing: error)
+            triggerContinuation?.finish(throwing: error)
             controlStackContinuation?.finish(throwing: error)
         } else {
             controlContinuation?.finish()
             sceneContinuation?.finish()
+            triggerContinuation?.finish()
             controlStackContinuation?.finish()
         }
         bufferedControlSubscriptionEvents.removeValue(forKey: identifier)
         bufferedSceneSubscriptionEvents.removeValue(forKey: identifier)
+        bufferedTriggerSubscriptionEvents.removeValue(forKey: identifier)
         bufferedControlStackSubscriptionEvents.removeValue(forKey: identifier)
         subscriptionSequences.removeValue(forKey: identifier)
     }
@@ -1513,20 +1698,26 @@ actor HomeBaseWebSocketClient {
 
         let controlSubscriptions = controlSubscriptionContinuations.values
         let sceneSubscriptions = sceneSubscriptionContinuations.values
+        let triggerSubscriptions = triggerSubscriptionContinuations.values
         let controlStackSubscriptions =
             controlStackSubscriptionContinuations.values
         controlSubscriptionContinuations.removeAll()
         sceneSubscriptionContinuations.removeAll()
+        triggerSubscriptionContinuations.removeAll()
         controlStackSubscriptionContinuations.removeAll()
         activeSubscriptions.removeAll()
         bufferedControlSubscriptionEvents.removeAll()
         bufferedSceneSubscriptionEvents.removeAll()
+        bufferedTriggerSubscriptionEvents.removeAll()
         bufferedControlStackSubscriptionEvents.removeAll()
         subscriptionSequences.removeAll()
         for continuation in controlSubscriptions {
             continuation.finish(throwing: error)
         }
         for continuation in sceneSubscriptions {
+            continuation.finish(throwing: error)
+        }
+        for continuation in triggerSubscriptions {
             continuation.finish(throwing: error)
         }
         for continuation in controlStackSubscriptions {

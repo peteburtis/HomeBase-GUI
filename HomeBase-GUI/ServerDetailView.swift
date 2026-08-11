@@ -49,6 +49,15 @@ struct ServerDetailView: View {
                 .tabItem {
                     Label("Scenes", systemImage: "sparkles")
                 }
+
+            NavigationStack {
+                TriggersView(
+                    client: connection.client
+                )
+            }
+                .tabItem {
+                    Label("Triggers", systemImage: "bolt")
+                }
         }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
