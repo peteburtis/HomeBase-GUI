@@ -8,10 +8,22 @@
 
 /* Begin PBXBuildFile section */
 		E2CD710130269489002FCE2D /* HomeBaseProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = E2CD710330269489002FCE2D /* HomeBaseProtocol */; };
+		F0F122010000000000000007 /* HomeBaseProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = E2CD710330269489002FCE2D /* HomeBaseProtocol */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		F0F122010000000000000008 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = E2CD70E930269489002FCE2D /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E2CD70F030269489002FCE2D;
+			remoteInfo = "HomeBase-GUI";
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		E2CD70F130269489002FCE2D /* HomeBase-GUI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "HomeBase-GUI.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		F0F122010000000000000001 /* HomeBase-GUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "HomeBase-GUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -33,6 +45,11 @@
 			path = "HomeBase-GUI";
 			sourceTree = "<group>";
 		};
+		F0F122010000000000000002 /* HomeBase-GUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "HomeBase-GUITests";
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -44,6 +61,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F0F122010000000000000005 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F0F122010000000000000007 /* HomeBaseProtocol in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -51,6 +76,7 @@
 			isa = PBXGroup;
 			children = (
 				E2CD70F330269489002FCE2D /* HomeBase-GUI */,
+				F0F122010000000000000002 /* HomeBase-GUITests */,
 				E2CD70F230269489002FCE2D /* Products */,
 			);
 			sourceTree = "<group>";
@@ -59,6 +85,7 @@
 			isa = PBXGroup;
 			children = (
 				E2CD70F130269489002FCE2D /* HomeBase-GUI.app */,
+				F0F122010000000000000001 /* HomeBase-GUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -89,6 +116,30 @@
 			productReference = E2CD70F130269489002FCE2D /* HomeBase-GUI.app */;
 			productType = "com.apple.product-type.application";
 		};
+		F0F122010000000000000003 /* HomeBase-GUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F0F12201000000000000000C /* Build configuration list for PBXNativeTarget "HomeBase-GUITests" */;
+			buildPhases = (
+				F0F122010000000000000004 /* Sources */,
+				F0F122010000000000000005 /* Frameworks */,
+				F0F122010000000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				F0F122010000000000000009 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				F0F122010000000000000002 /* HomeBase-GUITests */,
+			);
+			name = "HomeBase-GUITests";
+			packageProductDependencies = (
+				E2CD710330269489002FCE2D /* HomeBaseProtocol */,
+			);
+			productName = "HomeBase-GUITests";
+			productReference = F0F122010000000000000001 /* HomeBase-GUITests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -101,6 +152,10 @@
 				TargetAttributes = {
 					E2CD70F030269489002FCE2D = {
 						CreatedOnToolsVersion = 26.1.1;
+					};
+					F0F122010000000000000003 = {
+						CreatedOnToolsVersion = 26.1.1;
+						TestTargetID = E2CD70F030269489002FCE2D;
 					};
 				};
 			};
@@ -122,12 +177,20 @@
 			projectRoot = "";
 			targets = (
 				E2CD70F030269489002FCE2D /* HomeBase-GUI */,
+				F0F122010000000000000003 /* HomeBase-GUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		E2CD70EF30269489002FCE2D /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F0F122010000000000000006 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -144,7 +207,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F0F122010000000000000004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		F0F122010000000000000009 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = E2CD70F030269489002FCE2D /* HomeBase-GUI */;
+			targetProxy = F0F122010000000000000008 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		E2CD70FA3026948A002FCE2D /* Debug */ = {
@@ -351,6 +429,66 @@
 			};
 			name = Release;
 		};
+		F0F12201000000000000000A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 9FEHMMZM44;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.1;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.1;
+				PRODUCT_BUNDLE_IDENTIFIER = "io.pjb.HomeBase-GUITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/HomeBase-GUI.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/HomeBase-GUI";
+				XROS_DEPLOYMENT_TARGET = 26.1;
+			};
+			name = Debug;
+		};
+		F0F12201000000000000000B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 9FEHMMZM44;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.1;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.1;
+				PRODUCT_BUNDLE_IDENTIFIER = "io.pjb.HomeBase-GUITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/HomeBase-GUI.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/HomeBase-GUI";
+				XROS_DEPLOYMENT_TARGET = 26.1;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -368,6 +506,15 @@
 			buildConfigurations = (
 				E2CD70FD3026948A002FCE2D /* Debug */,
 				E2CD70FE3026948A002FCE2D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F0F12201000000000000000C /* Build configuration list for PBXNativeTarget "HomeBase-GUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F0F12201000000000000000A /* Debug */,
+				F0F12201000000000000000B /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

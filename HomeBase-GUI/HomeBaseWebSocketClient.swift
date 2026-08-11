@@ -361,6 +361,72 @@ actor HomeBaseWebSocketClient {
         return try body.decodedResult(as: HBSceneListResult.self).scenes
     }
 
+    func listConfigurationFiles(
+        at path: String? = nil
+    ) async throws -> HBConfigurationFileListResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.listFiles,
+            payload: HBConfigurationFileListRequest(path: path)
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(
+            as: HBConfigurationFileListResult.self
+        )
+        let expectedPath = path ?? ""
+        guard result.path == expectedPath else {
+            throw ClientError.invalidMessage(
+                "configuration file listing returned a different path"
+            )
+        }
+        return result
+    }
+
+    func configurationFile(
+        at path: String
+    ) async throws -> HBConfigurationFileGetResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.getFile,
+            payload: HBConfigurationFileGetRequest(path: path)
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(
+            as: HBConfigurationFileGetResult.self
+        )
+        guard result.path == path else {
+            throw ClientError.invalidMessage(
+                "configuration file read returned a different path"
+            )
+        }
+        return result
+    }
+
+    func setConfigurationFile(
+        at path: String,
+        contents: String
+    ) async throws -> HBConfigurationFileSetResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.setFile,
+            payload: HBConfigurationFileSetRequest(
+                path: path,
+                contents: contents
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(
+            as: HBConfigurationFileSetResult.self
+        )
+        guard result.path == path,
+              result.byteCount == contents.utf8.count else {
+            throw ClientError.invalidMessage(
+                "configuration file write acknowledgement did not match the request"
+            )
+        }
+        return result
+    }
+
     func subscribeToScenes() async throws -> SceneSubscription {
         let request = try sessionRequest(
             operation: HBProtocolOperations.streamScenes,
@@ -438,6 +504,44 @@ actor HomeBaseWebSocketClient {
         return result
     }
 
+    func reloadScene(named name: String) async throws -> HBSceneReloadResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.reloadScene,
+            payload: HBSceneReloadRequest(name: name)
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(as: HBSceneReloadResult.self)
+        guard result.name.caseInsensitiveCompare(name) == .orderedSame else {
+            throw ClientError.invalidMessage(
+                "a scene reload returned a different scene"
+            )
+        }
+        return result
+    }
+
+    func controlValue(
+        _ control: String,
+        projection: HBControlStateProjection
+    ) async throws -> HBControlGetResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.getControl,
+            payload: HBControlGetRequest(
+                control: control,
+                projection: projection
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(as: HBControlGetResult.self)
+        guard result.projection == nil || result.projection == projection else {
+            throw ClientError.invalidMessage(
+                "a control read returned the wrong projection"
+            )
+        }
+        return result
+    }
+
     func setControl(
         _ control: String,
         to value: HBJSONValue,
@@ -483,22 +587,63 @@ actor HomeBaseWebSocketClient {
     func deviceDetails(
         for device: HBTopologyDeviceDescriptor
     ) async throws -> HBDeviceDescriptor {
-        let request = try sessionRequest(
-            operation: HBProtocolOperations.listDevices,
-            payload: HBDeviceListRequest(
-                device: device.addressableName,
-                includeValues: true
-            )
+        try await deviceDetails(
+            named: device.addressableName,
+            projection: nil
         )
-        let response = try await sendRequest(request)
-        let body = try response.decodedPayload(as: HBProtocolResponse.self)
-        let result = try body.decodedResult(as: HBDeviceListResult.self)
+    }
+
+    func deviceDetails(
+        named device: String,
+        projection: HBControlStateProjection?
+    ) async throws -> HBDeviceDescriptor {
+        let result = try await listDevices(
+            device: device,
+            includeValues: true,
+            projection: projection
+        )
         guard let details = result.devices.first else {
             throw ClientError.invalidMessage(
                 "device discovery returned no device"
             )
         }
+        guard details.addressableName.caseInsensitiveCompare(device)
+                == .orderedSame
+                || details.identifier.caseInsensitiveCompare(device)
+                    == .orderedSame else {
+            throw ClientError.invalidMessage(
+                "device discovery returned a different device"
+            )
+        }
         return details
+    }
+
+    func listDevices(
+        device: String? = nil,
+        recursive: Bool = false,
+        includeValues: Bool = false,
+        projection: HBControlStateProjection? = nil
+    ) async throws -> HBDeviceListResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.listDevices,
+            payload: HBDeviceListRequest(
+                device: device,
+                recursive: recursive,
+                includeValues: includeValues,
+                projection: projection
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(as: HBDeviceListResult.self)
+        guard projection == nil
+                || result.projection == nil
+                || result.projection == projection else {
+            throw ClientError.invalidMessage(
+                "device discovery returned the wrong projection"
+            )
+        }
+        return result
     }
 
     func controlHistory(

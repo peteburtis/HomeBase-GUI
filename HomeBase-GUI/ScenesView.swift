@@ -11,9 +11,12 @@ import SwiftUI
 struct ScenesView: View {
     @Environment(\.scenePhase) private var scenePhase
 
+    private let client: HomeBaseWebSocketClient
     @StateObject private var model: ServerScenesModel
+    @State private var isEditingScenes = false
 
     init(client: HomeBaseWebSocketClient) {
+        self.client = client
         _model = StateObject(
             wrappedValue: ServerScenesModel(client: client)
         )
@@ -27,54 +30,7 @@ struct ScenesView: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(model.scenes, id: \.name) { scene in
-                        Toggle(
-                            isOn: Binding(
-                                get: {
-                                    model.isPresented(
-                                        sceneNamed: scene.name
-                                    )
-                                },
-                                set: { isActive in
-                                    Task {
-                                        await model.setScene(
-                                            named: scene.name,
-                                            active: isActive
-                                        )
-                                    }
-                                }
-                            )
-                        ) {
-                            HStack(spacing: 8) {
-                                Text(scene.name)
-                                Spacer(minLength: 8)
-                                SceneActivationAccessory(
-                                    countdownDeadline:
-                                        model.activationDeadline(
-                                            sceneNamed: scene.name
-                                        ),
-                                    priority: model.activePriority(
-                                        sceneNamed: scene.name
-                                    )
-                                )
-                            }
-                        }
-                        .tint(
-                            model.isMatchedOnly(sceneNamed: scene.name)
-                                ? .orange
-                                : .accentColor
-                        )
-                        .disabled(
-                            model.state != .live
-                                || model.isUpdating(sceneNamed: scene.name)
-                                || !model.canToggle(
-                                    sceneNamed: scene.name
-                                )
-                        )
-                        .accessibilityValue(
-                            model.accessibilityValue(
-                                sceneNamed: scene.name
-                            )
-                        )
+                        sceneRow(scene)
                     }
                 }
 
@@ -93,6 +49,33 @@ struct ScenesView: View {
             }
         }
         .navigationTitle("Scenes")
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                if isEditingScenes {
+                    NavigationLink {
+                        SceneConfigurationDetailView(
+                            newSceneIdentifier: suggestedNewSceneIdentifier,
+                            client: client
+                        )
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .disabled(model.state != .live)
+                    .accessibilityLabel("Create Scene")
+                    .transition(.scale.combined(with: .opacity))
+                }
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isEditingScenes.toggle()
+                    }
+                } label: {
+                    Text(isEditingScenes ? "Done" : "Edit")
+                        .contentTransition(.opacity)
+                }
+                .disabled(model.state != .live)
+            }
+        }
         .connectionStatusOverlay(connectionStatus) {
             Task {
                 await model.run()
@@ -109,6 +92,64 @@ struct ScenesView: View {
             Task {
                 await model.stop()
             }
+        }
+    }
+
+    @ViewBuilder
+    private func sceneRow(_ scene: HBSceneStateResult) -> some View {
+        if isEditingScenes {
+            NavigationLink {
+                SceneConfigurationDetailView(
+                    sceneName: scene.name,
+                    client: client
+                )
+            } label: {
+                Text(scene.name)
+            }
+            .transition(.opacity)
+        } else {
+            Toggle(
+                isOn: Binding(
+                    get: {
+                        model.isPresented(sceneNamed: scene.name)
+                    },
+                    set: { isActive in
+                        Task {
+                            await model.setScene(
+                                named: scene.name,
+                                active: isActive
+                            )
+                        }
+                    }
+                )
+            ) {
+                HStack(spacing: 8) {
+                    Text(scene.name)
+                    Spacer(minLength: 8)
+                    SceneActivationAccessory(
+                        countdownDeadline: model.activationDeadline(
+                            sceneNamed: scene.name
+                        ),
+                        priority: model.activePriority(
+                            sceneNamed: scene.name
+                        )
+                    )
+                }
+            }
+            .tint(
+                model.isMatchedOnly(sceneNamed: scene.name)
+                    ? .orange
+                    : .accentColor
+            )
+            .disabled(
+                model.state != .live
+                    || model.isUpdating(sceneNamed: scene.name)
+                    || !model.canToggle(sceneNamed: scene.name)
+            )
+            .accessibilityValue(
+                model.accessibilityValue(sceneNamed: scene.name)
+            )
+            .transition(.opacity)
         }
     }
 
@@ -131,12 +172,26 @@ struct ScenesView: View {
     private var emptyScenesMessage: String {
         switch model.state {
         case .live:
-            "No scenes are configured."
+            isEditingScenes
+                ? "No scenes are configured. Tap + to create one."
+                : "No scenes are configured."
         case .failed:
             "Scenes could not be loaded."
         case .idle, .loading:
             "Scenes will appear when monitoring begins."
         }
+    }
+
+    private var suggestedNewSceneIdentifier: String {
+        let existing = Set(model.scenes.map { $0.name.lowercased() })
+        let base = "UntitledScene"
+        guard existing.contains(base.lowercased()) else { return base }
+
+        var suffix = 2
+        while existing.contains("\(base)\(suffix)".lowercased()) {
+            suffix += 1
+        }
+        return "\(base)\(suffix)"
     }
 }
 

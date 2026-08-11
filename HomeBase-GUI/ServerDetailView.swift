@@ -153,12 +153,6 @@ struct ServerDetailView: View {
 
 }
 
-private extension HBTopologyListResult {
-    func containsRoom(identifier: String) -> Bool {
-        rooms.contains { $0.identifier == identifier }
-    }
-}
-
 @MainActor
 final class ServerConnectionModel: ObservableObject {
     enum State: Equatable {
@@ -176,31 +170,7 @@ final class ServerConnectionModel: ObservableObject {
     )
 
     var presentedTopology: HBTopologyListResult {
-        let assignedDeviceIdentifiers = Set(
-            topology.rooms.flatMap(\.resolvedDeviceIdentifiers)
-        )
-        let unassignedDevices = topology.devices.filter {
-            !assignedDeviceIdentifiers.contains($0.identifier)
-        }
-        guard !unassignedDevices.isEmpty else { return topology }
-
-        var presentedTopology = topology
-        presentedTopology.rooms.append(
-            HBTopologyRoomDescriptor(
-                identifier: Self.otherRoomIdentifier(
-                    avoiding: topology.rooms.map(\.identifier)
-                ),
-                displayName: "Other",
-                members: unassignedDevices.map {
-                    HBTopologyMemberDescriptor(
-                        kind: .device,
-                        identifier: $0.identifier
-                    )
-                },
-                resolvedDeviceIdentifiers: unassignedDevices.map(\.identifier)
-            )
-        )
-        return presentedTopology
+        topology.includingOtherRoom
     }
 
     let client: HomeBaseWebSocketClient
@@ -267,19 +237,4 @@ final class ServerConnectionModel: ObservableObject {
         state = .disconnected
     }
 
-    private static func otherRoomIdentifier(
-        avoiding roomIdentifiers: [String]
-    ) -> String {
-        let existingIdentifiers = Set(roomIdentifiers)
-        let baseIdentifier = "homebase-gui.other-room"
-        guard existingIdentifiers.contains(baseIdentifier) else {
-            return baseIdentifier
-        }
-
-        var suffix = 2
-        while existingIdentifiers.contains("\(baseIdentifier).\(suffix)") {
-            suffix += 1
-        }
-        return "\(baseIdentifier).\(suffix)"
-    }
 }

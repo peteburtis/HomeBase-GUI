@@ -83,14 +83,15 @@ struct LiveDeviceControlSections: View {
                     ControlStateRow(
                         control: control,
                         interactionEnabled: model.state == .live,
-                        setValue: { value in
-                            await model.setNumericValue(value, for: control)
+                        setValue: { value, origin in
+                            try await model.setPresentedValue(
+                                value,
+                                for: control,
+                                origin: origin
+                            )
                         },
-                        setColorValue: { value in
-                            try await model.setColorValue(value, for: control)
-                        },
-                        colorValues: {
-                            model.colorValueStream(for: control)
+                        values: {
+                            model.valueStream(for: control)
                         }
                     )
                     .alignmentGuide(.listRowSeparatorLeading) {
@@ -121,10 +122,10 @@ struct LiveDeviceControlSections: View {
 private struct ControlStateRow: View {
     let control: LiveDeviceControl
     let interactionEnabled: Bool
-    let setValue: (Double) async -> Void
-    let setColorValue: (HBJSONValue) async throws -> Void
-    let colorValues: () -> AsyncThrowingStream<
-        HomeBaseColorPickerObservation,
+    let setValue:
+        (HBJSONValue, ControlValueCommitOrigin) async throws -> Void
+    let values: () -> AsyncThrowingStream<
+        ControlValueObservation,
         Error
     >
 
@@ -145,11 +146,10 @@ private struct ControlStateRow: View {
                         control: control,
                         interactionEnabled: interactionEnabled,
                         setValue: setValue,
-                        setColorValue: setColorValue,
-                        colorValues: colorValues
+                        values: values
                     )
                     if control.valid == false,
-                       !control.valuePresentation.presentsStaleness {
+                       !control.valuePresentationHandlesStaleness {
                         Label(
                             "Stale",
                             systemImage: "exclamationmark.triangle"
@@ -234,15 +234,9 @@ final class LiveDeviceControlsModel: ObservableObject {
 
     private enum UpdateError: LocalizedError {
         case unavailable
-        case unsupportedColor
 
         var errorDescription: String? {
-            switch self {
-            case .unavailable:
-                "This control is not currently available."
-            case .unsupportedColor:
-                "This color value is not supported by the control."
-            }
+            "This control is not currently available."
         }
     }
 
@@ -316,51 +310,21 @@ final class LiveDeviceControlsModel: ObservableObject {
         await stopSubscription()
     }
 
-    func setNumericValue(
-        _ value: Double,
-        for control: LiveDeviceControl
-    ) async {
-        ControlWriteDiagnostics.logNumeric(
-            stage: "model-numeric-entry",
-            control: control.descriptor.control,
-            value: value
-        )
-        guard value.isFinite else { return }
-
-        let protocolValue: HBJSONValue
-        switch control.descriptor.kind.lowercased() {
-        case "binaryswitch":
-            protocolValue = .integer(value > 0 ? 1 : 0)
-        case "unitinterval":
-            protocolValue = .number(value)
-        default:
-            return
-        }
-
-        await setValue(protocolValue, for: control)
-    }
-
-    func setColorValue(
+    func setPresentedValue(
         _ value: HBJSONValue,
-        for control: LiveDeviceControl
+        for control: LiveDeviceControl,
+        origin: ControlValueCommitOrigin
     ) async throws {
-        guard let capabilities = HomeBaseColorPickerCapabilities(
-            controlKind: control.descriptor.kind
-        ),
-        let key = value.objectValue?.keys.first?.lowercased(),
-        (key == "xy" && capabilities.supportsXY)
-            || (key == "rgb" && capabilities.supportsRGB)
-            || (key == "white" && capabilities.supportsWhite) else {
-            throw UpdateError.unsupportedColor
-        }
-
         ControlWriteDiagnostics.log(
-            stage: "model-color-entry",
+            stage: origin == .inline
+                ? "model-inline-entry"
+                : "model-editor-entry",
             control: control.descriptor.control,
             value: value
         )
         let identity = control.id
-        guard var current = controlsByIdentity[identity],
+        guard (origin == .editor || state == .live),
+              var current = controlsByIdentity[identity],
               !current.isUpdating else {
             throw UpdateError.unavailable
         }
@@ -372,19 +336,25 @@ final class LiveDeviceControlsModel: ObservableObject {
         publishControls()
 
         do {
-            do {
-                try await client.setControl(
-                    current.descriptor.control,
-                    to: value
-                )
-            } catch let protocolError as HBProtocolError {
-                throw protocolError
-            } catch {
-                // A picker remains useful as a pushed screen even though the
-                // originating detail view may no longer be monitoring. If its
-                // session went away during that transition, rebuild it once
-                // and repeat this idempotent color write.
-                try await client.reactivate()
+            if origin == .editor {
+                do {
+                    try await client.setControl(
+                        current.descriptor.control,
+                        to: value
+                    )
+                } catch let protocolError as HBProtocolError {
+                    throw protocolError
+                } catch {
+                    // A pushed editor may outlive the source detail view. If
+                    // that transition retired its socket, rebuild the session
+                    // once and repeat this idempotent value write.
+                    try await client.reactivate()
+                    try await client.setControl(
+                        current.descriptor.control,
+                        to: value
+                    )
+                }
+            } else {
                 try await client.setControl(
                     current.descriptor.control,
                     to: value
@@ -399,6 +369,14 @@ final class LiveDeviceControlsModel: ObservableObject {
             updated.updateError = nil
             controlsByIdentity[identity] = updated
             publishControls()
+        } catch is CancellationError {
+            if var updated = controlsByIdentity[identity] {
+                updated.pendingValue = nil
+                updated.isUpdating = false
+                controlsByIdentity[identity] = updated
+                publishControls()
+            }
+            throw CancellationError()
         } catch {
             if var updated = controlsByIdentity[identity] {
                 updated.pendingValue = nil
@@ -412,9 +390,9 @@ final class LiveDeviceControlsModel: ObservableObject {
         }
     }
 
-    func colorValueStream(
+    func valueStream(
         for control: LiveDeviceControl
-    ) -> AsyncThrowingStream<HomeBaseColorPickerObservation, Error> {
+    ) -> AsyncThrowingStream<ControlValueObservation, Error> {
         let client = client
         let deviceIdentifier = control.descriptor.deviceIdentifier
         let controlIdentifier = control.descriptor.controlIdentifier
@@ -451,7 +429,7 @@ final class LiveDeviceControlsModel: ObservableObject {
                             continue
                         }
                         continuation.yield(
-                            HomeBaseColorPickerObservation(
+                            ControlValueObservation(
                                 value: event.value,
                                 aggregateState: event.aggregateState,
                                 aggregateValues: event.aggregateValues,
@@ -481,59 +459,6 @@ final class LiveDeviceControlsModel: ObservableObject {
                 producer.cancel()
             }
         }
-    }
-
-    private func setValue(
-        _ value: HBJSONValue,
-        for control: LiveDeviceControl
-    ) async {
-        ControlWriteDiagnostics.log(
-            stage: "model-entry",
-            control: control.descriptor.control,
-            value: value
-        )
-        let identity = control.id
-        guard state == .live,
-              var current = controlsByIdentity[identity],
-              !current.isUpdating else {
-            return
-        }
-
-        current.pendingValue = value
-        current.isUpdating = true
-        current.updateError = nil
-        controlsByIdentity[identity] = current
-        publishControls()
-
-        do {
-            try await client.setControl(
-                current.descriptor.control,
-                to: value
-            )
-            guard var updated = controlsByIdentity[identity] else { return }
-            // Preserve the accepted value while the live subscription catches
-            // up. Otherwise clearing the optimistic value can briefly restore
-            // the pre-write state and make a slider or toggle jump backward.
-            updated.value = value
-            updated.displayValue = nil
-            updated.pendingValue = nil
-            updated.isUpdating = false
-            controlsByIdentity[identity] = updated
-        } catch is CancellationError {
-            guard var updated = controlsByIdentity[identity] else { return }
-            updated.pendingValue = nil
-            updated.isUpdating = false
-            controlsByIdentity[identity] = updated
-        } catch {
-            guard var updated = controlsByIdentity[identity] else { return }
-            updated.pendingValue = nil
-            updated.isUpdating = false
-            updated.updateError =
-                "Could not update: \(error.localizedDescription)"
-            controlsByIdentity[identity] = updated
-        }
-
-        publishControls()
     }
 
     private func install(
@@ -691,7 +616,7 @@ private extension HBControlDescriptor {
     }
 }
 
-private extension HBJSONValue {
+extension HBJSONValue {
     var presentationText: String {
         switch self {
         case .null:

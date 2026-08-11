@@ -7,20 +7,6 @@ import Foundation
 import HomeBaseProtocol
 import SwiftUI
 
-enum ControlValuePresentation: Equatable {
-    case toggle(Bool)
-    case slider(value: Double, range: ClosedRange<Double>)
-    case color(HomeBaseColorReadoutPresentation)
-    case text(String)
-
-    var presentsStaleness: Bool {
-        if case .color = self {
-            return true
-        }
-        return false
-    }
-}
-
 enum ControlWriteDiagnostics {
     static func logNumeric(
         stage: String,
@@ -73,149 +59,46 @@ enum ControlWriteDiagnostics {
 }
 
 extension LiveDeviceControl {
-    var valuePresentation: ControlValuePresentation {
-        let text = ControlValuePresentation.text(presentedValue)
-        if descriptor.kind.lowercased().hasPrefix("color-v1:") {
-            if aggregateState == .mixed {
-                if let aggregateValues,
-                   let aggregate = HomeBaseColorAggregatePresentation(
-                    wireValues: aggregateValues,
-                    aggregateValueCount: aggregateValueCount
-                   ) {
-                    return .color(.aggregate(aggregate))
-                }
-                return .color(.mixed)
-            }
-            if aggregateState == .unavailable {
-                return .color(.unavailable)
-            }
-            if aggregateState != .unavailable,
-               let value = pendingValue ?? value,
-               let color = HomeBaseColorPresentation(wireValue: value) {
-                return .color(.selected(color))
-            }
-        }
+    var valueSchema: ControlValueSchema {
+        ControlValueSchema(
+            kind: descriptor.kind,
+            metadata: details?.metadata ?? [:],
+            tags: Set(descriptor.tags).union(details?.tags ?? [])
+        )
+    }
 
-        guard details?.metadata["readable"]?.boolValue == true,
-              details?.metadata["writable"]?.boolValue == true,
-              details?.metadata["structured"]?.boolValue == false,
-              aggregateState != .mixed,
-              aggregateState != .unavailable,
-              let numericValue = (pendingValue ?? value)?.numberValue else {
-            return text
-        }
+    var valueSnapshot: ControlValueSnapshot {
+        ControlValueSnapshot(
+            value: pendingValue ?? value,
+            displayText: presentedValue,
+            aggregateState: aggregateState,
+            aggregateValues: aggregateValues,
+            aggregateValueCount: aggregateValueCount,
+            isStale: valid == false
+        )
+    }
 
-        switch descriptor.kind.lowercased() {
-        case "binaryswitch":
-            return .toggle(numericValue > 0)
-
-        case "unitinterval":
-            guard let minimum = details?.metadata["minimum"]?.numberValue,
-                  let maximum = details?.metadata["maximum"]?.numberValue,
-                  minimum < maximum else {
-                return text
-            }
-            let range = minimum ... maximum
-            return .slider(
-                value: numericValue.clamped(to: range),
-                range: range
-            )
-
-        default:
-            return text
-        }
+    var valuePresentationHandlesStaleness: Bool {
+        let resolution = ControlValueTypeRegistry.standard.resolve(
+            valueSchema
+        )
+        return resolution.plugin.presentsStaleness(for: valueSnapshot)
     }
 }
 
+/// Host for source-independent control-value plugins. This view adapts a live
+/// control today; scene-file drafts can construct the same presentation
+/// context without depending on `LiveDeviceControl`.
 struct ControlValueView: View {
     let control: LiveDeviceControl
     let interactionEnabled: Bool
-    let setValue: (Double) async -> Void
-    let setColorValue: (HBJSONValue) async throws -> Void
-    let colorValues: () -> AsyncThrowingStream<
-        HomeBaseColorPickerObservation,
-        Error
-    >
-
-    @State private var isShowingColorPicker = false
+    let setValue:
+        (HBJSONValue, ControlValueCommitOrigin) async throws -> Void
+    let values: () -> AsyncThrowingStream<ControlValueObservation, Error>
 
     var body: some View {
         HStack(spacing: 8) {
-            switch control.valuePresentation {
-            case .toggle(let isOn):
-                Toggle(
-                    "",
-                    isOn: Binding(
-                        get: { isOn },
-                        set: { requestedValue in
-                            Task {
-                                await submit(
-                                    requestedValue ? 1 : 0,
-                                    stage: "toggle-ui"
-                                )
-                            }
-                        }
-                    )
-                )
-                .labelsHidden()
-                .disabled(!interactionEnabled || control.isUpdating)
-                .accessibilityLabel(control.displayName)
-                .accessibilityValue(control.presentedValue)
-
-            case .slider(let value, let range):
-                ControlSlider(
-                    value: value,
-                    range: range,
-                    interactionEnabled:
-                        interactionEnabled && !control.isUpdating,
-                    controlPath: control.descriptor.control,
-                    accessibilityLabel: control.displayName,
-                    setValue: { value in
-                        await submit(value, stage: "slider-presentation")
-                    }
-                )
-
-            case .color(let presentation):
-                if let capabilities = HomeBaseColorPickerCapabilities(
-                    controlKind: control.descriptor.kind
-                ),
-                control.details?.metadata["writable"]?.boolValue == true {
-                    Button {
-                        isShowingColorPicker = true
-                    } label: {
-                        colorReadout(presentation)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!interactionEnabled || control.isUpdating)
-                    .accessibilityHint("Opens the color picker")
-                    .navigationDestination(
-                        isPresented: $isShowingColorPicker
-                    ) {
-                        HomeBaseColorPickerView(
-                            capabilities: capabilities,
-                            initialValue: control.aggregateState == .mixed
-                                ? nil
-                                : control.pendingValue ?? control.value,
-                            aggregateState: control.aggregateState,
-                            aggregateValues: control.aggregateValues,
-                            aggregateValueCount: control.aggregateValueCount,
-                            liveValues: colorValues,
-                            setValue: setColorValue
-                        )
-                        .navigationTitle(control.displayName)
-#if os(iOS)
-                        .navigationBarTitleDisplayMode(.inline)
-#endif
-                    }
-                } else {
-                    colorReadout(presentation)
-                }
-
-            case .text(let value):
-                Text(value)
-                    .monospacedDigit()
-                    .multilineTextAlignment(.trailing)
-            }
+            ControlValuePluginView(context: context)
 
             if control.isUpdating {
                 ProgressView()
@@ -224,95 +107,33 @@ struct ControlValueView: View {
         }
     }
 
-    private func colorReadout(
-        _ presentation: HomeBaseColorReadoutPresentation
-    ) -> some View {
-        HomeBaseColorReadout(
-            presentation: presentation,
-            accessibilityValue: control.presentedValue,
-            isStale: control.valid == false
+    private var context: ControlValuePresentationContext {
+        ControlValuePresentationContext(
+            schema: control.valueSchema,
+            snapshot: control.valueSnapshot,
+            interaction: ControlValueInteraction(
+                isEnabled: interactionEnabled,
+                isUpdating: control.isUpdating,
+                commit: setValue,
+                observations: values
+            ),
+            accessibilityLabel: control.displayName,
+            controlPath: control.descriptor.control
         )
-    }
-
-    private func submit(
-        _ value: Double,
-        stage: String
-    ) async {
-        ControlWriteDiagnostics.logNumeric(
-            stage: stage,
-            control: control.descriptor.control,
-            value: value
-        )
-        await setValue(value)
     }
 }
 
-private struct ControlSlider: View {
-    let value: Double
-    let range: ClosedRange<Double>
-    let interactionEnabled: Bool
-    let controlPath: String
-    let accessibilityLabel: String
-    let setValue: (Double) async -> Void
-
-    @State private var draftValue: Double
-    @State private var isEditing = false
-
-    init(
-        value: Double,
-        range: ClosedRange<Double>,
-        interactionEnabled: Bool,
-        controlPath: String,
-        accessibilityLabel: String,
-        setValue: @escaping (Double) async -> Void
-    ) {
-        self.value = value
-        self.range = range
-        self.interactionEnabled = interactionEnabled
-        self.controlPath = controlPath
-        self.accessibilityLabel = accessibilityLabel
-        self.setValue = setValue
-        _draftValue = State(initialValue: value.clamped(to: range))
-    }
+/// The shared host for a resolved control-value plugin. Live controls and
+/// configuration drafts both construct a source-specific context and render
+/// it through this same view.
+struct ControlValuePluginView: View {
+    let context: ControlValuePresentationContext
 
     var body: some View {
-        Slider(
-            value: $draftValue,
-            in: range,
-            onEditingChanged: { editing in
-                if editing {
-                    isEditing = true
-                    return
-                }
-
-                isEditing = false
-                let requestedValue = draftValue.clamped(to: range)
-                guard interactionEnabled,
-                      requestedValue != value else {
-                    return
-                }
-                Task {
-                    ControlWriteDiagnostics.logNumeric(
-                        stage: "slider-ui",
-                        control: controlPath,
-                        value: requestedValue
-                    )
-                    await setValue(requestedValue)
-                }
-            }
-        )
-        .frame(minWidth: 120, idealWidth: 160, maxWidth: 200)
-        .disabled(!interactionEnabled)
-        .accessibilityLabel(accessibilityLabel)
-        .onChange(of: value) { _, updatedValue in
-            guard !isEditing else { return }
-            draftValue = updatedValue.clamped(to: range)
-        }
+        resolution.plugin.makeBody(context: context)
     }
-}
 
-private extension Double {
-    func clamped(to range: ClosedRange<Double>) -> Double {
-        min(max(self, range.lowerBound), range.upperBound)
+    private var resolution: ControlValueTypeRegistry.Resolution {
+        ControlValueTypeRegistry.standard.resolve(context.schema)
     }
 }

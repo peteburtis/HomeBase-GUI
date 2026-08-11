@@ -38,3 +38,13 @@ Develop the product incrementally:
 - Favor accessible, native Apple-platform interactions and layouts that can adapt to different window and screen sizes.
 - Add focused tests for protocol handling, state transitions, and shared domain logic as those layers are introduced.
 - Preserve staged delivery: establish dependable monitoring and control before expanding into automation editing or administration.
+
+## Remote configuration editing
+
+- For most remote JSON configuration, use the engine's general file load and save APIs. Do not introduce a bespoke protocol operation for every configuration file unless the generic file workflow cannot safely express the required behavior.
+- Treat “leave the file alone unless the user explicitly requests a change” as a persistence invariant for every remote JSON configuration editor. Opening, loading, viewing, dismissing, or saving an unchanged document must not issue a remote write. Editing a value and then restoring its original value must also produce no write.
+- Retain an immutable semantic baseline and the loaded source revision alongside the editable draft. Only explicit user actions may modify the draft, and the document is dirty only while its effective semantics differ from that baseline. Live updates, decoding defaults, editor initialization, normalization, and presentation changes must never mark it dirty.
+- Enforce the no-op rule again at the persistence boundary; do not rely only on a disabled Save button or other presentation state. Tests for each editor should prove that opening and saving, and changing then reverting and saving, invoke the save API zero times.
+- When the user has made a real semantic change, canonical JSON re-emission is acceptable even if it changes whitespace, key ordering, or other hand formatting. Reformatting must only ever be a consequence of an explicit effective change, never an incidental write.
+- Preserve unedited and unrecognized semantic content when applying an edit. If the editor cannot safely retain content outside the field it owns, it must refuse to save rather than silently discard that content.
+- Before saving, compare the current remote revision with the revision that was loaded. Do not silently overwrite an intervening external change; reload, merge explicit edits when demonstrably safe, or present a conflict.

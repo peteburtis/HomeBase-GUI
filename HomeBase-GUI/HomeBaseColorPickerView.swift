@@ -8,13 +8,6 @@ import Foundation
 import HomeBaseProtocol
 import SwiftUI
 
-struct HomeBaseColorPickerObservation: Equatable, Sendable {
-    let value: HBJSONValue?
-    let aggregateState: HBControlAggregateState?
-    let aggregateValues: [HBJSONValue]?
-    let aggregateValueCount: Int?
-}
-
 struct HomeBaseColorPickerCapabilities: Equatable {
     let supportsRGB: Bool
     let supportsWhite: Bool
@@ -66,7 +59,7 @@ struct HomeBaseColorPickerView: View {
 
     let capabilities: HomeBaseColorPickerCapabilities
     let liveValues: () -> AsyncThrowingStream<
-        HomeBaseColorPickerObservation,
+        ControlValueObservation,
         Error
     >
     let setValue: (HBJSONValue) async throws -> Void
@@ -88,7 +81,7 @@ struct HomeBaseColorPickerView: View {
     @State private var whiteKelvinText: String
     @State private var whiteKelvinError: String?
     @State private var isManipulating = false
-    @State private var deferredLiveObservation: HomeBaseColorPickerObservation?
+    @State private var deferredLiveObservation: ControlValueObservation?
     @State private var liveUpdateDeadline: Date?
     @State private var resumeLiveUpdatesTask: Task<Void, Never>?
     @FocusState private var focusedField: FocusedField?
@@ -100,7 +93,7 @@ struct HomeBaseColorPickerView: View {
         aggregateValues: [HBJSONValue]?,
         aggregateValueCount: Int?,
         liveValues: @escaping () -> AsyncThrowingStream<
-            HomeBaseColorPickerObservation,
+            ControlValueObservation,
             Error
         >,
         setValue: @escaping (HBJSONValue) async throws -> Void
@@ -534,7 +527,7 @@ struct HomeBaseColorPickerView: View {
     }
 
     private func receiveLiveObservation(
-        _ observation: HomeBaseColorPickerObservation
+        _ observation: ControlValueObservation
     ) {
         if isManipulating
             || focusedField != nil
@@ -549,7 +542,7 @@ struct HomeBaseColorPickerView: View {
     }
 
     private func applyLiveObservation(
-        _ observation: HomeBaseColorPickerObservation
+        _ observation: ControlValueObservation
     ) {
         if observation.aggregateState == .mixed {
             let selections = Self.constituentSelections(

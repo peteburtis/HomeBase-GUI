@@ -71,3 +71,56 @@ struct TopologyGroupPlacement {
         }
     }
 }
+
+extension HBTopologyListResult {
+    /// Adds the presentation-only room used by the app for devices that do
+    /// not belong to any configured room. The synthetic room is appended so
+    /// it remains the final room everywhere the topology is presented.
+    var includingOtherRoom: HBTopologyListResult {
+        let assignedDeviceIdentifiers = Set(
+            rooms.flatMap(\.resolvedDeviceIdentifiers)
+        )
+        let unassignedDevices = devices.filter {
+            !assignedDeviceIdentifiers.contains($0.identifier)
+        }
+        guard !unassignedDevices.isEmpty else { return self }
+
+        var presentedTopology = self
+        presentedTopology.rooms.append(
+            HBTopologyRoomDescriptor(
+                identifier: Self.otherRoomIdentifier(
+                    avoiding: rooms.map(\.identifier)
+                ),
+                displayName: "Other",
+                members: unassignedDevices.map {
+                    HBTopologyMemberDescriptor(
+                        kind: .device,
+                        identifier: $0.identifier
+                    )
+                },
+                resolvedDeviceIdentifiers: unassignedDevices.map(\.identifier)
+            )
+        )
+        return presentedTopology
+    }
+
+    func containsRoom(identifier: String) -> Bool {
+        rooms.contains { $0.identifier == identifier }
+    }
+
+    private static func otherRoomIdentifier(
+        avoiding roomIdentifiers: [String]
+    ) -> String {
+        let existingIdentifiers = Set(roomIdentifiers)
+        let baseIdentifier = "homebase-gui.other-room"
+        guard existingIdentifiers.contains(baseIdentifier) else {
+            return baseIdentifier
+        }
+
+        var suffix = 2
+        while existingIdentifiers.contains("\(baseIdentifier).\(suffix)") {
+            suffix += 1
+        }
+        return "\(baseIdentifier).\(suffix)"
+    }
+}
