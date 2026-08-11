@@ -92,6 +92,9 @@ struct ScenesView: View {
                 await model.stop()
             }
         }
+        .onAppear {
+            isEditingScenes = false
+        }
         .onDisappear {
             Task {
                 await model.stop()
