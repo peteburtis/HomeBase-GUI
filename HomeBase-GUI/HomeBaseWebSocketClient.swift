@@ -427,6 +427,51 @@ actor HomeBaseWebSocketClient {
         return result
     }
 
+    func renameConfigurationFile(
+        from sourcePath: String,
+        to destinationPath: String
+    ) async throws -> HBConfigurationFileRenameResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.renameFile,
+            payload: HBConfigurationFileRenameRequest(
+                sourcePath: sourcePath,
+                destinationPath: destinationPath
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(
+            as: HBConfigurationFileRenameResult.self
+        )
+        guard result.sourcePath == sourcePath,
+              result.destinationPath == destinationPath else {
+            throw ClientError.invalidMessage(
+                "configuration file rename acknowledgement did not match the request"
+            )
+        }
+        return result
+    }
+
+    func deleteConfigurationFile(
+        at path: String
+    ) async throws -> HBConfigurationFileDeleteResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.deleteFile,
+            payload: HBConfigurationFileDeleteRequest(path: path)
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(
+            as: HBConfigurationFileDeleteResult.self
+        )
+        guard result.path == path else {
+            throw ClientError.invalidMessage(
+                "configuration file delete acknowledgement did not match the request"
+            )
+        }
+        return result
+    }
+
     func subscribeToScenes() async throws -> SceneSubscription {
         let request = try sessionRequest(
             operation: HBProtocolOperations.streamScenes,

@@ -212,7 +212,9 @@ final class SceneConfigurationRepositoryTests: XCTestCase {
         )
     }
 
-    func testRequiredFileRenameFailsBeforeAnyRemoteOperation() async throws {
+    func testRequiredFileRenameMovesWritesReloadsAndVerifiesDestination()
+        async throws
+    {
         let source = sceneSource(value: 0.25)
         let client = SceneConfigurationRemoteClientSpy(
             files: ["scenes/Evening.json": source]
@@ -221,22 +223,30 @@ final class SceneConfigurationRepositoryTests: XCTestCase {
         var draft = try makeDraft(source: source)
         try draft.setIdentifier("LateEvening")
 
-        do {
-            _ = try await repository.save(draft)
-            XCTFail("Expected an unsupported file rename")
-        } catch let error as SceneConfigurationSaveError {
-            guard case .fileRenameUnsupported(let rename) = error else {
-                return XCTFail(
-                    "Expected an unsupported file rename, received \(error)"
-                )
-            }
-            XCTAssertEqual(rename.originalPath, "scenes/Evening.json")
-            XCTAssertEqual(rename.proposedPath, "scenes/LateEvening.json")
-        }
+        let outcome = try await repository.save(draft)
 
-        XCTAssertTrue(client.events.isEmpty)
-        XCTAssertEqual(client.files["scenes/Evening.json"], source)
-        XCTAssertNil(client.files["scenes/LateEvening.json"])
+        guard case .saved(let savedScene, let reload) = outcome else {
+            return XCTFail("Expected a saved outcome")
+        }
+        XCTAssertEqual(savedScene.identifier, "LateEvening")
+        XCTAssertEqual(
+            savedScene.source.path,
+            "scenes/LateEvening.json"
+        )
+        XCTAssertEqual(reload.name, "LateEvening")
+        XCTAssertNil(client.files["scenes/Evening.json"])
+        XCTAssertNotNil(client.files["scenes/LateEvening.json"])
+        XCTAssertEqual(
+            client.events,
+            [
+                "reactivate",
+                "get:scenes/Evening.json",
+                "rename:scenes/Evening.json:scenes/LateEvening.json",
+                "set:scenes/LateEvening.json",
+                "reload:LateEvening",
+                "get:scenes/LateEvening.json",
+            ]
+        )
     }
 
     func testIdentifierChangeInSharedFileSavesWithoutRenamingFile()
@@ -281,6 +291,40 @@ final class SceneConfigurationRepositoryTests: XCTestCase {
         )
     }
 
+    func testRenameWriteFailureMovesOriginalFileBack() async throws {
+        let source = sceneSource(value: 0.25)
+        let destinationPath = "scenes/LateEvening.json"
+        let client = SceneConfigurationRemoteClientSpy(
+            files: ["scenes/Evening.json": source],
+            setFailurePaths: [destinationPath]
+        )
+        let repository = SceneConfigurationRepository(client: client)
+        var draft = try makeDraft(source: source)
+        try draft.setIdentifier("LateEvening")
+
+        do {
+            _ = try await repository.save(draft)
+            XCTFail("Expected the destination write to fail")
+        } catch let error as SceneConfigurationRemoteClientSpy.StubError {
+            guard case .unavailable = error else {
+                return XCTFail("Expected an unavailable error, received \(error)")
+            }
+        }
+
+        XCTAssertEqual(client.files["scenes/Evening.json"], source)
+        XCTAssertNil(client.files[destinationPath])
+        XCTAssertEqual(
+            client.events,
+            [
+                "reactivate",
+                "get:scenes/Evening.json",
+                "rename:scenes/Evening.json:scenes/LateEvening.json",
+                "set:scenes/LateEvening.json",
+                "rename:scenes/LateEvening.json:scenes/Evening.json",
+            ]
+        )
+    }
+
     func testReloadFailureCarriesRevisionGuardedRecovery() async throws {
         let source = sceneSource(value: 0.25)
         let client = SceneConfigurationRemoteClientSpy(
@@ -320,6 +364,27 @@ final class SceneConfigurationRepositoryTests: XCTestCase {
         )
     }
 
+    func testSuccessfulReloadMustReportSavedScenePresent() async throws {
+        let source = sceneSource(value: 0.25)
+        let client = SceneConfigurationRemoteClientSpy(
+            files: ["scenes/Evening.json": source],
+            reloadSceneStatus: .notPresent
+        )
+        let repository = SceneConfigurationRepository(client: client)
+        var draft = try makeDraft(source: source)
+        try draft.setControlValue(actionIndex: 0, value: 0.8)
+
+        do {
+            _ = try await repository.save(draft)
+            XCTFail("Expected a missing-scene reload failure")
+        } catch let error as SceneConfigurationSaveError {
+            guard case .reloadFailed(let message, _, _) = error else {
+                return XCTFail("Expected reload failure, received \(error)")
+            }
+            XCTAssertTrue(message.contains("is not present"))
+        }
+    }
+
     func testRecoveryRefusesToOverwriteASecondEdit() async throws {
         let source = sceneSource(value: 0.25)
         let saved = sceneSource(value: 0.8)
@@ -328,7 +393,8 @@ final class SceneConfigurationRepositoryTests: XCTestCase {
         )
         let repository = SceneConfigurationRepository(client: client)
         let recovery = SceneConfigurationRecovery(
-            path: "scenes/Evening.json",
+            savedPath: "scenes/Evening.json",
+            originalPath: "scenes/Evening.json",
             originalSource: source,
             originalSceneName: "Evening",
             savedSourceRevision: RemoteJSONDocument.revision(for: saved)
@@ -350,6 +416,206 @@ final class SceneConfigurationRepositoryTests: XCTestCase {
         XCTAssertEqual(
             client.files["scenes/Evening.json"],
             sceneSource(value: 0.6)
+        )
+    }
+
+    func testRenamedSceneReloadFailureCanRestoreOriginalFile() async throws {
+        let source = sceneSource(value: 0.25)
+        let client = SceneConfigurationRemoteClientSpy(
+            files: ["scenes/Evening.json": source],
+            reloadFailure: "Scene validation failed"
+        )
+        let repository = SceneConfigurationRepository(client: client)
+        var draft = try makeDraft(source: source)
+        try draft.setIdentifier("LateEvening")
+
+        let recovery: SceneConfigurationRecovery
+        do {
+            _ = try await repository.save(draft)
+            return XCTFail("Expected reload failure")
+        } catch let error as SceneConfigurationSaveError {
+            guard case .reloadFailed(
+                _,
+                let carriedRecovery,
+                let presumedScene
+            ) = error else {
+                return XCTFail("Expected reload failure, received \(error)")
+            }
+            XCTAssertEqual(
+                presumedScene.source.path,
+                "scenes/LateEvening.json"
+            )
+            recovery = carriedRecovery
+        }
+
+        XCTAssertNil(client.files["scenes/Evening.json"])
+        XCTAssertNotNil(client.files["scenes/LateEvening.json"])
+
+        client.reloadFailure = nil
+        let restored = try await repository.restore(recovery)
+
+        XCTAssertEqual(restored.identifier, "Evening")
+        XCTAssertEqual(restored.source.path, "scenes/Evening.json")
+        XCTAssertEqual(client.files["scenes/Evening.json"], source)
+        XCTAssertNil(client.files["scenes/LateEvening.json"])
+        XCTAssertEqual(
+            client.events,
+            [
+                "reactivate",
+                "get:scenes/Evening.json",
+                "rename:scenes/Evening.json:scenes/LateEvening.json",
+                "set:scenes/LateEvening.json",
+                "reload:LateEvening",
+                "reactivate",
+                "get:scenes/LateEvening.json",
+                "set:scenes/LateEvening.json",
+                "rename:scenes/LateEvening.json:scenes/Evening.json",
+                "reload:Evening",
+                "get:scenes/Evening.json",
+            ]
+        )
+    }
+
+    func testDeletingSoleSceneDeletesFileAndReloadsItsAbsence()
+        async throws
+    {
+        let source = sceneSource(value: 0.25)
+        let client = SceneConfigurationRemoteClientSpy(
+            files: ["scenes/Evening.json": source],
+            reloadSceneStatus: .notPresent
+        )
+        let repository = SceneConfigurationRepository(client: client)
+        let scene = try makeDraft(source: source).original
+
+        let outcome = try await repository.delete(scene)
+
+        XCTAssertEqual(outcome.path, "scenes/Evening.json")
+        XCTAssertTrue(outcome.deletedFile)
+        XCTAssertEqual(outcome.reload.sceneStatus, .notPresent)
+        XCTAssertNil(client.files["scenes/Evening.json"])
+        XCTAssertEqual(
+            client.events,
+            [
+                "reactivate",
+                "get:scenes/Evening.json",
+                "delete:scenes/Evening.json",
+                "reload:Evening",
+            ]
+        )
+    }
+
+    func testDeletingSharedScenePreservesOtherScenesInTheFile()
+        async throws
+    {
+        let source = """
+        [
+          {"Identifier":"Morning","Actions":[]},
+          {"Identifier":"Evening","Actions":[]}
+        ]
+        """
+        let path = "scenes/Lighting.json"
+        let originalDocument = try RemoteJSONDocument(
+            path: path,
+            source: source
+        )
+        let scene = try SceneConfigurationCatalog(
+            documents: [originalDocument]
+        ).scene(named: "Evening")
+        let client = SceneConfigurationRemoteClientSpy(
+            files: [path: source],
+            reloadSceneStatus: .notPresent
+        )
+        let repository = SceneConfigurationRepository(client: client)
+
+        let outcome = try await repository.delete(scene)
+
+        XCTAssertFalse(outcome.deletedFile)
+        let remainingSource = try XCTUnwrap(client.files[path])
+        let remainingDocument = try RemoteJSONDocument(
+            path: path,
+            source: remainingSource
+        )
+        let catalog = SceneConfigurationCatalog(
+            documents: [remainingDocument]
+        )
+        XCTAssertEqual(catalog.scenes.map(\.identifier), ["Morning"])
+        guard case .array(let remainingValues) = remainingDocument.root else {
+            return XCTFail("Expected the shared file to remain an array")
+        }
+        XCTAssertEqual(remainingValues.count, 1)
+        XCTAssertEqual(
+            client.events,
+            [
+                "reactivate",
+                "get:scenes/Lighting.json",
+                "set:scenes/Lighting.json",
+                "reload:Evening",
+            ]
+        )
+    }
+
+    func testDeletingSceneRejectsAChangedSourceBeforeMutation()
+        async throws
+    {
+        let source = sceneSource(value: 0.25)
+        let client = SceneConfigurationRemoteClientSpy(
+            files: ["scenes/Evening.json": sceneSource(value: 0.5)],
+            reloadSceneStatus: .notPresent
+        )
+        let repository = SceneConfigurationRepository(client: client)
+        let scene = try makeDraft(source: source).original
+
+        do {
+            _ = try await repository.delete(scene)
+            XCTFail("Expected a source conflict")
+        } catch let error as SceneConfigurationDeleteError {
+            guard case .conflict(let path) = error else {
+                return XCTFail("Expected a conflict, received \(error)")
+            }
+            XCTAssertEqual(path, "scenes/Evening.json")
+        }
+
+        XCTAssertEqual(
+            client.events,
+            ["reactivate", "get:scenes/Evening.json"]
+        )
+        XCTAssertNotNil(client.files["scenes/Evening.json"])
+    }
+
+    func testFailedDeletionReloadRestoresTheOriginalFile()
+        async throws
+    {
+        let source = sceneSource(value: 0.25)
+        let client = SceneConfigurationRemoteClientSpy(
+            files: ["scenes/Evening.json": source],
+            reloadSceneStatus: .present
+        )
+        let repository = SceneConfigurationRepository(client: client)
+        let scene = try makeDraft(source: source).original
+
+        do {
+            _ = try await repository.delete(scene)
+            XCTFail("Expected the present-scene reload to fail")
+        } catch let error as SceneConfigurationDeleteError {
+            guard case .reloadFailed(let message) = error else {
+                return XCTFail(
+                    "Expected a restored reload failure, received \(error)"
+                )
+            }
+            XCTAssertTrue(message.contains("is still present"))
+        }
+
+        XCTAssertEqual(client.files["scenes/Evening.json"], source)
+        XCTAssertEqual(
+            client.events,
+            [
+                "reactivate",
+                "get:scenes/Evening.json",
+                "delete:scenes/Evening.json",
+                "reload:Evening",
+                "set:scenes/Evening.json",
+                "reload:Evening",
+            ]
         )
     }
 
@@ -486,7 +752,9 @@ private final class SceneConfigurationRemoteClientSpy:
 
     var files: [String: String]
     var events: [String] = []
-    let reloadFailure: String?
+    var reloadFailure: String?
+    var reloadSceneStatus: HBSceneReloadSceneStatus
+    let setFailurePaths: Set<String>
     let controlResult: HBControlGetResult?
     let deviceListResult: HBDeviceListResult?
     let topologyResult: HBTopologyListResult
@@ -494,6 +762,8 @@ private final class SceneConfigurationRemoteClientSpy:
     init(
         files: [String: String],
         reloadFailure: String? = nil,
+        reloadSceneStatus: HBSceneReloadSceneStatus = .present,
+        setFailurePaths: Set<String> = [],
         controlResult: HBControlGetResult? = nil,
         deviceListResult: HBDeviceListResult? = nil,
         topologyResult: HBTopologyListResult = HBTopologyListResult(
@@ -504,6 +774,8 @@ private final class SceneConfigurationRemoteClientSpy:
     ) {
         self.files = files
         self.reloadFailure = reloadFailure
+        self.reloadSceneStatus = reloadSceneStatus
+        self.setFailurePaths = setFailurePaths
         self.controlResult = controlResult
         self.deviceListResult = deviceListResult
         self.topologyResult = topologyResult
@@ -545,11 +817,45 @@ private final class SceneConfigurationRemoteClientSpy:
         contents: String
     ) async throws -> HBConfigurationFileSetResult {
         events.append("set:\(path)")
+        if setFailurePaths.contains(path) {
+            throw StubError.unavailable("Unable to write \(path)")
+        }
         files[path] = contents
         return HBConfigurationFileSetResult(
             path: path,
             byteCount: contents.utf8.count
         )
+    }
+
+    func renameConfigurationFile(
+        from sourcePath: String,
+        to destinationPath: String
+    ) async throws -> HBConfigurationFileRenameResult {
+        events.append("rename:\(sourcePath):\(destinationPath)")
+        guard let contents = files[sourcePath] else {
+            throw StubError.missingFile(sourcePath)
+        }
+        guard files[destinationPath] == nil else {
+            throw StubError.unavailable(
+                "Destination file already exists: \(destinationPath)"
+            )
+        }
+        files[sourcePath] = nil
+        files[destinationPath] = contents
+        return HBConfigurationFileRenameResult(
+            sourcePath: sourcePath,
+            destinationPath: destinationPath
+        )
+    }
+
+    func deleteConfigurationFile(
+        at path: String
+    ) async throws -> HBConfigurationFileDeleteResult {
+        events.append("delete:\(path)")
+        guard files.removeValue(forKey: path) != nil else {
+            throw StubError.missingFile(path)
+        }
+        return HBConfigurationFileDeleteResult(path: path)
     }
 
     func reloadScene(named name: String) async throws
@@ -559,7 +865,7 @@ private final class SceneConfigurationRemoteClientSpy:
         if let reloadFailure {
             throw StubError.unavailable(reloadFailure)
         }
-        return HBSceneReloadResult(name: name)
+        return HBSceneReloadResult(name: name, sceneStatus: reloadSceneStatus)
     }
 
     func deviceDetails(

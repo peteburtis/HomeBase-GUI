@@ -19,6 +19,13 @@ protocol SceneConfigurationRemoteClient: Sendable {
         at path: String,
         contents: String
     ) async throws -> HBConfigurationFileSetResult
+    func renameConfigurationFile(
+        from sourcePath: String,
+        to destinationPath: String
+    ) async throws -> HBConfigurationFileRenameResult
+    func deleteConfigurationFile(
+        at path: String
+    ) async throws -> HBConfigurationFileDeleteResult
     func reloadScene(named name: String) async throws -> HBSceneReloadResult
     func listDevices(
         device: String?,
@@ -44,10 +51,37 @@ struct SceneConfigurationDeviceCatalog: Equatable, Sendable {
 }
 
 struct SceneConfigurationRecovery: Sendable {
-    let path: String
+    let savedPath: String
+    let originalPath: String
     let originalSource: String
     let originalSceneName: String
     let savedSourceRevision: String
+}
+
+struct SceneConfigurationDeleteOutcome: Sendable {
+    let path: String
+    let deletedFile: Bool
+    let reload: HBSceneReloadResult
+}
+
+enum SceneConfigurationDeleteError: LocalizedError, Sendable {
+    case conflict(path: String)
+    case invalidSceneLocation(path: String, jsonPath: String)
+    case reloadFailed(message: String)
+    case rollbackFailed(reloadMessage: String, rollbackMessage: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .conflict(let path):
+            "\(path) changed on the server after it was opened. Reload before deleting so another edit is not overwritten."
+        case .invalidSceneLocation(let path, let jsonPath):
+            "The scene no longer has a valid location at \(path) \(jsonPath). No file was changed."
+        case .reloadFailed(let message):
+            "HomeBase could not finish deleting the scene, so the original file was restored. \(message)"
+        case .rollbackFailed(let reloadMessage, let rollbackMessage):
+            "The scene file was changed, but HomeBase could not reload the deletion or restore the original state. Reload error: \(reloadMessage) Restore error: \(rollbackMessage)"
+        }
+    }
 }
 
 enum SceneConfigurationSaveOutcome: Sendable {
@@ -61,7 +95,12 @@ enum SceneConfigurationSaveOutcome: Sendable {
 enum SceneConfigurationSaveError: LocalizedError, Sendable {
     case conflict(path: String)
     case invalidDerivedFilename(identifier: String)
-    case fileRenameUnsupported(SceneConfigurationSourceRename)
+    case renameRollbackFailed(
+        sourcePath: String,
+        destinationPath: String,
+        saveMessage: String,
+        rollbackMessage: String
+    )
     case fileAlreadyExists(path: String)
     case sceneAlreadyExists(identifier: String, path: String)
     case creationPreflightFailed(message: String)
@@ -85,8 +124,13 @@ enum SceneConfigurationSaveError: LocalizedError, Sendable {
             "\(path) changed on the server after it was opened. Reload before saving so another edit is not overwritten."
         case .invalidDerivedFilename(let identifier):
             "A safe scene filename could not be derived from identifier \"\(identifier)\"."
-        case .fileRenameUnsupported(let rename):
-            "Saving requires renaming \(rename.originalPath) to \(rename.proposedPath), but HomeBase does not yet provide the file-delete operation needed to remove the old file safely. No file was changed."
+        case .renameRollbackFailed(
+            let sourcePath,
+            let destinationPath,
+            let saveMessage,
+            let rollbackMessage
+        ):
+            "HomeBase renamed \(sourcePath) to \(destinationPath), but the edited contents could not be saved and the file could not be moved back. Save error: \(saveMessage) Rollback error: \(rollbackMessage) Reload the editor before making further changes."
         case .fileAlreadyExists(let path):
             "A configuration file already exists at \(path). No file was changed."
         case .sceneAlreadyExists(let identifier, let path):
@@ -165,17 +209,17 @@ struct SceneConfigurationRepository: Sendable {
                     identifier: draft.scene.identifier ?? ""
                 )
             }
-            if let rename = draft.sourceRename {
-                throw SceneConfigurationSaveError.fileRenameUnsupported(rename)
-            }
         }
 
         let sceneName = draft.scene.identifier
             ?? draft.original.identifier
             ?? ""
+        let sourcePath = draft.original.source.path
+        let rename = draft.sourceRename
+        let savedPath = rename?.proposedPath ?? sourcePath
         let renderedSource = try draft.renderedSource()
         let presumedDocument = try RemoteJSONDocument(
-            path: draft.original.source.path,
+            path: savedPath,
             source: renderedSource
         )
         let presumedScene = try SceneConfigurationCatalog(
@@ -183,27 +227,57 @@ struct SceneConfigurationRepository: Sendable {
         ).scene(named: sceneName)
 
         try await client.reactivate()
-        let current = try await document(at: draft.original.source.path)
+        let current = try await document(at: sourcePath)
         guard current.sourceRevision == draft.original.source.sourceRevision else {
             throw SceneConfigurationSaveError.conflict(
-                path: draft.original.source.path
+                path: sourcePath
             )
         }
 
-        _ = try await client.setConfigurationFile(
-            at: draft.original.source.path,
-            contents: renderedSource
-        )
+        if let rename {
+            _ = try await client.renameConfigurationFile(
+                from: rename.originalPath,
+                to: rename.proposedPath
+            )
+            do {
+                _ = try await client.setConfigurationFile(
+                    at: savedPath,
+                    contents: renderedSource
+                )
+            } catch {
+                let saveMessage = error.localizedDescription
+                do {
+                    _ = try await client.renameConfigurationFile(
+                        from: rename.proposedPath,
+                        to: rename.originalPath
+                    )
+                } catch {
+                    throw SceneConfigurationSaveError.renameRollbackFailed(
+                        sourcePath: rename.originalPath,
+                        destinationPath: rename.proposedPath,
+                        saveMessage: saveMessage,
+                        rollbackMessage: error.localizedDescription
+                    )
+                }
+                throw error
+            }
+        } else {
+            _ = try await client.setConfigurationFile(
+                at: savedPath,
+                contents: renderedSource
+            )
+        }
 
         let recovery = SceneConfigurationRecovery(
-            path: draft.original.source.path,
+            savedPath: savedPath,
+            originalPath: sourcePath,
             originalSource: draft.original.source.originalSource,
             originalSceneName: draft.original.identifier ?? sceneName,
             savedSourceRevision: presumedDocument.sourceRevision
         )
         let reload: HBSceneReloadResult
         do {
-            reload = try await client.reloadScene(named: sceneName)
+            reload = try await reloadPresentScene(named: sceneName)
         } catch {
             throw SceneConfigurationSaveError.reloadFailed(
                 message: error.localizedDescription,
@@ -214,7 +288,7 @@ struct SceneConfigurationRepository: Sendable {
 
         do {
             let verifiedDocument = try await document(
-                at: draft.original.source.path
+                at: savedPath
             )
             let verifiedScene = try SceneConfigurationCatalog(
                 documents: [verifiedDocument]
@@ -239,21 +313,92 @@ struct SceneConfigurationRepository: Sendable {
         _ recovery: SceneConfigurationRecovery
     ) async throws -> SceneConfigurationDocument {
         try await client.reactivate()
-        let current = try await document(at: recovery.path)
-        guard current.sourceRevision == recovery.savedSourceRevision else {
-            throw SceneConfigurationSaveError.conflict(path: recovery.path)
+        let current = try await document(at: recovery.savedPath)
+        let originalSourceRevision = RemoteJSONDocument.revision(
+            for: recovery.originalSource
+        )
+        guard current.sourceRevision == recovery.savedSourceRevision
+                || current.sourceRevision == originalSourceRevision else {
+            throw SceneConfigurationSaveError.conflict(path: recovery.savedPath)
         }
 
-        _ = try await client.setConfigurationFile(
-            at: recovery.path,
-            contents: recovery.originalSource
-        )
-        let reload = try await client.reloadScene(
+        if current.sourceRevision != originalSourceRevision {
+            _ = try await client.setConfigurationFile(
+                at: recovery.savedPath,
+                contents: recovery.originalSource
+            )
+        }
+        if recovery.savedPath != recovery.originalPath {
+            _ = try await client.renameConfigurationFile(
+                from: recovery.savedPath,
+                to: recovery.originalPath
+            )
+        }
+        let reload = try await reloadPresentScene(
             named: recovery.originalSceneName
         )
-        let restored = try await document(at: recovery.path)
+        let restored = try await document(at: recovery.originalPath)
         return try SceneConfigurationCatalog(documents: [restored])
             .scene(named: reload.name)
+    }
+
+    func delete(
+        _ scene: SceneConfigurationDocument
+    ) async throws -> SceneConfigurationDeleteOutcome {
+        guard let sceneName = scene.identifier, !sceneName.isEmpty else {
+            throw SceneConfigurationDeleteError.invalidSceneLocation(
+                path: scene.source.path,
+                jsonPath: scene.jsonPath
+            )
+        }
+
+        try await client.reactivate()
+        let current = try await document(at: scene.source.path)
+        guard current.sourceRevision == scene.source.sourceRevision else {
+            throw SceneConfigurationDeleteError.conflict(
+                path: scene.source.path
+            )
+        }
+
+        let remainingSource = try sourceAfterRemoving(scene)
+        if let remainingSource {
+            _ = try await client.setConfigurationFile(
+                at: scene.source.path,
+                contents: remainingSource
+            )
+        } else {
+            _ = try await client.deleteConfigurationFile(
+                at: scene.source.path
+            )
+        }
+
+        let reload: HBSceneReloadResult
+        do {
+            reload = try await reloadMissingScene(named: sceneName)
+        } catch {
+            let reloadMessage = error.localizedDescription
+            do {
+                _ = try await client.setConfigurationFile(
+                    at: scene.source.path,
+                    contents: scene.source.originalSource
+                )
+                _ = try await reloadPresentScene(named: sceneName)
+            } catch {
+                throw SceneConfigurationDeleteError.rollbackFailed(
+                    reloadMessage: reloadMessage,
+                    rollbackMessage: error.localizedDescription
+                )
+            }
+            throw SceneConfigurationDeleteError.reloadFailed(
+                message: reloadMessage
+            )
+        }
+
+        return SceneConfigurationDeleteOutcome(
+            path: scene.source.path,
+            deletedFile: remainingSource == nil,
+            reload: reload
+        )
     }
 
     private func create(
@@ -339,7 +484,7 @@ struct SceneConfigurationRepository: Sendable {
         let sceneName = presumedScene.identifier ?? ""
         let reload: HBSceneReloadResult
         do {
-            reload = try await client.reloadScene(named: sceneName)
+            reload = try await reloadPresentScene(named: sceneName)
         } catch {
             throw SceneConfigurationSaveError.creationReloadFailed(
                 message: error.localizedDescription,
@@ -410,6 +555,56 @@ struct SceneConfigurationRepository: Sendable {
             )
         }
         return try RemoteJSONDocument(path: result.path, source: result.contents)
+    }
+
+    private func sourceAfterRemoving(
+        _ scene: SceneConfigurationDocument
+    ) throws -> String? {
+        switch (scene.source.root, scene.rootIndex) {
+        case (.object, nil):
+            return nil
+
+        case (.array(var values), .some(let index))
+            where values.indices.contains(index):
+            if values.count == 1 {
+                return nil
+            }
+            values.remove(at: index)
+            return try HBJSONValue.array(values)
+                .configurationJSONSource(prettyPrinted: true) + "\n"
+
+        default:
+            throw SceneConfigurationDeleteError.invalidSceneLocation(
+                path: scene.source.path,
+                jsonPath: scene.jsonPath
+            )
+        }
+    }
+
+    private func reloadPresentScene(
+        named sceneName: String
+    ) async throws -> HBSceneReloadResult {
+        let result = try await client.reloadScene(named: sceneName)
+        guard result.sceneStatus == .present else {
+            throw SceneConfigurationLoadingError(
+                message:
+                    "The automation graph reloaded, but scene \"\(sceneName)\" is not present."
+            )
+        }
+        return result
+    }
+
+    private func reloadMissingScene(
+        named sceneName: String
+    ) async throws -> HBSceneReloadResult {
+        let result = try await client.reloadScene(named: sceneName)
+        guard result.sceneStatus == .notPresent else {
+            throw SceneConfigurationLoadingError(
+                message:
+                    "The automation graph reloaded, but scene \"\(sceneName)\" is still present."
+            )
+        }
+        return result
     }
 }
 

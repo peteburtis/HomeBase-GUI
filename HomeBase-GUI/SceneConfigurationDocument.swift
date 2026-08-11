@@ -54,6 +54,17 @@ struct SceneConfigurationDocument: Identifiable, Equatable, Sendable {
                 return left.key < right.key
             }
     }
+
+    var occupiesEntireSourceFile: Bool {
+        switch (source.root, rootIndex) {
+        case (.object, nil):
+            true
+        case (.array(let values), .some(let index)):
+            values.count == 1 && index == 0
+        default:
+            false
+        }
+    }
 }
 
 struct SceneActionConfiguration: Identifiable, Equatable, Sendable {

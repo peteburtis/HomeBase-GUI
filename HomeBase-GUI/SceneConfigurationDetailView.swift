@@ -20,7 +20,8 @@ struct SceneConfigurationDetailView: View {
     private let repository: SceneConfigurationRepository
     @StateObject private var model: SceneConfigurationDetailModel
     @State private var isShowingControlPicker = false
-    @State private var isConfirmingDiscard = false
+    @State private var pendingAddedActionIndex: Int?
+    @State private var newlyAddedActionIndex: Int?
 
     init(
         sceneName: String,
@@ -62,7 +63,11 @@ struct SceneConfigurationDetailView: View {
                     .foregroundStyle(.secondary)
 
             case .loaded:
-                SceneConfigurationContents(model: model)
+                SceneConfigurationContents(
+                    model: model,
+                    newlyAddedActionIndex: $newlyAddedActionIndex,
+                    addAction: beginAddingAction
+                )
                     .refreshable {
                         await model.reload()
                     }
@@ -96,23 +101,19 @@ struct SceneConfigurationDetailView: View {
                 } label: {
                     Image(systemName: "xmark")
                 }
-                .disabled(model.isSaving)
+                .disabled(model.isBusy)
                 .accessibilityLabel("Cancel Editing")
             }
 
             if model.state == .loaded {
-                ToolbarItemGroup(placement: .primaryAction) {
-                    Button {
-                        isShowingControlPicker = true
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    .disabled(!model.canMutateStructure)
-                    .accessibilityLabel("Add Control Set")
-
-                    if model.isSaving {
+                ToolbarItem(placement: .primaryAction) {
+                    if model.isBusy {
                         ProgressView()
-                            .accessibilityLabel("Saving scene")
+                            .accessibilityLabel(
+                                model.isDeleting
+                                    ? "Deleting scene"
+                                    : "Saving scene"
+                            )
                     } else {
                         Button {
                             Task {
@@ -129,24 +130,15 @@ struct SceneConfigurationDetailView: View {
             }
         }
         .alert(item: $model.presentedAlert, content: makeAlert)
-        .confirmationDialog(
-            "Discard Scene Changes?",
-            isPresented: $isConfirmingDiscard,
-            titleVisibility: .visible
+        .sheet(
+            isPresented: $isShowingControlPicker,
+            onDismiss: revealAddedAction
         ) {
-            Button("Discard Changes", role: .destructive) {
-                dismiss()
-            }
-            Button("Keep Editing", role: .cancel) {}
-        } message: {
-            Text("Your unsaved scene changes will be lost.")
-        }
-        .sheet(isPresented: $isShowingControlPicker) {
             SceneControlPickerView(
                 repository: repository,
                 excludedControlPaths: model.configuredControlPaths
             ) { device, control, valueSource in
-                try await model.addControlSet(
+                pendingAddedActionIndex = try await model.addControlSet(
                     device: device,
                     control: control,
                     valueSource: valueSource
@@ -158,9 +150,21 @@ struct SceneConfigurationDetailView: View {
         }
     }
 
+    private func beginAddingAction() {
+        pendingAddedActionIndex = nil
+        newlyAddedActionIndex = nil
+        isShowingControlPicker = true
+    }
+
+    private func revealAddedAction() {
+        guard let pendingAddedActionIndex else { return }
+        self.pendingAddedActionIndex = nil
+        newlyAddedActionIndex = pendingAddedActionIndex
+    }
+
     private func cancel() {
         if model.hasChangesToDiscard {
-            isConfirmingDiscard = true
+            model.confirmDiscardAndClose()
         } else {
             dismiss()
         }
@@ -175,6 +179,30 @@ struct SceneConfigurationDetailView: View {
                 primaryButton: .destructive(Text("Discard Changes")) {
                     Task {
                         await model.forceReload()
+                    }
+                },
+                secondaryButton: .cancel()
+            )
+
+        case .discardAndClose:
+            Alert(
+                title: Text(alert.title),
+                message: Text(alert.message),
+                primaryButton: .destructive(Text("Discard Changes")) {
+                    dismiss()
+                },
+                secondaryButton: .cancel(Text("Keep Editing"))
+            )
+
+        case .deleteScene:
+            Alert(
+                title: Text(alert.title),
+                message: Text(alert.message),
+                primaryButton: .destructive(Text("Delete Scene")) {
+                    Task {
+                        if await model.deleteScene() {
+                            dismiss()
+                        }
                     }
                 },
                 secondaryButton: .cancel()
@@ -216,110 +244,184 @@ struct SceneConfigurationDetailView: View {
 
 private struct SceneConfigurationContents: View {
     @ObservedObject var model: SceneConfigurationDetailModel
+    @Binding var newlyAddedActionIndex: Int?
+    let addAction: () -> Void
+
+    @State private var highlightedActionIndex: Int?
 
     var body: some View {
-        List {
-            if let scene = model.scene {
-                Section {
-                    SceneConfigurationEditableTextRow(
-                        label: "Identifier",
-                        text: Binding(
-                            get: { model.identifierInput },
-                            set: model.setIdentifierInput
-                        ),
-                        prompt: "Required",
-                        kind: .identifier,
-                        validationMessage:
-                            model.identifierValidationMessage
-                    )
-                    SceneConfigurationEditableTextRow(
-                        label: "Priority",
-                        text: Binding(
-                            get: { model.priorityInput },
-                            set: model.setPriorityInput
-                        ),
-                        prompt: "Default",
-                        kind: .integer,
-                        validationMessage: model.priorityValidationMessage
-                    )
-                    SceneConfigurationEditableTextRow(
-                        label: "Timing",
-                        text: Binding(
-                            get: { model.timingInput },
-                            set: model.setTimingInput
-                        ),
-                        prompt: "Default (seconds)",
-                        kind: .decimal,
-                        validationMessage: model.timingValidationMessage
-                    )
-
-                    ForEach(scene.additionalFields, id: \.key) { field in
-                        SceneConfigurationValueRow(
-                            label: field.key,
-                            value: field.value
-                        )
-                    }
-                } header: {
-                    SceneConfigurationSectionHeader("Scene")
-                }
-
-                if scene.actions.isEmpty {
+        ScrollViewReader { scrollProxy in
+            List {
+                if let scene = model.scene {
                     Section {
-                        Text("This scene contains no actions.")
-                            .foregroundStyle(.secondary)
-                    } header: {
-                        SceneConfigurationSectionHeader("Actions")
-                    }
-                } else {
-                    ForEach(scene.actions) { action in
-                        Section {
-                            SceneActionConfigurationRows(
-                                action: action,
-                                model: model
-                            )
-                        } header: {
-                            SceneActionSectionHeader(
-                                action: action,
-                                model: model
+                        SceneConfigurationEditableTextRow(
+                            label: "Identifier",
+                            text: Binding(
+                                get: { model.identifierInput },
+                                set: model.setIdentifierInput
+                            ),
+                            prompt: "Required",
+                            kind: .identifier,
+                            validationMessage:
+                                model.identifierValidationMessage
+                        )
+                        SceneConfigurationEditableTextRow(
+                            label: "Priority",
+                            text: Binding(
+                                get: { model.priorityInput },
+                                set: model.setPriorityInput
+                            ),
+                            prompt: "Default",
+                            kind: .integer,
+                            validationMessage: model.priorityValidationMessage
+                        )
+                        SceneConfigurationEditableTextRow(
+                            label: "Timing",
+                            text: Binding(
+                                get: { model.timingInput },
+                                set: model.setTimingInput
+                            ),
+                            prompt: "Default (seconds)",
+                            kind: .decimal,
+                            validationMessage: model.timingValidationMessage
+                        )
+
+                        ForEach(scene.additionalFields, id: \.key) { field in
+                            SceneConfigurationValueRow(
+                                label: field.key,
+                                value: field.value
                             )
                         }
+                    } header: {
+                        SceneConfigurationSectionHeader("Scene")
+                    }
+
+                    if scene.actions.isEmpty {
+                        Section {
+                            Text("This scene contains no actions.")
+                                .foregroundStyle(.secondary)
+                            newActionButton
+                        } header: {
+                            SceneConfigurationSectionHeader("Actions")
+                        }
+                    } else {
+                        ForEach(scene.actions) { action in
+                            Section {
+                                SceneActionConfigurationRows(
+                                    action: action,
+                                    model: model
+                                )
+                            } header: {
+                                SceneActionSectionHeader(
+                                    action: action,
+                                    model: model
+                                )
+                            }
+                            .id(actionScrollID(action.index))
+                            .listRowBackground(
+                                action.index == highlightedActionIndex
+                                    ? Color.accentColor.opacity(0.14)
+                                    : nil
+                            )
+                        }
+
+                        Section {
+                            newActionButton
+                        }
+                    }
+
+                    Section {
+                        SceneConfigurationFileRow(
+                            path: model.presentedFilePath,
+                            note: model.filePathNote,
+                            renamePending: model.fileRenameIsPending,
+                            creatingFile: model.fileCreationIsPending
+                        )
+                        SceneConfigurationTextRow(
+                            label: "JSON location",
+                            value: scene.jsonPath
+                        )
+
+                        if model.isAwaitingCreatedSceneReload {
+                            Label(
+                                "File created; reload pending",
+                                systemImage: "arrow.clockwise.circle"
+                            )
+                            .foregroundStyle(.orange)
+                        } else if model.isDirty {
+                            Label(
+                                "Unsaved changes",
+                                systemImage: "pencil.circle"
+                            )
+                            .foregroundStyle(.secondary)
+                        } else if let saveConfirmation = model.saveConfirmation {
+                            Label(
+                                saveConfirmation,
+                                systemImage: "checkmark.circle"
+                            )
+                            .foregroundStyle(.green)
+                        }
+                        if model.showsDeleteAction {
+                            Button(role: .destructive) {
+                                model.confirmDeletion()
+                            } label: {
+                                if model.isDeleting {
+                                    HStack(spacing: 10) {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                        Text("Deleting Scene…")
+                                    }
+                                } else {
+                                    Label("Delete Scene", systemImage: "trash")
+                                }
+                            }
+                            .disabled(!model.canDelete)
+                        }
+                    } header: {
+                        SceneConfigurationSectionHeader("Source")
                     }
                 }
+            }
+            .onChange(of: newlyAddedActionIndex) { _, actionIndex in
+                guard let actionIndex else { return }
+                newlyAddedActionIndex = nil
+                reveal(actionIndex, using: scrollProxy)
+            }
+        }
+    }
 
-                Section {
-                    SceneConfigurationFileRow(
-                        path: model.presentedFilePath,
-                        note: model.filePathNote,
-                        renamePending: model.fileRenameIsPending,
-                        creatingFile: model.fileCreationIsPending
-                    )
-                    SceneConfigurationTextRow(
-                        label: "JSON location",
-                        value: scene.jsonPath
-                    )
+    private var newActionButton: some View {
+        Button(action: addAction) {
+            Label("New Action", systemImage: "plus")
+        }
+        .disabled(!model.canMutateStructure)
+    }
 
-                    if model.isAwaitingCreatedSceneReload {
-                        Label(
-                            "File created; reload pending",
-                            systemImage: "arrow.clockwise.circle"
-                        )
-                        .foregroundStyle(.orange)
-                    } else if model.isDirty {
-                        Label(
-                            "Unsaved changes",
-                            systemImage: "pencil.circle"
-                        )
-                        .foregroundStyle(.secondary)
-                    } else if let saveConfirmation = model.saveConfirmation {
-                        Label(
-                            saveConfirmation,
-                            systemImage: "checkmark.circle"
-                        )
-                        .foregroundStyle(.green)
-                    }
-                } header: {
-                    SceneConfigurationSectionHeader("Source")
-                }
+    private func actionScrollID(_ actionIndex: Int) -> String {
+        "scene-action-\(actionIndex)"
+    }
+
+    private func reveal(
+        _ actionIndex: Int,
+        using scrollProxy: ScrollViewProxy
+    ) {
+        withAnimation(.easeInOut(duration: 0.3)) {
+            highlightedActionIndex = actionIndex
+            scrollProxy.scrollTo(
+                actionScrollID(actionIndex),
+                anchor: .center
+            )
+        }
+
+        Task { @MainActor in
+            do {
+                try await Task<Never, Never>.sleep(for: .seconds(1))
+            } catch {
+                return
+            }
+            guard highlightedActionIndex == actionIndex else { return }
+            withAnimation(.easeOut(duration: 0.35)) {
+                highlightedActionIndex = nil
             }
         }
     }
@@ -464,7 +566,7 @@ private struct SceneControlSetValueRow: View {
     private func resolvedValue(_ target: SceneResolvedControl) -> some View {
         let context = target.presentationContext(
             value: controlSet.value,
-            isEnabled: !model.isSaving
+            isEnabled: !model.isBusy
                 && !model.isLoadingCurrentValue(
                     actionIndex: controlSet.actionIndex
                 ),
@@ -503,7 +605,7 @@ private struct SceneControlSetValueRow: View {
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
-                .disabled(model.isSaving)
+                .disabled(model.isBusy)
                 .accessibilityLabel("Use Current Value")
             }
         } else {
@@ -522,7 +624,7 @@ private struct SceneControlSetValueRow: View {
             } label: {
                 Label("Edit JSON", systemImage: "curlybraces")
             }
-            .disabled(model.isSaving)
+            .disabled(model.isBusy)
 
             Text(
                 "This control does not have a dedicated editor."
@@ -710,6 +812,8 @@ private enum SceneControlResolution: Equatable, Sendable {
 private struct SceneEditorAlert: Identifiable {
     enum Kind {
         case discardChanges
+        case discardAndClose
+        case deleteScene
         case conflict
         case reloadFailed
         case message
@@ -761,6 +865,7 @@ private final class SceneConfigurationDetailModel: ObservableObject {
     @Published private(set) var state: State = .idle
     @Published private(set) var draft: SceneConfigurationDraft?
     @Published private(set) var isSaving = false
+    @Published private(set) var isDeleting = false
     @Published private(set) var saveConfirmation: String?
     @Published private(set) var identifierInput = ""
     @Published private(set) var priorityInput = ""
@@ -809,6 +914,10 @@ private final class SceneConfigurationDetailModel: ObservableObject {
         draft?.scene
     }
 
+    var isBusy: Bool {
+        isSaving || isDeleting
+    }
+
     var isDirty: Bool {
         draft?.isDirty == true
             || pendingCreatedScene != nil
@@ -832,11 +941,19 @@ private final class SceneConfigurationDetailModel: ObservableObject {
         state == .loaded
             && (draft?.isDirty == true || pendingCreatedScene != nil)
             && metadataValidationMessage == nil
-            && !isSaving
+            && !isBusy
     }
 
     var canMutateStructure: Bool {
-        state == .loaded && !isSaving && loadingCurrentValues.isEmpty
+        state == .loaded && !isBusy && loadingCurrentValues.isEmpty
+    }
+
+    var showsDeleteAction: Bool {
+        draft?.isNew == false
+    }
+
+    var canDelete: Bool {
+        state == .loaded && showsDeleteAction && !isBusy
     }
 
     var configuredControlPaths: Set<String> {
@@ -940,6 +1057,35 @@ private final class SceneConfigurationDetailModel: ObservableObject {
         await forceReload()
     }
 
+    func confirmDiscardAndClose() {
+        guard !isBusy else { return }
+        presentedAlert = SceneEditorAlert(
+            kind: .discardAndClose,
+            title: "Discard Scene Changes?",
+            message: "Your unsaved scene changes will be lost."
+        )
+    }
+
+    func confirmDeletion() {
+        guard canDelete, let original = draft?.original else { return }
+        let name = original.identifier ?? "this scene"
+        let message: String
+        if original.occupiesEntireSourceFile {
+            message =
+                "This permanently deletes the scene and its configuration file, \(original.source.path). This cannot be undone."
+        } else {
+            message =
+                "This permanently removes the scene from \(original.source.path). Other scenes in that file will be preserved. This cannot be undone."
+        }
+        presentedAlert = SceneEditorAlert(
+            kind: .deleteScene,
+            title: "Delete \"\(name)\"?",
+            message: hasChangesToDiscard
+                ? message + " Unsaved changes will also be discarded."
+                : message
+        )
+    }
+
     func reload() async {
         guard case .existing = source else { return }
         guard !isDirty else {
@@ -955,7 +1101,7 @@ private final class SceneConfigurationDetailModel: ObservableObject {
     }
 
     func forceReload() async {
-        guard !isSaving,
+        guard !isBusy,
               case .existing(let sceneName) = source else {
             return
         }
@@ -1009,7 +1155,7 @@ private final class SceneConfigurationDetailModel: ObservableObject {
     private func updateSceneMetadata(
         _ mutation: (inout SceneConfigurationDraft) throws -> Void
     ) {
-        guard !isSaving, var updated = draft else { return }
+        guard !isBusy, var updated = draft else { return }
         do {
             try mutation(&updated)
             draft = updated
@@ -1027,7 +1173,7 @@ private final class SceneConfigurationDetailModel: ObservableObject {
         actionIndex: Int,
         value: HBJSONValue
     ) async throws {
-        guard !isSaving, var updated = draft else {
+        guard !isBusy, var updated = draft else {
             throw EditorError.unavailable
         }
         try updated.setControlValue(actionIndex: actionIndex, value: value)
@@ -1066,7 +1212,7 @@ private final class SceneConfigurationDetailModel: ObservableObject {
         device: HBDeviceDescriptor,
         control: HBControlDescriptor,
         valueSource: SceneControlSetValueSource
-    ) async throws {
+    ) async throws -> Int {
         guard canMutateStructure, var updated = draft else {
             throw EditorError.unavailable
         }
@@ -1117,10 +1263,11 @@ private final class SceneConfigurationDetailModel: ObservableObject {
         actionErrors[actionIndex] = nil
         saveConfirmation = nil
         objectWillChange.send()
+        return actionIndex
     }
 
     func useCurrentValue(actionIndex: Int) async {
-        guard !isSaving,
+        guard !isBusy,
               !loadingCurrentValues.contains(actionIndex),
               case .resolved(let target) = resolutions[actionIndex] else {
             return
@@ -1151,7 +1298,7 @@ private final class SceneConfigurationDetailModel: ObservableObject {
     }
 
     func saveIfNeeded() async -> Bool {
-        guard state == .loaded, !isSaving else { return false }
+        guard state == .loaded, !isBusy else { return false }
         if let metadataValidationMessage {
             presentedAlert = SceneEditorAlert(
                 kind: .message,
@@ -1164,6 +1311,40 @@ private final class SceneConfigurationDetailModel: ObservableObject {
             return true
         }
         return await save()
+    }
+
+    func deleteScene() async -> Bool {
+        guard canDelete, let original = draft?.original else { return false }
+        isDeleting = true
+        actionErrors = [:]
+        saveConfirmation = nil
+        defer { isDeleting = false }
+
+        do {
+            _ = try await repository.delete(original)
+            return true
+        } catch let error as SceneConfigurationDeleteError {
+            if case .conflict = error {
+                presentedAlert = conflictAlert(
+                    message: error.localizedDescription
+                )
+            } else {
+                presentedAlert = SceneEditorAlert(
+                    kind: .message,
+                    title: "Scene Could Not Be Deleted",
+                    message: error.localizedDescription
+                )
+            }
+        } catch is CancellationError {
+            return false
+        } catch {
+            presentedAlert = SceneEditorAlert(
+                kind: .message,
+                title: "Scene Could Not Be Deleted",
+                message: error.localizedDescription
+            )
+        }
+        return false
     }
 
     private func save() async -> Bool {
@@ -1214,7 +1395,7 @@ private final class SceneConfigurationDetailModel: ObservableObject {
     }
 
     func restoreOriginal() async {
-        guard let recovery = pendingRecovery, !isSaving else { return }
+        guard let recovery = pendingRecovery, !isBusy else { return }
         isSaving = true
         defer { isSaving = false }
 
@@ -1387,10 +1568,10 @@ private final class SceneConfigurationDetailModel: ObservableObject {
                 message: error.localizedDescription
             )
 
-        case .fileRenameUnsupported:
+        case .renameRollbackFailed:
             presentedAlert = SceneEditorAlert(
-                kind: .message,
-                title: "Scene File Cannot Be Renamed",
+                kind: .conflict,
+                title: "Scene File Rename Needs Attention",
                 message: error.localizedDescription
             )
 

@@ -50,8 +50,8 @@ struct ScenesView: View {
         }
         .navigationTitle("Scenes")
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                if isEditingScenes {
+            if isEditingScenes {
+                ToolbarItem(placement: .primaryAction) {
                     NavigationLink {
                         SceneConfigurationDetailView(
                             newSceneIdentifier: suggestedNewSceneIdentifier,
@@ -65,6 +65,10 @@ struct ScenesView: View {
                     .transition(.scale.combined(with: .opacity))
                 }
 
+                ToolbarSpacer(.fixed, placement: .primaryAction)
+            }
+
+            ToolbarItem(placement: .primaryAction) {
                 Button {
                     withAnimation(.easeInOut(duration: 0.2)) {
                         isEditingScenes.toggle()
