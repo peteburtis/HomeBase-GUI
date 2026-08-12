@@ -50,8 +50,11 @@ struct PairingScannerView: View {
             VStack {
                 HStack {
                     Spacer()
-                    Button("Cancel") {
+                    Button {
                         dismiss()
+                    } label: {
+                        Label("Cancel", systemImage: "xmark")
+                            .labelStyle(.iconOnly)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.black.opacity(0.65))

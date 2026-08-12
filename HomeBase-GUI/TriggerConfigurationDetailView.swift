@@ -120,6 +120,7 @@ struct TriggerConfigurationDetailView: View {
                         } label: {
                             Image(systemName: "checkmark")
                         }
+                        .buttonStyle(.glassProminent)
                         .accessibilityLabel("Save and Close")
                     }
                 }
@@ -677,13 +678,23 @@ struct TriggerConditionJSONEditor: View {
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
 #endif
+        .navigationBarBackButtonHidden(true)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
-                Button("Cancel") { dismiss() }
+                Button {
+                    dismiss()
+                } label: {
+                    Label("Cancel", systemImage: "xmark")
+                        .labelStyle(.iconOnly)
+                }
             }
             ToolbarItem(placement: .primaryAction) {
-                Button(actionLabel, action: submit)
-                    .disabled(parsedValue == nil)
+                Button(action: submit) {
+                    Label(actionLabel, systemImage: "checkmark")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.glassProminent)
+                .disabled(parsedValue == nil)
             }
         }
         .onChange(of: source) {

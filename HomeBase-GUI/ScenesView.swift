@@ -52,32 +52,35 @@ struct ScenesView: View {
         .toolbar {
             if isEditingScenes {
                 ToolbarItem(placement: .primaryAction) {
-                    NavigationLink {
-                        SceneConfigurationDetailView(
-                            newSceneIdentifier: suggestedNewSceneIdentifier,
-                            client: client
-                        )
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    .disabled(model.state != .live)
-                    .accessibilityLabel("Create Scene")
-                    .transition(.scale.combined(with: .opacity))
+                    createSceneButton
+                        .transition(.scale.combined(with: .opacity))
                 }
 
                 ToolbarSpacer(.fixed, placement: .primaryAction)
-            }
 
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        isEditingScenes.toggle()
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        setEditingScenes(false)
+                    } label: {
+                        Label("Done Editing", systemImage: "checkmark")
+                            .labelStyle(.iconOnly)
                     }
-                } label: {
-                    Text(isEditingScenes ? "Done" : "Edit")
-                        .contentTransition(.opacity)
+                    .buttonStyle(.glassProminent)
+                    .disabled(model.state != .live)
+                    .transition(.scale.combined(with: .opacity))
                 }
-                .disabled(model.state != .live)
+            } else {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    createSceneButton
+
+                    Button {
+                        setEditingScenes(true)
+                    } label: {
+                        Label("Edit Scenes", systemImage: "pencil.line")
+                            .labelStyle(.iconOnly)
+                    }
+                    .disabled(model.state != .live)
+                }
             }
         }
         .connectionStatusOverlay(connectionStatus) {
@@ -99,6 +102,25 @@ struct ScenesView: View {
             Task {
                 await model.stop()
             }
+        }
+    }
+
+    private var createSceneButton: some View {
+        NavigationLink {
+            SceneConfigurationDetailView(
+                newSceneIdentifier: suggestedNewSceneIdentifier,
+                client: client
+            )
+        } label: {
+            Label("Create Scene", systemImage: "plus")
+                .labelStyle(.iconOnly)
+        }
+        .disabled(model.state != .live)
+    }
+
+    private func setEditingScenes(_ isEditing: Bool) {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            isEditingScenes = isEditing
         }
     }
 

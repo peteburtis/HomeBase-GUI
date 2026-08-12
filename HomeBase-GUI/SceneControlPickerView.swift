@@ -519,8 +519,11 @@ struct SceneControlPickerView<Repository: AutomationControlRepository>: View {
                 .navigationTitle("Add Control")
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel", systemImage: "xmark") {
+                        Button {
                             dismiss()
+                        } label: {
+                            Label("Cancel", systemImage: "xmark")
+                                .labelStyle(.iconOnly)
                         }
                         .disabled(submittingPath != nil)
                     }
@@ -1074,15 +1077,30 @@ private struct SceneControlValueCreationEditor: View {
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
 #endif
+        .navigationBarBackButtonHidden(true)
         .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button {
+                    dismiss()
+                } label: {
+                    Label("Cancel", systemImage: "xmark")
+                        .labelStyle(.iconOnly)
+                }
+                .disabled(isSubmitting)
+            }
+
             ToolbarItem(placement: .primaryAction) {
                 if isSubmitting {
                     ProgressView()
                         .accessibilityLabel("Adding control")
                 } else {
-                    Button(actionLabel) {
+                    Button {
                         submit()
+                    } label: {
+                        Label(actionLabel, systemImage: "checkmark")
+                            .labelStyle(.iconOnly)
                     }
+                    .buttonStyle(.glassProminent)
                     .disabled(selectedValue == nil)
                 }
             }
@@ -1219,15 +1237,30 @@ struct SceneRawControlValueEditor: View {
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
 #endif
+        .navigationBarBackButtonHidden(true)
         .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button {
+                    dismiss()
+                } label: {
+                    Label("Cancel", systemImage: "xmark")
+                        .labelStyle(.iconOnly)
+                }
+                .disabled(isSubmitting)
+            }
+
             ToolbarItem(placement: .primaryAction) {
                 if isSubmitting {
                     ProgressView()
                         .accessibilityLabel("Adding control")
                 } else {
-                    Button(actionLabel) {
+                    Button {
                         submit()
+                    } label: {
+                        Label(actionLabel, systemImage: "checkmark")
+                            .labelStyle(.iconOnly)
                     }
+                    .buttonStyle(.glassProminent)
                     .disabled(parsedValue == nil)
                 }
             }

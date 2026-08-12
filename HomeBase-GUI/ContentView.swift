@@ -129,8 +129,11 @@ private struct ServerSelectionView: View {
             .toolbar {
                 if serverStore.selectedServer != nil {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button("Done") {
+                        Button {
                             dismiss()
+                        } label: {
+                            Label("Close Server List", systemImage: "xmark")
+                                .labelStyle(.iconOnly)
                         }
                     }
                 }

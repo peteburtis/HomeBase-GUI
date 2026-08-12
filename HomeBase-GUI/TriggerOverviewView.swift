@@ -60,7 +60,8 @@ struct TriggerOverviewView: View {
                         client: client
                     )
                 } label: {
-                    Text("Edit")
+                    Label("Edit Trigger", systemImage: "pencil.line")
+                        .labelStyle(.iconOnly)
                 }
                 .disabled(model.state != .live)
             }

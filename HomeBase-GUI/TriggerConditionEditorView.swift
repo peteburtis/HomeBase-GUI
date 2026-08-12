@@ -92,13 +92,23 @@ struct TriggerConditionEditorView: View {
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
 #endif
+        .navigationBarBackButtonHidden(true)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
-                Button("Cancel") { dismiss() }
+                Button {
+                    dismiss()
+                } label: {
+                    Label("Cancel", systemImage: "xmark")
+                        .labelStyle(.iconOnly)
+                }
             }
             ToolbarItem(placement: .primaryAction) {
-                Button(actionLabel, action: submit)
-                    .disabled(validationMessage != nil)
+                Button(action: submit) {
+                    Label(actionLabel, systemImage: "checkmark")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.glassProminent)
+                .disabled(validationMessage != nil)
             }
         }
         .onChange(of: rawValue) {
@@ -571,7 +581,12 @@ private struct TriggerConditionControlPicker: View {
 #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
+                    Button {
+                        dismiss()
+                    } label: {
+                        Label("Cancel", systemImage: "xmark")
+                            .labelStyle(.iconOnly)
+                    }
                 }
             }
         }

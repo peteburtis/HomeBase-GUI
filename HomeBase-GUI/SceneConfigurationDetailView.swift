@@ -127,6 +127,7 @@ struct SceneConfigurationDetailView: View {
                         } label: {
                             Image(systemName: "checkmark")
                         }
+                        .buttonStyle(.glassProminent)
                         .accessibilityLabel("Save and Close")
                     }
                 }

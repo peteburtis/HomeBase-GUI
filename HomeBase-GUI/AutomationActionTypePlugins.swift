@@ -843,18 +843,28 @@ private struct AutomationWaitActionEditor: View {
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
 #endif
+        .navigationBarBackButtonHidden(true)
         .interactiveDismissDisabled(isSubmitting)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
-                Button("Cancel") { dismiss() }
-                    .disabled(isSubmitting)
+                Button {
+                    dismiss()
+                } label: {
+                    Label("Cancel", systemImage: "xmark")
+                        .labelStyle(.iconOnly)
+                }
+                .disabled(isSubmitting)
             }
             ToolbarItem(placement: .primaryAction) {
                 if isSubmitting {
                     ProgressView().accessibilityLabel("Saving wait")
                 } else {
-                    Button(actionLabel, action: submit)
-                        .disabled(parsedDuration == nil)
+                    Button(action: submit) {
+                        Label(actionLabel, systemImage: "checkmark")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonStyle(.glassProminent)
+                    .disabled(parsedDuration == nil)
                 }
             }
         }
@@ -1036,18 +1046,28 @@ private struct AutomationSceneInvocationActionEditor: View {
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
 #endif
+        .navigationBarBackButtonHidden(true)
         .interactiveDismissDisabled(isSubmitting)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
-                Button("Cancel") { dismiss() }
-                    .disabled(isSubmitting)
+                Button {
+                    dismiss()
+                } label: {
+                    Label("Cancel", systemImage: "xmark")
+                        .labelStyle(.iconOnly)
+                }
+                .disabled(isSubmitting)
             }
             ToolbarItem(placement: .primaryAction) {
                 if isSubmitting {
                     ProgressView().accessibilityLabel("Saving scene action")
                 } else {
-                    Button(actionLabel, action: submit)
-                        .disabled(actionValue == nil)
+                    Button(action: submit) {
+                        Label(actionLabel, systemImage: "checkmark")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonStyle(.glassProminent)
+                    .disabled(actionValue == nil)
                 }
             }
         }
@@ -1265,18 +1285,28 @@ private struct AutomationActionJSONEditor: View {
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
 #endif
+        .navigationBarBackButtonHidden(true)
         .interactiveDismissDisabled(isSubmitting)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
-                Button("Cancel") { dismiss() }
-                    .disabled(isSubmitting)
+                Button {
+                    dismiss()
+                } label: {
+                    Label("Cancel", systemImage: "xmark")
+                        .labelStyle(.iconOnly)
+                }
+                .disabled(isSubmitting)
             }
             ToolbarItem(placement: .primaryAction) {
                 if isSubmitting {
                     ProgressView().accessibilityLabel("Saving action")
                 } else {
-                    Button(actionLabel, action: submit)
-                        .disabled(parsedValue == nil)
+                    Button(action: submit) {
+                        Label(actionLabel, systemImage: "checkmark")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonStyle(.glassProminent)
+                    .disabled(parsedValue == nil)
                 }
             }
         }
