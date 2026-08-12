@@ -10,7 +10,9 @@ import SwiftUI
 extension ControlValueTypeRegistry {
     static let standard = ControlValueTypeRegistry(
         plugins: [
-            AnyControlValueTypePlugin(ColorControlValuePlugin()),
+            AnyControlValueTypePlugin(
+                standaloneEditing: ColorControlValuePlugin()
+            ),
             AnyControlValueTypePlugin(BinarySwitchControlValuePlugin()),
             AnyControlValueTypePlugin(UnitIntervalControlValuePlugin()),
         ],
@@ -183,7 +185,7 @@ private struct UnitIntervalControlValueBody: View {
     }
 }
 
-private struct ColorControlValuePlugin: ControlValueTypePlugin {
+private struct ColorControlValuePlugin: ControlValueStandaloneEditingPlugin {
     let identifier = "color-v1"
 
     func matchScore(for schema: ControlValueSchema) -> Int? {
@@ -212,6 +214,21 @@ private struct ColorControlValuePlugin: ControlValueTypePlugin {
         ColorControlValueBody(context: context)
     }
 
+    func supportsStandaloneEditing(
+        context: ControlValuePresentationContext
+    ) -> Bool {
+        context.schema.isWritable
+            && HomeBaseColorPickerCapabilities(
+                controlKind: context.schema.kind
+            ) != nil
+    }
+
+    func makeStandaloneEditor(
+        context: ControlValuePresentationContext
+    ) -> some View {
+        ColorControlValueStandaloneEditor(context: context)
+    }
+
     fileprivate func readoutPresentation(
         for snapshot: ControlValueSnapshot
     ) -> HomeBaseColorReadoutPresentation? {
@@ -237,21 +254,13 @@ private struct ColorControlValuePlugin: ControlValueTypePlugin {
 }
 
 private struct ColorControlValueBody: View {
-    private enum UpdateError: LocalizedError {
-        case unsupportedValue
-
-        var errorDescription: String? {
-            "This color value is not supported by the control."
-        }
-    }
-
     let context: ControlValuePresentationContext
 
     @State private var isShowingColorPicker = false
 
     var body: some View {
         if let presentation = readoutPresentation,
-           let capabilities,
+           capabilities != nil,
            context.schema.isWritable {
             Button {
                 isShowingColorPicker = true
@@ -265,18 +274,7 @@ private struct ColorControlValueBody: View {
             )
             .accessibilityHint("Opens the color picker")
             .navigationDestination(isPresented: $isShowingColorPicker) {
-                HomeBaseColorPickerView(
-                    capabilities: capabilities,
-                    initialValue: context.snapshot.aggregateState == .mixed
-                        ? nil
-                        : context.snapshot.value,
-                    aggregateState: context.snapshot.aggregateState,
-                    aggregateValues: context.snapshot.aggregateValues,
-                    aggregateValueCount:
-                        context.snapshot.aggregateValueCount,
-                    liveValues: context.interaction.observations,
-                    setValue: submit
-                )
+                ColorControlValueStandaloneEditor(context: context)
                 .navigationTitle(context.accessibilityLabel)
 #if os(iOS)
                 .navigationBarTitleDisplayMode(.inline)
@@ -307,6 +305,43 @@ private struct ColorControlValueBody: View {
             accessibilityValue: context.snapshot.displayText,
             isStale: context.snapshot.isStale
         )
+    }
+}
+
+private struct ColorControlValueStandaloneEditor: View {
+    private enum UpdateError: LocalizedError {
+        case unsupportedValue
+
+        var errorDescription: String? {
+            "This color value is not supported by the control."
+        }
+    }
+
+    let context: ControlValuePresentationContext
+
+    var body: some View {
+        if let capabilities {
+            HomeBaseColorPickerView(
+                capabilities: capabilities,
+                initialValue: context.snapshot.aggregateState == .mixed
+                    ? nil
+                    : context.snapshot.value,
+                aggregateState: context.snapshot.aggregateState,
+                aggregateValues: context.snapshot.aggregateValues,
+                aggregateValueCount: context.snapshot.aggregateValueCount,
+                liveValues: context.interaction.observations,
+                setValue: submit
+            )
+        } else {
+            ContentUnavailableView(
+                "Color Editor Unavailable",
+                systemImage: "paintpalette"
+            )
+        }
+    }
+
+    private var capabilities: HomeBaseColorPickerCapabilities? {
+        HomeBaseColorPickerCapabilities(controlKind: context.schema.kind)
     }
 
     private func submit(_ value: HBJSONValue) async throws {

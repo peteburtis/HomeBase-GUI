@@ -121,6 +121,45 @@ final class ControlValueTypeRegistryTests: XCTestCase {
         XCTAssertFalse(selectedPlugin.presentsStaleness(for: invalid))
     }
 
+    func testColorPluginOffersStandaloneEditingForMixedAggregates() {
+        let context = ControlValuePresentationContext(
+            schema: ControlValueSchema(
+                kind: "color-v1:RGB+White+XY",
+                metadata: [
+                    "readable": true,
+                    "writable": true,
+                    "structured": true,
+                ]
+            ),
+            snapshot: ControlValueSnapshot(
+                value: .null,
+                displayText: "Mixed",
+                aggregateState: .mixed,
+                aggregateValues: [
+                    ["RGB": [1, 0, 0]],
+                    ["White": 2_700],
+                ],
+                aggregateValueCount: 2
+            ),
+            interaction: ControlValueInteraction(
+                isEnabled: true,
+                isUpdating: false,
+                commit: { _, _ in },
+                observations: {
+                    AsyncThrowingStream { continuation in
+                        continuation.finish()
+                    }
+                }
+            ),
+            accessibilityLabel: "Color",
+            controlPath: "ColoredLights:Color"
+        )
+        let plugin = resolve("color-v1:RGB+White+XY").plugin
+
+        XCTAssertTrue(plugin.supportsStandaloneEditing(context: context))
+        XCTAssertNotNil(plugin.makeStandaloneEditor(context: context))
+    }
+
     func testStandardPluginsOnlyOfferEditorsForCompatibleStaticValues() {
         let binary = editableContext(
             kind: "BinarySwitch",

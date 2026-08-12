@@ -19,6 +19,16 @@ enum SceneControlSetValueSource: Equatable, Sendable {
     case explicit(HBJSONValue)
 }
 
+enum SceneControlPickerValueEntryMode: Equatable, Sendable {
+    /// The published value is unambiguous and can be copied immediately.
+    case currentPresentation
+    /// The type module can ask the user for a value without a usable current
+    /// presentation, as with a mixed aggregate color.
+    case dedicatedEditor
+    /// No registered type module can edit this schema yet.
+    case rawJSON
+}
+
 struct SceneRawControlValueValidator {
     enum ValidationError: LocalizedError, Equatable {
         case empty
@@ -113,11 +123,7 @@ struct SceneResolvedControl: Equatable, Sendable {
     }
 
     var schema: ControlValueSchema {
-        ControlValueSchema(
-            kind: descriptor.kind,
-            metadata: descriptor.metadata,
-            tags: descriptor.tags
-        )
+        descriptor.controlValueSchema
     }
 
     func presentationContext(
@@ -128,9 +134,64 @@ struct SceneResolvedControl: Equatable, Sendable {
             ControlValueCommitOrigin
         ) async throws -> Void
     ) -> ControlValuePresentationContext {
+        presentationContext(
+            snapshot: draftSnapshot(value: value),
+            isEnabled: isEnabled,
+            commit: commit
+        )
+    }
+
+    func listedPresentationContext(
+        isEnabled: Bool,
+        commit: @escaping (
+            HBJSONValue,
+            ControlValueCommitOrigin
+        ) async throws -> Void
+    ) -> ControlValuePresentationContext {
+        presentationContext(
+            snapshot: descriptor.listedControlValueSnapshot,
+            isEnabled: isEnabled,
+            commit: commit
+        )
+    }
+
+    @MainActor
+    var valueEntryMode: SceneControlPickerValueEntryMode {
+        let context = listedPresentationContext(
+            isEnabled: false,
+            commit: { _, _ in }
+        )
+        let plugin = ControlValueTypeRegistry.standard
+            .resolve(schema)
+            .plugin
+        let snapshot = context.snapshot
+        let hasUnambiguousCurrentValue = !snapshot.isStale
+            && snapshot.aggregateState != .mixed
+            && snapshot.aggregateState != .unavailable
+            && snapshot.value != nil
+            && snapshot.value != .null
+
+        if hasUnambiguousCurrentValue,
+           plugin.supportsEditing(context: context) {
+            return .currentPresentation
+        }
+        if plugin.supportsStandaloneEditing(context: context) {
+            return .dedicatedEditor
+        }
+        return .rawJSON
+    }
+
+    private func presentationContext(
+        snapshot: ControlValueSnapshot,
+        isEnabled: Bool,
+        commit: @escaping (
+            HBJSONValue,
+            ControlValueCommitOrigin
+        ) async throws -> Void
+    ) -> ControlValuePresentationContext {
         ControlValuePresentationContext(
             schema: schema,
-            snapshot: snapshot(value: value),
+            snapshot: snapshot,
             interaction: ControlValueInteraction(
                 isEnabled: isEnabled,
                 isUpdating: false,
@@ -158,7 +219,7 @@ struct SceneResolvedControl: Equatable, Sendable {
             .supportsEditing(context: context)
     }
 
-    private func snapshot(value: HBJSONValue) -> ControlValueSnapshot {
+    private func draftSnapshot(value: HBJSONValue) -> ControlValueSnapshot {
         let suffix = descriptor.metadata["unitSuffix"]?.stringValue ?? ""
         return ControlValueSnapshot(
             value: value,
@@ -206,11 +267,10 @@ struct SceneControlPickerCatalog {
             }.sorted(by: Self.controlSort)
 
             let supportedControls = writableControls.filter { descriptor in
-                guard let value = descriptor.value else { return false }
-                return SceneResolvedControl(
+                SceneResolvedControl(
                     device: device,
                     descriptor: descriptor
-                ).supportsEditing(value: value)
+                ).valueEntryMode != .rawJSON
             }
             let supportedIdentifiers = Set(
                 supportedControls.map(\.identifier)
@@ -835,17 +895,7 @@ private struct SceneControlPickerControlSections: View {
             } else {
                 Section {
                     ForEach(supportedControls, id: \.identifier) { control in
-                        Button {
-                            choose(
-                                deviceAddressableName,
-                                control,
-                                .currentPresentation
-                            )
-                        } label: {
-                            controlLabel(control, showsSchema: false)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(submittingPath != nil)
+                        supportedControlRow(control)
                     }
                 } header: {
                     Text("Controls")
@@ -909,6 +959,66 @@ private struct SceneControlPickerControlSections: View {
         "\(deviceAddressableName):\(control.identifier)"
     }
 
+    @ViewBuilder
+    private func supportedControlRow(
+        _ control: HBControlDescriptor
+    ) -> some View {
+        let target = SceneResolvedControl(
+            path: controlPath(control),
+            descriptor: control
+        )
+
+        switch target.valueEntryMode {
+        case .currentPresentation:
+            Button {
+                choose(
+                    deviceAddressableName,
+                    control,
+                    .currentPresentation
+                )
+            } label: {
+                controlLabel(control, showsSchema: false)
+            }
+            .buttonStyle(.plain)
+            .disabled(submittingPath != nil)
+
+        case .dedicatedEditor:
+            NavigationLink {
+                SceneControlValueCreationEditor(
+                    target: target,
+                    actionLabel: "Add"
+                ) { value in
+                    try await chooseRawValue(
+                        deviceAddressableName,
+                        control,
+                        value
+                    )
+                }
+            } label: {
+                controlLabel(control, showsSchema: false)
+            }
+            .disabled(submittingPath != nil)
+
+        case .rawJSON:
+            NavigationLink {
+                SceneRawControlValueEditor(
+                    control: control,
+                    initialValue: control.value,
+                    actionLabel: "Add"
+                ) { value in
+                    try await chooseRawValue(
+                        deviceAddressableName,
+                        control,
+                        value
+                    )
+                }
+            } label: {
+                controlLabel(control, showsSchema: true)
+            }
+            .disabled(submittingPath != nil)
+        }
+    }
+
     private func controlLabel(
         _ control: HBControlDescriptor,
         showsSchema: Bool
@@ -934,6 +1044,107 @@ private struct SceneControlPickerControlSections: View {
             }
         }
         .contentShape(Rectangle())
+    }
+}
+
+@MainActor
+private struct SceneControlValueCreationEditor: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let target: SceneResolvedControl
+    let actionLabel: String
+    let onCommit: @MainActor @Sendable (HBJSONValue) async throws -> Void
+
+    @State private var selectedValue: HBJSONValue?
+    @State private var isSubmitting = false
+    @State private var submissionError: String?
+
+    var body: some View {
+        Group {
+            if let editor = plugin.makeStandaloneEditor(context: context) {
+                editor
+            } else {
+                ContentUnavailableView(
+                    "Editor Unavailable",
+                    systemImage: "slider.horizontal.3"
+                )
+            }
+        }
+        .navigationTitle(target.descriptor.name)
+#if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+#endif
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                if isSubmitting {
+                    ProgressView()
+                        .accessibilityLabel("Adding control")
+                } else {
+                    Button(actionLabel) {
+                        submit()
+                    }
+                    .disabled(selectedValue == nil)
+                }
+            }
+        }
+        .alert(
+            "Control Could Not Be Added",
+            isPresented: Binding(
+                get: { submissionError != nil },
+                set: { isPresented in
+                    if !isPresented { submissionError = nil }
+                }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(submissionError ?? "")
+        }
+    }
+
+    private var plugin: AnyControlValueTypePlugin {
+        ControlValueTypeRegistry.standard.resolve(target.schema).plugin
+    }
+
+    private var context: ControlValuePresentationContext {
+        if let selectedValue {
+            return target.presentationContext(
+                value: selectedValue,
+                isEnabled: !isSubmitting,
+                commit: select
+            )
+        }
+        return target.listedPresentationContext(
+            isEnabled: !isSubmitting,
+            commit: select
+        )
+    }
+
+    private func select(
+        _ value: HBJSONValue,
+        _ origin: ControlValueCommitOrigin
+    ) async throws {
+        guard !isSubmitting else { throw CancellationError() }
+        selectedValue = value
+        submissionError = nil
+    }
+
+    private func submit() {
+        guard !isSubmitting, let selectedValue else { return }
+        isSubmitting = true
+        submissionError = nil
+
+        Task { @MainActor in
+            defer { isSubmitting = false }
+            do {
+                try await onCommit(selectedValue)
+                dismiss()
+            } catch is CancellationError {
+                return
+            } catch {
+                submissionError = error.localizedDescription
+            }
+        }
     }
 }
 

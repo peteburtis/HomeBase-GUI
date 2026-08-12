@@ -174,6 +174,66 @@ final class SceneControlPickerCatalogTests: XCTestCase {
         )
     }
 
+    func testMixedAggregateColorUsesDedicatedEditorInsteadOfRawJSON() throws {
+        let color = HBControlDescriptor(
+            identifier: "Color",
+            name: "Color",
+            kind: "color-v1:RGB+White+XY",
+            value: .null,
+            projection: .presentation,
+            metadata: [
+                "readable": true,
+                "writable": true,
+                "structured": true,
+                "aggregateState": "mixed",
+                "aggregateValues": [
+                    ["RGB": [1, 0, 0]],
+                    ["White": 2_700],
+                ],
+                "aggregateValueCount": 2,
+            ]
+        )
+        let groupDevice = HBDeviceDescriptor(
+            identifier: "MainRoomColoredLights",
+            addressableName: "MainRoomColoredLights",
+            displayName: "Main Room Colored Lights",
+            moduleName: "Test",
+            controls: [color]
+        )
+        let catalog = SceneControlPickerCatalog(
+            source: SceneConfigurationDeviceCatalog(
+                topology: HBTopologyListResult(
+                    devices: [],
+                    rooms: [],
+                    groups: []
+                ),
+                devices: [groupDevice]
+            ),
+            excludedControlPaths: []
+        )
+
+        let device = try XCTUnwrap(catalog.devices.first)
+        XCTAssertEqual(device.supportedControls.map(\.identifier), ["Color"])
+        XCTAssertTrue(device.otherWritableControls.isEmpty)
+
+        let target = SceneResolvedControl(
+            device: groupDevice,
+            descriptor: color
+        )
+        XCTAssertEqual(target.valueEntryMode, .dedicatedEditor)
+        XCTAssertEqual(
+            target.descriptor.listedControlValueSnapshot.aggregateState,
+            .mixed
+        )
+        XCTAssertEqual(
+            target.descriptor.listedControlValueSnapshot.aggregateValues,
+            [
+                ["RGB": [1, 0, 0]],
+                ["White": 2_700],
+            ]
+        )
+    }
+
     private func device(
         identifier: String,
         addressableName: String,

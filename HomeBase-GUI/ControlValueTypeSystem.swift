@@ -3,6 +3,7 @@
 //  HomeBase-GUI
 //
 
+import Foundation
 import HomeBaseProtocol
 import SwiftUI
 
@@ -130,6 +131,81 @@ struct ControlValuePresentationContext {
     let controlPath: String
 }
 
+extension HBControlDescriptor {
+    var controlValueSchema: ControlValueSchema {
+        ControlValueSchema(
+            kind: kind,
+            metadata: metadata,
+            tags: tags
+        )
+    }
+
+    /// The value snapshot published by `device.list`. Aggregate controls put
+    /// their constituent state in descriptor metadata because a mixed value
+    /// deliberately has no single JSON representation.
+    var listedControlValueSnapshot: ControlValueSnapshot {
+        let displayText = metadata["displayValue"]?.stringValue
+            ?? value?.presentationText
+            ?? "—"
+        return ControlValueSnapshot(
+            value: value,
+            displayText: displayText,
+            aggregateState: aggregateState,
+            aggregateValues: aggregateValues,
+            aggregateValueCount: aggregateValueCount,
+            isStale: metadata["valid"]?.boolValue == false
+        )
+    }
+
+    var aggregateState: HBControlAggregateState? {
+        guard let value = metadata["aggregateState"]?.stringValue else {
+            return nil
+        }
+        return HBControlAggregateState(rawValue: value)
+    }
+
+    var aggregateValues: [HBJSONValue]? {
+        metadata["aggregateValues"]?.arrayValue
+    }
+
+    var aggregateValueCount: Int? {
+        guard let value = metadata["aggregateValueCount"]?.integerValue else {
+            return nil
+        }
+        return Int(exactly: value)
+    }
+}
+
+extension HBJSONValue {
+    var presentationText: String {
+        switch self {
+        case .null:
+            "null"
+        case .bool(let value):
+            value ? "True" : "False"
+        case .integer(let value):
+            String(value)
+        case .number(let value):
+            value.formatted(
+                .number.precision(.fractionLength(0 ... 6))
+            )
+        case .string(let value):
+            value
+        case .array, .object:
+            compactJSONString
+        }
+    }
+
+    private var compactJSONString: String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(self) else {
+            return "—"
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
 /// Relative scores make plugin selection independent of registration order.
 /// A plugin may use an intermediate score when it has a meaningful subtype
 /// relationship, but exact schemas should always outrank schema families and
@@ -155,6 +231,23 @@ protocol ControlValueTypePlugin {
     func makeBody(context: ControlValuePresentationContext) -> Body
 }
 
+/// Optional full-screen editing supplied by the same module that owns compact
+/// control presentation. This is used when a configuration editor must ask
+/// for a value rather than copy an unambiguous current value.
+@MainActor
+protocol ControlValueStandaloneEditingPlugin: ControlValueTypePlugin {
+    associatedtype StandaloneEditor: View
+
+    func supportsStandaloneEditing(
+        context: ControlValuePresentationContext
+    ) -> Bool
+
+    @ViewBuilder
+    func makeStandaloneEditor(
+        context: ControlValuePresentationContext
+    ) -> StandaloneEditor
+}
+
 extension ControlValueTypePlugin {
     func supportsEditing(
         context: ControlValuePresentationContext
@@ -175,6 +268,10 @@ struct AnyControlValueTypePlugin: Identifiable {
     private let presentsStalenessImplementation: (ControlValueSnapshot) -> Bool
     private let makeBodyImplementation:
         (ControlValuePresentationContext) -> AnyView
+    private let supportsStandaloneEditingImplementation:
+        (ControlValuePresentationContext) -> Bool
+    private let makeStandaloneEditorImplementation:
+        ((ControlValuePresentationContext) -> AnyView)?
 
     init<Plugin: ControlValueTypePlugin>(_ plugin: Plugin) {
         identifier = plugin.identifier
@@ -183,6 +280,25 @@ struct AnyControlValueTypePlugin: Identifiable {
         presentsStalenessImplementation = plugin.presentsStaleness
         makeBodyImplementation = { context in
             AnyView(plugin.makeBody(context: context))
+        }
+        supportsStandaloneEditingImplementation = { _ in false }
+        makeStandaloneEditorImplementation = nil
+    }
+
+    init<Plugin: ControlValueStandaloneEditingPlugin>(
+        standaloneEditing plugin: Plugin
+    ) {
+        identifier = plugin.identifier
+        matchScoreImplementation = plugin.matchScore
+        supportsEditingImplementation = plugin.supportsEditing
+        presentsStalenessImplementation = plugin.presentsStaleness
+        makeBodyImplementation = { context in
+            AnyView(plugin.makeBody(context: context))
+        }
+        supportsStandaloneEditingImplementation =
+            plugin.supportsStandaloneEditing
+        makeStandaloneEditorImplementation = { context in
+            AnyView(plugin.makeStandaloneEditor(context: context))
         }
     }
 
@@ -204,6 +320,20 @@ struct AnyControlValueTypePlugin: Identifiable {
 
     func makeBody(context: ControlValuePresentationContext) -> AnyView {
         makeBodyImplementation(context)
+    }
+
+    func supportsStandaloneEditing(
+        context: ControlValuePresentationContext
+    ) -> Bool {
+        makeStandaloneEditorImplementation != nil
+            && supportsStandaloneEditingImplementation(context)
+    }
+
+    func makeStandaloneEditor(
+        context: ControlValuePresentationContext
+    ) -> AnyView? {
+        guard supportsStandaloneEditing(context: context) else { return nil }
+        return makeStandaloneEditorImplementation?(context)
     }
 }
 
