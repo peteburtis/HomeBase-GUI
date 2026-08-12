@@ -94,11 +94,16 @@ struct SceneControlSetConfiguration: Equatable, Sendable {
     let actionIndex: Int
     let device: String
     let control: String
-    let value: HBJSONValue
+    let command: ControlCommandJSONLens
     let trailingValues: [HBJSONValue]
 
     var controlPath: String {
         "\(device):\(control)"
+    }
+
+    /// The command's primary value, suitable for a control's typed editor.
+    var value: HBJSONValue {
+        command.primaryValue
     }
 
     init?(action: SceneActionConfiguration) {
@@ -106,13 +111,14 @@ struct SceneControlSetConfiguration: Equatable, Sendable {
               let values = action.payload?.arrayValue,
               values.count >= 3,
               let device = values[0].stringValue,
-              let control = values[1].stringValue else {
+              let control = values[1].stringValue,
+              let command = ControlCommandJSONLens(values[2]) else {
             return nil
         }
         actionIndex = action.index
         self.device = device
         self.control = control
-        value = values[2]
+        self.command = command
         trailingValues = Array(values.dropFirst(3))
     }
 }
@@ -135,6 +141,7 @@ struct SceneConfigurationDraft: Equatable, Sendable {
         case invalidSceneLocation
         case actionsAreNotAnArray
         case missingAction(Int)
+        case invalidAction(Int)
         case actionIsNotControlSet(Int)
         case invalidControlTarget
         case invalidTiming
@@ -147,6 +154,8 @@ struct SceneConfigurationDraft: Equatable, Sendable {
                 "The scene's Actions field is not an array."
             case .missingAction(let index):
                 "The scene has no action at index \(index)."
+            case .invalidAction(let index):
+                "Action \(index + 1) must be an object with exactly one nonempty key."
             case .actionIsNotControlSet(let index):
                 "Action \(index + 1) is not an editable ControlSet action."
             case .invalidControlTarget:
@@ -294,21 +303,81 @@ struct SceneConfigurationDraft: Equatable, Sendable {
         guard var action = actions[actionIndex].objectValue,
               action.count == 1,
               var controlSet = action["ControlSet"]?.arrayValue,
-              controlSet.count >= 3 else {
+              controlSet.count >= 3,
+              let command = ControlCommandJSONLens(controlSet[2]) else {
             throw MutationError.actionIsNotControlSet(actionIndex)
         }
 
-        guard controlSet[2] != value else { return }
-        controlSet[2] = value
+        let patchedCommand = command.replacingPrimaryValue(with: value)
+        guard controlSet[2] != patchedCommand else { return }
+        controlSet[2] = patchedCommand
         action["ControlSet"] = .array(controlSet)
         actions[actionIndex] = .object(action)
         fields["Actions"] = .array(actions)
         try replaceSceneFields(fields)
     }
 
-    mutating func removeControlSet(actionIndex: Int) throws {
+    mutating func setAction(
+        at index: Int,
+        rawValue: HBJSONValue
+    ) throws {
+        try Self.validateAction(rawValue, at: index)
         var fields = try requiredSceneFields()
         guard var actions = fields["Actions"]?.arrayValue else {
+            if fields["Actions"] == nil {
+                throw MutationError.missingAction(index)
+            }
+            throw MutationError.actionsAreNotAnArray
+        }
+        guard actions.indices.contains(index) else {
+            throw MutationError.missingAction(index)
+        }
+        guard actions[index] != rawValue else { return }
+        actions[index] = rawValue
+        fields["Actions"] = .array(actions)
+        try replaceSceneFields(fields)
+    }
+
+    mutating func removeAction(at index: Int) throws {
+        var fields = try requiredSceneFields()
+        guard var actions = fields["Actions"]?.arrayValue else {
+            if fields["Actions"] == nil {
+                throw MutationError.missingAction(index)
+            }
+            throw MutationError.actionsAreNotAnArray
+        }
+        guard actions.indices.contains(index) else {
+            throw MutationError.missingAction(index)
+        }
+        actions.remove(at: index)
+        fields["Actions"] = .array(actions)
+        try replaceSceneFields(fields)
+    }
+
+    @discardableResult
+    mutating func appendAction(_ rawValue: HBJSONValue) throws -> Int {
+        var fields = try requiredSceneFields()
+        var actions: [HBJSONValue]
+        if let actionsValue = fields["Actions"] {
+            guard let existingActions = actionsValue.arrayValue else {
+                throw MutationError.actionsAreNotAnArray
+            }
+            actions = existingActions
+        } else {
+            actions = []
+        }
+
+        let index = actions.count
+        try Self.validateAction(rawValue, at: index)
+        actions.append(rawValue)
+        fields["Actions"] = .array(actions)
+        try replaceSceneFields(fields)
+        return index
+    }
+
+    mutating func removeControlSet(actionIndex: Int) throws {
+        let fields = try requiredSceneFields()
+        guard let actions = fields["Actions"]?.arrayValue else {
             if fields["Actions"] == nil {
                 throw MutationError.missingAction(actionIndex)
             }
@@ -324,9 +393,7 @@ struct SceneConfigurationDraft: Equatable, Sendable {
             throw MutationError.actionIsNotControlSet(actionIndex)
         }
 
-        actions.remove(at: actionIndex)
-        fields["Actions"] = .array(actions)
-        try replaceSceneFields(fields)
+        try removeAction(at: actionIndex)
     }
 
     @discardableResult
@@ -339,19 +406,7 @@ struct SceneConfigurationDraft: Equatable, Sendable {
             throw MutationError.invalidControlTarget
         }
 
-        var fields = try requiredSceneFields()
-        var actions: [HBJSONValue]
-        if let actionsValue = fields["Actions"] {
-            guard let existingActions = actionsValue.arrayValue else {
-                throw MutationError.actionsAreNotAnArray
-            }
-            actions = existingActions
-        } else {
-            actions = []
-        }
-
-        let actionIndex = actions.count
-        actions.append(
+        return try appendAction(
             .object([
                 "ControlSet": .array([
                     .string(device),
@@ -360,9 +415,6 @@ struct SceneConfigurationDraft: Equatable, Sendable {
                 ])
             ])
         )
-        fields["Actions"] = .array(actions)
-        try replaceSceneFields(fields)
-        return actionIndex
     }
 
     func renderedSource() throws -> String {
@@ -415,6 +467,18 @@ struct SceneConfigurationDraft: Equatable, Sendable {
             guard fields.removeValue(forKey: key) != nil else { return }
         }
         try replaceSceneFields(fields)
+    }
+
+    private static func validateAction(
+        _ rawValue: HBJSONValue,
+        at index: Int
+    ) throws {
+        guard let object = rawValue.objectValue,
+              object.count == 1,
+              let key = object.keys.first,
+              !key.isEmpty else {
+            throw MutationError.invalidAction(index)
+        }
     }
 }
 

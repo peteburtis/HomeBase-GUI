@@ -82,7 +82,9 @@ struct TriggerOverviewView: View {
             Section {
                 TriggerOverviewTextRow(
                     label: "Type",
-                    value: state.trigger.kind == .when ? "When" : "While"
+                    value: TriggerKindUICatalog.registration(
+                        for: state.trigger.kind
+                    ).displayName
                 )
                 TriggerOverviewTextRow(
                     label: "State",
@@ -90,15 +92,20 @@ struct TriggerOverviewView: View {
                         state.trigger.state
                     )
                 )
-                if let lastFiredAt = state.trigger.lastFiredAt {
-                    LabeledContent("Last fired") {
-                        Text(lastFiredAt, style: .relative)
-                    }
-                } else {
+                switch TriggerOverviewPresentation.lastFired(
+                    for: state.trigger
+                ) {
+                case .omitted:
+                    EmptyView()
+                case .never:
                     TriggerOverviewTextRow(
                         label: "Last fired",
                         value: "Never"
                     )
+                case .date(let lastFiredAt):
+                    LabeledContent("Last fired") {
+                        Text(lastFiredAt, style: .relative)
+                    }
                 }
                 if !state.trigger.schedulerRunning {
                     Label("Trigger scheduler is paused", systemImage: "pause.circle")
@@ -253,13 +260,20 @@ private struct TriggerConditionOverviewRow: View {
 private struct TriggerActionOverviewRow: View {
     let action: SceneActionConfiguration
 
+    private var presentation: AutomationActionPluginPresentation {
+        AutomationActionTypeRegistry.standard.resolve(action).plugin
+            .presentation(for: action)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(TriggerOverviewPresentation.humanized(action.type ?? "Action"))
-            Text(TriggerOverviewPresentation.actionSummary(action))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(4)
+            Text(presentation.title)
+            if let detail = presentation.detail {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4)
+            }
         }
     }
 }
@@ -271,11 +285,15 @@ struct TriggerOverviewCondition: Identifiable, Equatable {
     var id: String { descriptor.path }
 
     var title: String {
-        TriggerOverviewPresentation.humanized(descriptor.type)
+        TriggerConditionTypeRegistry.standard
+            .presentation(for: descriptor)
+            .title
     }
 
     var detail: String? {
-        TriggerOverviewPresentation.conditionSummary(descriptor)
+        TriggerConditionTypeRegistry.standard
+            .presentation(for: descriptor)
+            .detail
     }
 
     var systemImage: String {
@@ -315,6 +333,20 @@ struct TriggerOverviewCondition: Identifiable, Equatable {
 }
 
 enum TriggerOverviewPresentation {
+    enum LastFired: Equatable {
+        case omitted
+        case never
+        case date(Date)
+    }
+
+    static func lastFired(
+        for trigger: HBTriggerSummaryDescriptor
+    ) -> LastFired {
+        guard TriggerKindUICatalog.registration(for: trigger.kind)
+            .showsLastFired else { return .omitted }
+        return trigger.lastFiredAt.map(LastFired.date) ?? .never
+    }
+
     static func flatten(
         _ conditions: [HBTriggerConditionDescriptor]
     ) -> [TriggerOverviewCondition] {
@@ -332,25 +364,6 @@ enum TriggerOverviewPresentation {
         return result
     }
 
-    static func humanized(_ identifier: String) -> String {
-        guard !identifier.isEmpty else { return identifier }
-        var result = ""
-        for character in identifier {
-            if character == "_" || character == "-" {
-                if result.last != " " { result.append(" ") }
-                continue
-            }
-            if character.isUppercase,
-               let last = result.last,
-               last != " ",
-               !last.isUppercase {
-                result.append(" ")
-            }
-            result.append(character)
-        }
-        return result
-    }
-
     static func stateLabel(_ state: HBTriggerActivityState) -> String {
         switch state {
         case .inactive: "Inactive"
@@ -362,86 +375,9 @@ enum TriggerOverviewPresentation {
     static func conditionSummary(
         _ condition: HBTriggerConditionDescriptor
     ) -> String? {
-        if ["And", "Or", "Xor"].contains(condition.type) {
-            let count = condition.children.count
-            return "\(count) nested condition\(count == 1 ? "" : "s")"
-        }
-        if condition.type == "TrueWhenInvalid" {
-            return "Treats an invalid nested condition as true"
-        }
-        if condition.type == "Compare",
-           let values = condition.configuration.arrayValue,
-           values.count == 3 {
-            return values.map { renderOperand($0) }.joined(separator: " ")
-        }
-        if let comparison = legacyControlComparison(condition) {
-            return comparison
-        }
-        guard condition.configuration != .null else { return nil }
-        return truncated(condition.configuration.compactConfigurationJSON)
-    }
-
-    static func actionSummary(_ action: SceneActionConfiguration) -> String {
-        if let controlSet = action.controlSet {
-            return "\(controlSet.device).\(controlSet.control) = "
-                + controlSet.value.compactConfigurationJSON
-        }
-        if let payload = action.payload {
-            return truncated(payload.compactConfigurationJSON)
-        }
-        return truncated(action.rawValue.compactConfigurationJSON)
-    }
-
-    private static func legacyControlComparison(
-        _ condition: HBTriggerConditionDescriptor
-    ) -> String? {
-        let operators = [
-            "ControlValueGreaterThan": ">",
-            "ControlValueGreaterThanOrEqual": "≥",
-            "ControlValueLessThan": "<",
-            "ControlValueLessThanOrEqual": "≤",
-            "ControlValueEqual": "=",
-            "ControlValueNotEqual": "≠",
-        ]
-        guard let operation = operators[condition.type],
-              let values = condition.configuration.arrayValue,
-              values.count >= 3,
-              let device = values[0].stringValue,
-              let control = values[1].stringValue else {
-            if condition.type == "ControlValueChange",
-               let values = condition.configuration.arrayValue,
-               values.count >= 2,
-               let device = values[0].stringValue,
-               let control = values[1].stringValue {
-                let suffix = values.count > 2
-                    ? " to \(renderOperand(values[2]))"
-                    : ""
-                return "\(device).\(control) changes\(suffix)"
-            }
-            return nil
-        }
-        return "\(device).\(control) \(operation) "
-            + renderOperand(values[2])
-    }
-
-    private static func renderOperand(_ value: HBJSONValue) -> String {
-        if let object = value.objectValue,
-           object.count == 1,
-           let entry = object.first {
-            if entry.key == "ControlValue",
-               let path = entry.value.arrayValue,
-               path.count >= 2,
-               let device = path[0].stringValue,
-               let control = path[1].stringValue {
-                return "\(device).\(control)"
-            }
-            if entry.key == "SceneState",
-               let scene = entry.value.stringValue {
-                return "scene \(scene)"
-            }
-        }
-        if let string = value.stringValue { return string }
-        return value.compactConfigurationJSON
+        TriggerConditionTypeRegistry.standard
+            .presentation(for: condition)
+            .detail
     }
 
     private static func truncated(_ value: String) -> String {

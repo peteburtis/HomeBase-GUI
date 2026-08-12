@@ -8,6 +8,29 @@ import XCTest
 @testable import HomeBase_GUI
 
 final class TriggerOverviewPresentationTests: XCTestCase {
+    func testLastFiredPresentationOnlyAppliesToWhenTriggers() {
+        let date = Date(timeIntervalSince1970: 1_234)
+
+        XCTAssertEqual(
+            TriggerOverviewPresentation.lastFired(
+                for: trigger(kind: .when, lastFiredAt: date)
+            ),
+            .date(date)
+        )
+        XCTAssertEqual(
+            TriggerOverviewPresentation.lastFired(
+                for: trigger(kind: .when, lastFiredAt: nil)
+            ),
+            .never
+        )
+        XCTAssertEqual(
+            TriggerOverviewPresentation.lastFired(
+                for: trigger(kind: .while, lastFiredAt: date)
+            ),
+            .omitted
+        )
+    }
+
     func testConditionTreeFlattensInDisplayOrderWithDepth() {
         let child = condition(
             path: "conditions.0.children.0",
@@ -55,8 +78,12 @@ final class TriggerOverviewPresentationTests: XCTestCase {
 
         XCTAssertEqual(
             TriggerOverviewPresentation.conditionSummary(descriptor),
-            "HallSensor.Motion == 1"
+            "Equals 1"
         )
+        let presentation = TriggerConditionTypeRegistry.standard.presentation(
+            for: descriptor
+        )
+        XCTAssertEqual(presentation.title, "Hall Sensor — Motion")
     }
 
     func testLegacyControlConditionUsesReadableComparison() {
@@ -73,11 +100,13 @@ final class TriggerOverviewPresentationTests: XCTestCase {
 
         XCTAssertEqual(
             TriggerOverviewPresentation.conditionSummary(descriptor),
-            "Thermostat.Temperature ≤ 68"
+            "Is Less Than or Equal To 68"
         )
         XCTAssertEqual(
-            TriggerOverviewPresentation.humanized(descriptor.type),
-            "Control Value Less Than Or Equal"
+            TriggerConditionTypeRegistry.standard.presentation(
+                for: descriptor
+            ).title,
+            "Thermostat — Temperature"
         )
     }
 
@@ -105,7 +134,7 @@ final class TriggerOverviewPresentationTests: XCTestCase {
 
         XCTAssertEqual(
             TriggerOverviewPresentation.conditionSummary(descriptor),
-            "2 nested conditions"
+            "2 conditions"
         )
     }
 
@@ -124,6 +153,19 @@ final class TriggerOverviewPresentationTests: XCTestCase {
             effectiveTruth: status == .satisfied,
             trueWhileInvalid: false,
             children: children
+        )
+    }
+
+    private func trigger(
+        kind: HBTriggerKind,
+        lastFiredAt: Date?
+    ) -> HBTriggerSummaryDescriptor {
+        HBTriggerSummaryDescriptor(
+            name: "Example",
+            kind: kind,
+            state: kind == .when ? .satisfied : .active,
+            schedulerRunning: true,
+            lastFiredAt: lastFiredAt
         )
     }
 }

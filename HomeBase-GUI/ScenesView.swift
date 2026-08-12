@@ -203,9 +203,6 @@ struct ScenesView: View {
 }
 
 private struct SceneActivationAccessory: View {
-    private static let userPriority = Int(Int32.max)
-    private static let userPriorityLabel = "P-User"
-
     let countdownDeadline: Date?
     let priority: Int?
 
@@ -248,13 +245,11 @@ private struct SceneActivationAccessory: View {
     }
 
     private func priorityText(_ priority: Int) -> String {
-        priority == Self.userPriority
-            ? Self.userPriorityLabel
-            : "P-\(priority)"
+        AutomationPresentationFormat.priority(Int64(priority))
     }
 
     private func priorityAccessibilityText(_ priority: Int) -> String {
-        priority == Self.userPriority
+        Int64(priority) == AutomationPresentationFormat.userPriority
             ? "User priority"
             : "Priority \(priority)"
     }

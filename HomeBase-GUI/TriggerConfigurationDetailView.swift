@@ -19,8 +19,9 @@ struct TriggerConfigurationDetailView: View {
     private let navigationTitle: String
     private let repository: TriggerConfigurationRepository
     @StateObject private var model: TriggerConfigurationDetailModel
-    @State private var isShowingControlPicker = false
-    @State private var isShowingNewConditionEditor = false
+    @State private var selectedActionPlugin: AnyAutomationActionTypePlugin?
+    @State private var selectedConditionCreation:
+        TriggerConditionCreationOption?
     @State private var pendingAddedActionIndex: Int?
     @State private var newlyAddedActionIndex: Int?
 
@@ -60,9 +61,10 @@ struct TriggerConfigurationDetailView: View {
             case .loaded:
                 TriggerConfigurationContents(
                     model: model,
+                    repository: repository,
                     newlyAddedActionIndex: $newlyAddedActionIndex,
-                    addCondition: { isShowingNewConditionEditor = true },
-                    addAction: beginAddingAction
+                    chooseCondition: { selectedConditionCreation = $0 },
+                    chooseAction: beginAddingAction
                 )
                 .refreshable {
                     await model.reload()
@@ -124,33 +126,16 @@ struct TriggerConfigurationDetailView: View {
             }
         }
         .alert(item: $model.presentedAlert, content: makeAlert)
-        .sheet(
-            isPresented: $isShowingControlPicker,
-            onDismiss: revealAddedAction
-        ) {
-            SceneControlPickerView(
-                repository: repository,
-                excludedControlPaths: [],
-                configurationKind: "trigger"
-            ) { device, control, valueSource in
-                pendingAddedActionIndex = try await model.addControlSet(
-                    device: device,
-                    control: control,
-                    valueSource: valueSource
-                )
-            }
+        .sheet(item: $selectedActionPlugin, onDismiss: revealAddedAction) {
+            plugin in
+            plugin.makeCreationView(operations: actionCreationOperations)
         }
-        .sheet(isPresented: $isShowingNewConditionEditor) {
+        .sheet(item: $selectedConditionCreation) { creation in
             NavigationStack {
-                TriggerConditionJSONEditor(
-                    title: "New Condition",
-                    initialValue: .object([
-                        "Compare": .array([
-                            .integer(0),
-                            .string("=="),
-                            .integer(1),
-                        ])
-                    ]),
+                TriggerConditionEditorView(
+                    title: creation.title,
+                    initialValue: creation.initialValue,
+                    repository: repository,
                     actionLabel: "Add"
                 ) { value in
                     try model.appendCondition(value)
@@ -162,10 +147,34 @@ struct TriggerConfigurationDetailView: View {
         }
     }
 
-    private func beginAddingAction() {
+    private var actionCreationOperations: AutomationActionCreationOperations {
+        AutomationActionCreationOperations(
+            controlRepository: repository,
+            excludedControlPaths: [],
+            configurationKind: "trigger",
+            addControlSet: { device, control, valueSource in
+                let index = try await model.addControlSet(
+                    device: device,
+                    control: control,
+                    valueSource: valueSource
+                )
+                pendingAddedActionIndex = index
+                return index
+            },
+            appendAction: { value in
+                let index = try await model.appendAction(value)
+                pendingAddedActionIndex = index
+                return index
+            }
+        )
+    }
+
+    private func beginAddingAction(
+        _ plugin: AnyAutomationActionTypePlugin
+    ) {
         pendingAddedActionIndex = nil
         newlyAddedActionIndex = nil
-        isShowingControlPicker = true
+        selectedActionPlugin = plugin
     }
 
     private func revealAddedAction() {
@@ -250,9 +259,10 @@ struct TriggerConfigurationDetailView: View {
 
 private struct TriggerConfigurationContents: View {
     @ObservedObject var model: TriggerConfigurationDetailModel
+    let repository: TriggerConfigurationRepository
     @Binding var newlyAddedActionIndex: Int?
-    let addCondition: () -> Void
-    let addAction: () -> Void
+    let chooseCondition: (TriggerConditionCreationOption) -> Void
+    let chooseAction: (AnyAutomationActionTypePlugin) -> Void
 
     @State private var highlightedActionIndex: Int?
 
@@ -279,8 +289,21 @@ private struct TriggerConfigurationContents: View {
                                 set: model.setTriggerTypeInput
                             )
                         ) {
-                            Text("When").tag("When")
-                            Text("While").tag("While")
+                            ForEach(TriggerKindUICatalog.supported) {
+                                registration in
+                                Text(registration.displayName)
+                                    .tag(registration.wireValue)
+                            }
+                        }
+
+                        if let message =
+                            model.actionApplicabilityValidationMessage {
+                            Label(
+                                message,
+                                systemImage: "exclamationmark.triangle.fill"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.red)
                         }
 
                         ForEach(trigger.additionalFields, id: \.key) { field in
@@ -308,7 +331,8 @@ private struct TriggerConfigurationContents: View {
                             Section {
                                 TriggerConditionRows(
                                     condition: condition,
-                                    model: model
+                                    model: model,
+                                    repository: repository
                                 )
                             } header: {
                                 TriggerConditionSectionHeader(
@@ -421,14 +445,35 @@ private struct TriggerConfigurationContents: View {
     }
 
     private var newConditionButton: some View {
-        Button(action: addCondition) {
+        Menu {
+            ForEach(TriggerConditionTypeRegistry.standard.creationOptions) {
+                option in
+                Button {
+                    chooseCondition(option)
+                } label: {
+                    Label(option.title, systemImage: option.systemImage)
+                }
+            }
+        } label: {
             Label("New Condition", systemImage: "plus")
         }
         .disabled(!model.canMutateStructure)
     }
 
     private var newActionButton: some View {
-        Button(action: addAction) {
+        Menu {
+            ForEach(
+                AutomationActionTypeRegistry.standard.creationPlugins(
+                    for: model.actionConfigurationContext
+                )
+            ) { plugin in
+                Button {
+                    chooseAction(plugin)
+                } label: {
+                    Label(plugin.displayName, systemImage: plugin.systemImage)
+                }
+            }
+        } label: {
             Label("New Action", systemImage: "plus")
         }
         .disabled(!model.canMutateStructure)
@@ -490,9 +535,11 @@ private struct TriggerConditionSectionHeader: View {
     @ObservedObject var model: TriggerConfigurationDetailModel
 
     var body: some View {
+        let presentation = TriggerConditionTypeRegistry.standard
+            .presentation(for: condition.rawValue)
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(condition.type ?? "Unrecognized condition")
+                Text(presentation.title)
                     .font(.headline)
                     .foregroundStyle(.primary)
                 Text("Condition \(condition.index + 1)")
@@ -518,24 +565,24 @@ private struct TriggerConditionSectionHeader: View {
 private struct TriggerConditionRows: View {
     let condition: TriggerConditionConfiguration
     @ObservedObject var model: TriggerConfigurationDetailModel
+    let repository: TriggerConfigurationRepository
 
     var body: some View {
-        if let payload = condition.payload {
-            SceneConfigurationValueRow(
-                label: "Configuration",
-                value: payload
-            )
-        } else {
-            SceneConfigurationValueRow(
-                label: "Raw condition",
-                value: condition.rawValue
-            )
+        let presentation = TriggerConditionTypeRegistry.standard
+            .presentation(for: condition.rawValue)
+
+        if let detail = presentation.detail {
+            LabeledContent("Configuration") {
+                Text(detail)
+                    .multilineTextAlignment(.trailing)
+            }
         }
 
         NavigationLink {
-            TriggerConditionJSONEditor(
-                title: condition.type ?? "Condition",
+            TriggerConditionEditorView(
+                title: presentation.title,
                 initialValue: condition.rawValue,
+                repository: repository,
                 actionLabel: "Done"
             ) { value in
                 try model.setCondition(
@@ -544,13 +591,13 @@ private struct TriggerConditionRows: View {
                 )
             }
         } label: {
-            Label("Edit JSON", systemImage: "curlybraces")
+            Label("Edit Condition", systemImage: "slider.horizontal.3")
         }
         .disabled(model.isBusy)
     }
 }
 
-private struct TriggerConditionJSONEditor: View {
+struct TriggerConditionJSONEditor: View {
     private enum ValidationError: LocalizedError {
         case empty
         case invalidJSON(String)
@@ -741,7 +788,8 @@ private final class TriggerConfigurationDetailModel:
     @Published private(set) var isDeleting = false
     @Published private(set) var saveConfirmation: String?
     @Published private(set) var identifierInput = ""
-    @Published private(set) var triggerTypeInput = "When"
+    @Published private(set) var triggerTypeInput =
+        TriggerKindUICatalog.defaultRegistration.wireValue
     @Published var presentedAlert: TriggerEditorAlert?
 
     private let source: TriggerConfigurationEditingSource
@@ -752,7 +800,8 @@ private final class TriggerConfigurationDetailModel:
     private var pendingRecovery: TriggerConfigurationRecovery?
     private var pendingCreatedTrigger: TriggerConfigurationDocument?
     private var initialIdentifierInput = ""
-    private var initialTriggerTypeInput = "When"
+    private var initialTriggerTypeInput =
+        TriggerKindUICatalog.defaultRegistration.wireValue
 
     init(
         source: TriggerConfigurationEditingSource,
@@ -770,7 +819,8 @@ private final class TriggerConfigurationDetailModel:
             )
             draft = newDraft
             identifierInput = suggestedIdentifier
-            triggerTypeInput = "When"
+            triggerTypeInput =
+                TriggerKindUICatalog.defaultRegistration.wireValue
             initialIdentifierInput = identifierInput
             initialTriggerTypeInput = triggerTypeInput
             state = .loaded
@@ -808,6 +858,14 @@ private final class TriggerConfigurationDetailModel:
         state == .loaded && !isBusy && loadingCurrentValues.isEmpty
     }
 
+    var supportsGenericActionMutation: Bool { true }
+
+    var actionConfigurationContext: AutomationActionConfigurationContext {
+        TriggerKindUICatalog.actionConfigurationContext(
+            forEditorWireValue: triggerTypeInput
+        )
+    }
+
     var showsDeleteAction: Bool {
         draft?.isNew == false
     }
@@ -829,6 +887,26 @@ private final class TriggerConfigurationDetailModel:
             return "An identifier used as a filename cannot begin with a period or contain a slash."
         }
         return nil
+    }
+
+    var actionApplicabilityValidationMessage: String? {
+        guard let actions = trigger?.actions else { return nil }
+        let registry = AutomationActionTypeRegistry.standard
+        let incompatible = actions.compactMap { action -> String? in
+            let plugin = registry.resolve(action).plugin
+            guard !plugin.supports(
+                action: action,
+                in: actionConfigurationContext
+            ) else {
+                return nil
+            }
+            return "\(plugin.displayName) (action \(action.index + 1))"
+        }
+        guard !incompatible.isEmpty else { return nil }
+        let actionList = incompatible.formatted(
+            .list(type: .and, width: .standard)
+        )
+        return "\(actionList) cannot be used in a \(triggerTypeInput) trigger. Remove the incompatible action or change the trigger type."
     }
 
     var presentedFilePath: String {
@@ -1002,6 +1080,81 @@ private final class TriggerConfigurationDetailModel:
         objectWillChange.send()
     }
 
+    func setAction(
+        actionIndex: Int,
+        rawValue: HBJSONValue
+    ) async throws {
+        guard canMutateStructure, var updated = draft else {
+            throw EditorError.unavailable
+        }
+        let originalRoot = updated.root
+        try updated.setAction(at: actionIndex, rawValue: rawValue)
+        guard updated.root != originalRoot else { return }
+
+        draft = updated
+        resolutions[actionIndex] = nil
+        actionErrors[actionIndex] = nil
+        saveConfirmation = nil
+
+        let needsResolution = updated.trigger.actions[actionIndex]
+            .controlSet != nil
+        if needsResolution {
+            resolutions[actionIndex] = .resolving
+        }
+        objectWillChange.send()
+
+        if needsResolution {
+            await resolveControls()
+        }
+    }
+
+    func removeAction(actionIndex: Int) {
+        guard canMutateStructure, var updated = draft else { return }
+
+        do {
+            try updated.removeAction(at: actionIndex)
+            draft = updated
+            resolutions = shiftingIndexes(
+                in: resolutions,
+                afterRemoving: actionIndex
+            )
+            actionErrors = shiftingIndexes(
+                in: actionErrors,
+                afterRemoving: actionIndex
+            )
+            saveConfirmation = nil
+            objectWillChange.send()
+        } catch {
+            presentedAlert = TriggerEditorAlert(
+                kind: .message,
+                title: "Action Could Not Be Removed",
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    func appendAction(_ rawValue: HBJSONValue) async throws -> Int {
+        guard canMutateStructure, var updated = draft else {
+            throw EditorError.unavailable
+        }
+        let actionIndex = try updated.appendAction(rawValue)
+        draft = updated
+        actionErrors[actionIndex] = nil
+        saveConfirmation = nil
+
+        let needsResolution = updated.trigger.actions[actionIndex]
+            .controlSet != nil
+        if needsResolution {
+            resolutions[actionIndex] = .resolving
+        }
+        objectWillChange.send()
+
+        if needsResolution {
+            await resolveControls()
+        }
+        return actionIndex
+    }
+
     func removeControlSet(actionIndex: Int) {
         guard canMutateStructure, var updated = draft else { return }
         do {
@@ -1127,6 +1280,14 @@ private final class TriggerConfigurationDetailModel:
                 kind: .message,
                 title: "Trigger Fields Need Attention",
                 message: identifierValidationMessage
+            )
+            return false
+        }
+        if let actionApplicabilityValidationMessage {
+            presentedAlert = TriggerEditorAlert(
+                kind: .message,
+                title: "Trigger Actions Need Attention",
+                message: actionApplicabilityValidationMessage
             )
             return false
         }
@@ -1302,7 +1463,8 @@ private final class TriggerConfigurationDetailModel:
         draft = TriggerConfigurationDraft(trigger: trigger)
         pendingCreatedTrigger = nil
         identifierInput = trigger.identifier ?? ""
-        triggerTypeInput = trigger.triggerType ?? "When"
+        triggerTypeInput = trigger.triggerType
+            ?? TriggerKindUICatalog.defaultRegistration.wireValue
         initialIdentifierInput = identifierInput
         initialTriggerTypeInput = triggerTypeInput
         if !retainingResolutions {

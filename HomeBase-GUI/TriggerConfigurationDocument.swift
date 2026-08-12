@@ -28,14 +28,7 @@ struct TriggerConfigurationDocument: Identifiable, Equatable, Sendable {
     }
 
     var kind: HBTriggerKind? {
-        switch triggerType {
-        case "When":
-            .when
-        case "While":
-            .while
-        default:
-            nil
-        }
+        TriggerKindUICatalog.registration(forWireValue: triggerType)?.kind
     }
 
     var conditions: [TriggerConditionConfiguration] {
@@ -125,6 +118,7 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
         case invalidCondition(Int)
         case actionsAreNotAnArray
         case missingAction(Int)
+        case invalidAction(Int)
         case actionIsNotControlSet(Int)
         case invalidControlTarget
 
@@ -133,7 +127,9 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
             case .invalidTriggerLocation:
                 "The trigger no longer has a valid location in its source file."
             case .invalidTriggerType:
-                "Trigger type must be \"When\" or \"While\"."
+                "Trigger type must be "
+                    + TriggerKindUICatalog.supportedWireValueDescription
+                    + "."
             case .conditionsAreNotAnArray:
                 "The trigger's Conditions field is not an array."
             case .missingCondition(let index):
@@ -144,6 +140,8 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
                 "The trigger's Actions field is not an array."
             case .missingAction(let index):
                 "The trigger has no action at index \(index)."
+            case .invalidAction(let index):
+                "Action \(index + 1) must be an object with exactly one nonempty key."
             case .actionIsNotControlSet(let index):
                 "Action \(index + 1) is not an editable ControlSet action."
             case .invalidControlTarget:
@@ -167,9 +165,11 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
 
     static func newTrigger(
         identifier: String = "UntitledTrigger",
-        triggerType: String = "When"
+        triggerType: String = TriggerKindUICatalog.defaultRegistration.wireValue
     ) throws -> Self {
-        guard Self.validTriggerTypes.contains(triggerType) else {
+        guard TriggerKindUICatalog.registration(
+            forWireValue: triggerType
+        ) != nil else {
             throw MutationError.invalidTriggerType
         }
         let root = HBJSONValue.object([
@@ -266,7 +266,9 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
     }
 
     mutating func setTriggerType(_ triggerType: String) throws {
-        guard Self.validTriggerTypes.contains(triggerType) else {
+        guard TriggerKindUICatalog.registration(
+            forWireValue: triggerType
+        ) != nil else {
             throw MutationError.invalidTriggerType
         }
         try setTriggerField("Type", value: .string(triggerType))
@@ -341,21 +343,81 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
         guard var action = actions[actionIndex].objectValue,
               action.count == 1,
               var controlSet = action["ControlSet"]?.arrayValue,
-              controlSet.count >= 3 else {
+              controlSet.count >= 3,
+              let command = ControlCommandJSONLens(controlSet[2]) else {
             throw MutationError.actionIsNotControlSet(actionIndex)
         }
 
-        guard controlSet[2] != value else { return }
-        controlSet[2] = value
+        let patchedCommand = command.replacingPrimaryValue(with: value)
+        guard controlSet[2] != patchedCommand else { return }
+        controlSet[2] = patchedCommand
         action["ControlSet"] = .array(controlSet)
         actions[actionIndex] = .object(action)
         fields["Actions"] = .array(actions)
         try replaceTriggerFields(fields)
     }
 
-    mutating func removeControlSet(actionIndex: Int) throws {
+    mutating func setAction(
+        at index: Int,
+        rawValue: HBJSONValue
+    ) throws {
+        try Self.validateAction(rawValue, at: index)
         var fields = try requiredTriggerFields()
         guard var actions = fields["Actions"]?.arrayValue else {
+            if fields["Actions"] == nil {
+                throw MutationError.missingAction(index)
+            }
+            throw MutationError.actionsAreNotAnArray
+        }
+        guard actions.indices.contains(index) else {
+            throw MutationError.missingAction(index)
+        }
+        guard actions[index] != rawValue else { return }
+        actions[index] = rawValue
+        fields["Actions"] = .array(actions)
+        try replaceTriggerFields(fields)
+    }
+
+    mutating func removeAction(at index: Int) throws {
+        var fields = try requiredTriggerFields()
+        guard var actions = fields["Actions"]?.arrayValue else {
+            if fields["Actions"] == nil {
+                throw MutationError.missingAction(index)
+            }
+            throw MutationError.actionsAreNotAnArray
+        }
+        guard actions.indices.contains(index) else {
+            throw MutationError.missingAction(index)
+        }
+        actions.remove(at: index)
+        fields["Actions"] = .array(actions)
+        try replaceTriggerFields(fields)
+    }
+
+    @discardableResult
+    mutating func appendAction(_ rawValue: HBJSONValue) throws -> Int {
+        var fields = try requiredTriggerFields()
+        var actions: [HBJSONValue]
+        if let actionsValue = fields["Actions"] {
+            guard let existingActions = actionsValue.arrayValue else {
+                throw MutationError.actionsAreNotAnArray
+            }
+            actions = existingActions
+        } else {
+            actions = []
+        }
+
+        let index = actions.count
+        try Self.validateAction(rawValue, at: index)
+        actions.append(rawValue)
+        fields["Actions"] = .array(actions)
+        try replaceTriggerFields(fields)
+        return index
+    }
+
+    mutating func removeControlSet(actionIndex: Int) throws {
+        let fields = try requiredTriggerFields()
+        guard let actions = fields["Actions"]?.arrayValue else {
             if fields["Actions"] == nil {
                 throw MutationError.missingAction(actionIndex)
             }
@@ -371,9 +433,7 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
             throw MutationError.actionIsNotControlSet(actionIndex)
         }
 
-        actions.remove(at: actionIndex)
-        fields["Actions"] = .array(actions)
-        try replaceTriggerFields(fields)
+        try removeAction(at: actionIndex)
     }
 
     @discardableResult
@@ -386,19 +446,7 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
             throw MutationError.invalidControlTarget
         }
 
-        var fields = try requiredTriggerFields()
-        var actions: [HBJSONValue]
-        if let actionsValue = fields["Actions"] {
-            guard let existingActions = actionsValue.arrayValue else {
-                throw MutationError.actionsAreNotAnArray
-            }
-            actions = existingActions
-        } else {
-            actions = []
-        }
-
-        let actionIndex = actions.count
-        actions.append(
+        return try appendAction(
             .object([
                 "ControlSet": .array([
                     .string(device),
@@ -407,16 +455,11 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
                 ])
             ])
         )
-        fields["Actions"] = .array(actions)
-        try replaceTriggerFields(fields)
-        return actionIndex
     }
 
     func renderedSource() throws -> String {
         try root.configurationJSONSource(prettyPrinted: true) + "\n"
     }
-
-    private static let validTriggerTypes: Set<String> = ["When", "While"]
 
     private var currentTriggerFields: [String: HBJSONValue]? {
         switch (root, original.rootIndex) {
@@ -475,6 +518,18 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
               let key = object.keys.first,
               !key.isEmpty else {
             throw MutationError.invalidCondition(index)
+        }
+    }
+
+    private static func validateAction(
+        _ rawValue: HBJSONValue,
+        at index: Int
+    ) throws {
+        guard let object = rawValue.objectValue,
+              object.count == 1,
+              let key = object.keys.first,
+              !key.isEmpty else {
+            throw MutationError.invalidAction(index)
         }
     }
 }

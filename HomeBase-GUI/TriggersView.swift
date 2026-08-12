@@ -176,13 +176,18 @@ private struct TriggerRowLabel: View {
     }
 
     private var detail: Text {
-        let kind = trigger.kind == .when ? "When" : "While"
-        if let lastFiredAt = trigger.lastFiredAt {
+        let kindName = TriggerKindUICatalog.registration(for: trigger.kind)
+            .displayName
+        switch TriggerOverviewPresentation.lastFired(for: trigger) {
+        case .omitted:
+            return Text(kindName)
+        case .never:
+            return Text("\(kindName) • Never fired")
+        case .date(let lastFiredAt):
             return Text(
-                "\(kind) • Last fired \(lastFiredAt, style: .relative)"
+                "\(kindName) • Last fired \(lastFiredAt, style: .relative)"
             )
         }
-        return Text("\(kind) • Never fired")
     }
 }
 

@@ -19,7 +19,7 @@ struct SceneConfigurationDetailView: View {
     private let navigationTitle: String
     private let repository: SceneConfigurationRepository
     @StateObject private var model: SceneConfigurationDetailModel
-    @State private var isShowingControlPicker = false
+    @State private var selectedActionPlugin: AnyAutomationActionTypePlugin?
     @State private var pendingAddedActionIndex: Int?
     @State private var newlyAddedActionIndex: Int?
 
@@ -66,7 +66,7 @@ struct SceneConfigurationDetailView: View {
                 SceneConfigurationContents(
                     model: model,
                     newlyAddedActionIndex: $newlyAddedActionIndex,
-                    addAction: beginAddingAction
+                    chooseAction: beginAddingAction
                 )
                     .refreshable {
                         await model.reload()
@@ -130,30 +130,41 @@ struct SceneConfigurationDetailView: View {
             }
         }
         .alert(item: $model.presentedAlert, content: makeAlert)
-        .sheet(
-            isPresented: $isShowingControlPicker,
-            onDismiss: revealAddedAction
-        ) {
-            SceneControlPickerView(
-                repository: repository,
-                excludedControlPaths: model.configuredControlPaths
-            ) { device, control, valueSource in
-                pendingAddedActionIndex = try await model.addControlSet(
-                    device: device,
-                    control: control,
-                    valueSource: valueSource
-                )
-            }
+        .sheet(item: $selectedActionPlugin, onDismiss: revealAddedAction) {
+            plugin in
+            plugin.makeCreationView(operations: actionCreationOperations)
         }
         .task {
             await model.loadIfNeeded()
         }
     }
 
-    private func beginAddingAction() {
+    private var actionCreationOperations: AutomationActionCreationOperations {
+        AutomationActionCreationOperations(
+            controlRepository: repository,
+            excludedControlPaths: model.configuredControlPaths,
+            configurationKind: "scene",
+            addControlSet: { device, control, valueSource in
+                let index = try await model.addControlSet(
+                    device: device,
+                    control: control,
+                    valueSource: valueSource
+                )
+                pendingAddedActionIndex = index
+                return index
+            },
+            appendAction: { value in
+                let index = try await model.appendAction(value)
+                pendingAddedActionIndex = index
+                return index
+            }
+        )
+    }
+
+    private func beginAddingAction(_ plugin: AnyAutomationActionTypePlugin) {
         pendingAddedActionIndex = nil
         newlyAddedActionIndex = nil
-        isShowingControlPicker = true
+        selectedActionPlugin = plugin
     }
 
     private func revealAddedAction() {
@@ -245,7 +256,7 @@ struct SceneConfigurationDetailView: View {
 private struct SceneConfigurationContents: View {
     @ObservedObject var model: SceneConfigurationDetailModel
     @Binding var newlyAddedActionIndex: Int?
-    let addAction: () -> Void
+    let chooseAction: (AnyAutomationActionTypePlugin) -> Void
 
     @State private var highlightedActionIndex: Int?
 
@@ -271,20 +282,26 @@ private struct SceneConfigurationContents: View {
                                 get: { model.priorityInput },
                                 set: model.setPriorityInput
                             ),
-                            prompt: "Default",
+                            prompt: "Per action (P-0 if unset)",
                             kind: .integer,
                             validationMessage: model.priorityValidationMessage
                         )
                         SceneConfigurationEditableTextRow(
-                            label: "Timing",
+                            label: "Transition",
                             text: Binding(
                                 get: { model.timingInput },
                                 set: model.setTimingInput
                             ),
-                            prompt: "Default (seconds)",
+                            prompt: "Per action (seconds)",
                             kind: .decimal,
                             validationMessage: model.timingValidationMessage
                         )
+
+                        Text(
+                            "Priority and transition are optional scene-wide overrides. Leave them empty to keep each action’s own setting."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
 
                         ForEach(scene.additionalFields, id: \.key) { field in
                             SceneConfigurationValueRow(
@@ -294,6 +311,20 @@ private struct SceneConfigurationContents: View {
                         }
                     } header: {
                         SceneConfigurationSectionHeader("Scene")
+                    }
+
+                    if let message =
+                        model.actionApplicabilityValidationMessage {
+                        Section {
+                            Label(
+                                message,
+                                systemImage: "exclamationmark.triangle.fill"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                        } header: {
+                            SceneConfigurationSectionHeader("Actions")
+                        }
                     }
 
                     if scene.actions.isEmpty {
@@ -391,7 +422,19 @@ private struct SceneConfigurationContents: View {
     }
 
     private var newActionButton: some View {
-        Button(action: addAction) {
+        Menu {
+            ForEach(
+                AutomationActionTypeRegistry.standard.creationPlugins(
+                    for: .scene
+                )
+            ) { plugin in
+                Button {
+                    chooseAction(plugin)
+                } label: {
+                    Label(plugin.displayName, systemImage: plugin.systemImage)
+                }
+            }
+        } label: {
             Label("New Action", systemImage: "plus")
         }
         .disabled(!model.canMutateStructure)
@@ -424,221 +467,6 @@ private struct SceneConfigurationContents: View {
                 highlightedActionIndex = nil
             }
         }
-    }
-}
-
-struct AutomationActionSectionHeader<Model: AutomationActionEditingModel>: View {
-    let action: SceneActionConfiguration
-    @ObservedObject var model: Model
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(action.type ?? "Unrecognized action")
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                Text("Action \(action.index + 1)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer(minLength: 8)
-
-            if action.controlSet != nil {
-                Button(role: .destructive) {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        model.removeControlSet(
-                            actionIndex: action.index
-                        )
-                    }
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .disabled(!model.canMutateStructure)
-                .accessibilityLabel("Remove Control Set")
-            }
-        }
-        .textCase(nil)
-    }
-}
-
-struct AutomationActionConfigurationRows<Model: AutomationActionEditingModel>: View {
-    let action: SceneActionConfiguration
-    @ObservedObject var model: Model
-
-    @ViewBuilder
-    var body: some View {
-        if let controlSet = action.controlSet {
-            SceneConfigurationTextRow(
-                label: "Device",
-                value: controlSet.device
-            )
-            SceneConfigurationTextRow(
-                label: "Control",
-                value: controlSet.control
-            )
-            AutomationControlSetValueRow(
-                controlSet: controlSet,
-                model: model
-            )
-
-            ForEach(
-                Array(controlSet.trailingValues.enumerated()),
-                id: \.offset
-            ) { offset, value in
-                SceneConfigurationValueRow(
-                    label: controlSetTrailingLabel(
-                        value: value,
-                        absoluteIndex: offset + 3
-                    ),
-                    value: value
-                )
-            }
-        } else if let payload = action.payload {
-            SceneConfigurationValueRow(
-                label: "Configuration",
-                value: payload
-            )
-        } else {
-            SceneConfigurationValueRow(
-                label: "Raw action",
-                value: action.rawValue
-            )
-        }
-    }
-
-    private func controlSetTrailingLabel(
-        value: HBJSONValue,
-        absoluteIndex: Int
-    ) -> String {
-        if value.objectValue != nil {
-            return "Options"
-        }
-        if absoluteIndex == 3 {
-            return "Priority"
-        }
-        return "Element \(absoluteIndex + 1)"
-    }
-}
-
-struct AutomationControlSetValueRow<Model: AutomationActionEditingModel>: View {
-    let controlSet: SceneControlSetConfiguration
-    @ObservedObject var model: Model
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text("Value")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            switch model.controlResolution(for: controlSet.actionIndex) {
-            case .resolving:
-                HStack(spacing: 10) {
-                    rawValue
-                    Spacer(minLength: 8)
-                    ProgressView()
-                        .controlSize(.small)
-                }
-
-            case .unavailable(let message):
-                rawValue
-                Text(message)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-            case .resolved(let target):
-                resolvedValue(target)
-            }
-
-            if let error = model.actionError(
-                for: controlSet.actionIndex
-            ) {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-        }
-        .padding(.vertical, 2)
-    }
-
-    @ViewBuilder
-    private func resolvedValue(_ target: SceneResolvedControl) -> some View {
-        let context = target.presentationContext(
-            value: controlSet.value,
-            isEnabled: !model.isBusy
-                && !model.isLoadingCurrentValue(
-                    actionIndex: controlSet.actionIndex
-                ),
-            commit: { value, _ in
-                try await model.setControlValue(
-                    actionIndex: controlSet.actionIndex,
-                    value: value
-                )
-            }
-        )
-        let plugin = ControlValueTypeRegistry.standard
-            .resolve(context.schema)
-            .plugin
-
-        if plugin.supportsEditing(context: context) {
-            HStack(spacing: 12) {
-                ControlValuePluginView(context: context)
-
-                Spacer(minLength: 4)
-
-                Button {
-                    Task {
-                        await model.useCurrentValue(
-                            actionIndex: controlSet.actionIndex
-                        )
-                    }
-                } label: {
-                    if model.isLoadingCurrentValue(
-                        actionIndex: controlSet.actionIndex
-                    ) {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Label("Current", systemImage: "arrow.down.circle")
-                    }
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .disabled(model.isBusy)
-                .accessibilityLabel("Use Current Value")
-            }
-        } else {
-            rawValue
-            NavigationLink {
-                SceneRawControlValueEditor(
-                    control: target.descriptor,
-                    initialValue: controlSet.value,
-                    actionLabel: "Done"
-                ) { value in
-                    try await model.setControlValue(
-                        actionIndex: controlSet.actionIndex,
-                        value: value
-                    )
-                }
-            } label: {
-                Label("Edit JSON", systemImage: "curlybraces")
-            }
-            .disabled(model.isBusy)
-
-            Text(
-                "This control does not have a dedicated editor."
-            )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private var rawValue: some View {
-        Text(controlSet.value.prettyConfigurationJSON)
-            .font(.body.monospaced())
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -803,25 +631,6 @@ struct SceneConfigurationValueRow: View {
     }
 }
 
-enum AutomationControlResolution: Equatable, Sendable {
-    case resolving
-    case resolved(SceneResolvedControl)
-    case unavailable(String)
-}
-
-@MainActor
-protocol AutomationActionEditingModel: ObservableObject {
-    var isBusy: Bool { get }
-    var canMutateStructure: Bool { get }
-
-    func controlResolution(for actionIndex: Int) -> AutomationControlResolution
-    func isLoadingCurrentValue(actionIndex: Int) -> Bool
-    func actionError(for actionIndex: Int) -> String?
-    func setControlValue(actionIndex: Int, value: HBJSONValue) async throws
-    func useCurrentValue(actionIndex: Int) async
-    func removeControlSet(actionIndex: Int)
-}
-
 private struct SceneEditorAlert: Identifiable {
     enum Kind {
         case discardChanges
@@ -954,12 +763,15 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         state == .loaded
             && (draft?.isDirty == true || pendingCreatedScene != nil)
             && metadataValidationMessage == nil
+            && actionApplicabilityValidationMessage == nil
             && !isBusy
     }
 
     var canMutateStructure: Bool {
         state == .loaded && !isBusy && loadingCurrentValues.isEmpty
     }
+
+    var supportsGenericActionMutation: Bool { true }
 
     var showsDeleteAction: Bool {
         draft?.isNew == false
@@ -990,6 +802,23 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
             return "An identifier used as a filename cannot begin with a period or contain a slash."
         }
         return nil
+    }
+
+    var actionApplicabilityValidationMessage: String? {
+        guard let actions = scene?.actions else { return nil }
+        let registry = AutomationActionTypeRegistry.standard
+        let incompatible = actions.compactMap { action -> String? in
+            let plugin = registry.resolve(action).plugin
+            guard !plugin.supports(action: action, in: .scene) else {
+                return nil
+            }
+            return "\(plugin.displayName) (action \(action.index + 1))"
+        }
+        guard !incompatible.isEmpty else { return nil }
+        let actionList = incompatible.formatted(
+            .list(type: .and, width: .standard)
+        )
+        return "\(actionList) cannot be used in a scene. Remove the incompatible action before saving."
     }
 
     var priorityValidationMessage: String? {
@@ -1196,6 +1025,79 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         objectWillChange.send()
     }
 
+    func setAction(
+        actionIndex: Int,
+        rawValue: HBJSONValue
+    ) async throws {
+        guard canMutateStructure, var updated = draft else {
+            throw EditorError.unavailable
+        }
+        let originalRoot = updated.root
+        try updated.setAction(at: actionIndex, rawValue: rawValue)
+        guard updated.root != originalRoot else { return }
+
+        draft = updated
+        resolutions[actionIndex] = nil
+        actionErrors[actionIndex] = nil
+        saveConfirmation = nil
+
+        let needsResolution = updated.scene.actions[actionIndex].controlSet != nil
+        if needsResolution {
+            resolutions[actionIndex] = .resolving
+        }
+        objectWillChange.send()
+
+        if needsResolution {
+            await resolveControls()
+        }
+    }
+
+    func removeAction(actionIndex: Int) {
+        guard canMutateStructure, var updated = draft else { return }
+
+        do {
+            try updated.removeAction(at: actionIndex)
+            draft = updated
+            resolutions = shiftingIndexes(
+                in: resolutions,
+                afterRemoving: actionIndex
+            )
+            actionErrors = shiftingIndexes(
+                in: actionErrors,
+                afterRemoving: actionIndex
+            )
+            saveConfirmation = nil
+            objectWillChange.send()
+        } catch {
+            presentedAlert = SceneEditorAlert(
+                kind: .message,
+                title: "Action Could Not Be Removed",
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    func appendAction(_ rawValue: HBJSONValue) async throws -> Int {
+        guard canMutateStructure, var updated = draft else {
+            throw EditorError.unavailable
+        }
+        let actionIndex = try updated.appendAction(rawValue)
+        draft = updated
+        actionErrors[actionIndex] = nil
+        saveConfirmation = nil
+
+        let needsResolution = updated.scene.actions[actionIndex].controlSet != nil
+        if needsResolution {
+            resolutions[actionIndex] = .resolving
+        }
+        objectWillChange.send()
+
+        if needsResolution {
+            await resolveControls()
+        }
+        return actionIndex
+    }
+
     func removeControlSet(actionIndex: Int) {
         guard canMutateStructure, var updated = draft else { return }
 
@@ -1317,6 +1219,14 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
                 kind: .message,
                 title: "Scene Fields Need Attention",
                 message: metadataValidationMessage
+            )
+            return false
+        }
+        if let actionApplicabilityValidationMessage {
+            presentedAlert = SceneEditorAlert(
+                kind: .message,
+                title: "Scene Actions Need Attention",
+                message: actionApplicabilityValidationMessage
             )
             return false
         }
