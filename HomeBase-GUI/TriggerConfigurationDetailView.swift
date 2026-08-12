@@ -152,9 +152,9 @@ struct TriggerConfigurationDetailView: View {
             controlRepository: repository,
             excludedControlPaths: [],
             configurationKind: "trigger",
-            addControlSet: { device, control, valueSource in
+            addControlSet: { deviceAddressableName, control, valueSource in
                 let index = try await model.addControlSet(
-                    device: device,
+                    deviceAddressableName: deviceAddressableName,
                     control: control,
                     valueSource: valueSource
                 )
@@ -1180,7 +1180,7 @@ private final class TriggerConfigurationDetailModel:
     }
 
     func addControlSet(
-        device: HBDeviceDescriptor,
+        deviceAddressableName: String,
         control: HBControlDescriptor,
         valueSource: SceneControlSetValueSource
     ) async throws -> Int {
@@ -1189,7 +1189,7 @@ private final class TriggerConfigurationDetailModel:
         }
 
         let resolved = SceneResolvedControl(
-            device: device,
+            path: "\(deviceAddressableName):\(control.identifier)",
             descriptor: control
         )
         let value: HBJSONValue
@@ -1214,7 +1214,7 @@ private final class TriggerConfigurationDetailModel:
         }
         updated = latestDraft
         let actionIndex = try updated.appendControlSet(
-            device: device.addressableName,
+            device: deviceAddressableName,
             control: control.identifier,
             value: value
         )

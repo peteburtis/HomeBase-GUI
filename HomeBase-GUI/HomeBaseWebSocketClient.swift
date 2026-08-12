@@ -204,6 +204,10 @@ actor HomeBaseWebSocketClient {
         try await connect()
     }
 
+    func currentSessionIdentifier() async -> UUID? {
+        sessionID
+    }
+
     private func establishConnection() async throws {
         if sessionID != nil, task != nil {
             return
@@ -758,6 +762,43 @@ actor HomeBaseWebSocketClient {
             Self.logControlWriteFailed(control: control, error: error)
             throw error
         }
+    }
+
+    func holdControl(
+        _ control: String,
+        at value: HBJSONValue,
+        transitionSeconds: TimeInterval? = nil,
+        priority: Int? = nil,
+        lifetime: HBControlHoldLifetime? = nil
+    ) async throws -> HBControlHoldResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.holdControl,
+            payload: HBControlHoldRequest(
+                control: control,
+                value: value,
+                transitionSeconds: transitionSeconds,
+                priority: priority,
+                lifetime: lifetime
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        return try body.decodedResult(as: HBControlHoldResult.self)
+    }
+
+    func releaseControlHold(token: String) async throws
+        -> HBControlReleaseResult
+    {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.releaseControl,
+            payload: HBControlReleaseRequest(
+                token: token,
+                allClients: false
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        return try body.decodedResult(as: HBControlReleaseResult.self)
     }
 
     func deviceDetails(

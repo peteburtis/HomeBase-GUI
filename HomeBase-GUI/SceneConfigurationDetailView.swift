@@ -112,12 +112,15 @@ struct SceneConfigurationDetailView: View {
                             .accessibilityLabel(
                                 model.isDeleting
                                     ? "Deleting scene"
-                                    : "Saving scene"
+                                    : model.isUpdatingLiveEditing
+                                        ? "Updating live editing"
+                                        : "Saving scene"
                             )
                     } else {
                         Button {
                             Task {
-                                if await model.saveIfNeeded() {
+                                if await model.saveIfNeeded(),
+                                   await model.stopLiveEditingForExit() {
                                     dismiss()
                                 }
                             }
@@ -144,9 +147,9 @@ struct SceneConfigurationDetailView: View {
             controlRepository: repository,
             excludedControlPaths: model.configuredControlPaths,
             configurationKind: "scene",
-            addControlSet: { device, control, valueSource in
+            addControlSet: { deviceAddressableName, control, valueSource in
                 let index = try await model.addControlSet(
-                    device: device,
+                    deviceAddressableName: deviceAddressableName,
                     control: control,
                     valueSource: valueSource
                 )
@@ -177,7 +180,11 @@ struct SceneConfigurationDetailView: View {
         if model.hasChangesToDiscard {
             model.confirmDiscardAndClose()
         } else {
-            dismiss()
+            Task {
+                if await model.stopLiveEditingForExit() {
+                    dismiss()
+                }
+            }
         }
     }
 
@@ -200,7 +207,11 @@ struct SceneConfigurationDetailView: View {
                 title: Text(alert.title),
                 message: Text(alert.message),
                 primaryButton: .destructive(Text("Discard Changes")) {
-                    dismiss()
+                    Task {
+                        if await model.stopLiveEditingForExit() {
+                            dismiss()
+                        }
+                    }
                 },
                 secondaryButton: .cancel(Text("Keep Editing"))
             )
@@ -211,7 +222,8 @@ struct SceneConfigurationDetailView: View {
                 message: Text(alert.message),
                 primaryButton: .destructive(Text("Delete Scene")) {
                     Task {
-                        if await model.deleteScene() {
+                        if await model.stopLiveEditingForExit(),
+                           await model.deleteScene() {
                             dismiss()
                         }
                     }
@@ -264,6 +276,42 @@ private struct SceneConfigurationContents: View {
         ScrollViewReader { scrollProxy in
             List {
                 if let scene = model.scene {
+                    Section {
+                        Toggle(
+                            "Live Editing",
+                            isOn: Binding(
+                                get: { model.isLiveEditing },
+                                set: { enabled in
+                                    Task {
+                                        await model.setLiveEditingEnabled(
+                                            enabled
+                                        )
+                                    }
+                                }
+                            )
+                        )
+                        .disabled(!model.canToggleLiveEditing)
+
+                        if model.isUpdatingLiveEditing {
+                            HStack(spacing: 10) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Updating the live preview…")
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else {
+                            Text(
+                                model.isLiveEditing
+                                    ? "Control changes are temporarily applied at P-User. Saving, canceling, or turning this off returns the home to its underlying state."
+                                    : "Preview this scene while editing. Control changes apply immediately; transitions and other action types are not run."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                    } header: {
+                        SceneConfigurationSectionHeader("Preview")
+                    }
+
                     Section {
                         SceneConfigurationEditableTextRow(
                             label: "Identifier",
@@ -688,6 +736,8 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
     @Published private(set) var draft: SceneConfigurationDraft?
     @Published private(set) var isSaving = false
     @Published private(set) var isDeleting = false
+    @Published private(set) var isLiveEditing = false
+    @Published private(set) var isUpdatingLiveEditing = false
     @Published private(set) var saveConfirmation: String?
     @Published private(set) var identifierInput = ""
     @Published private(set) var priorityInput = ""
@@ -696,6 +746,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
 
     private let source: SceneConfigurationEditingSource
     private let repository: SceneConfigurationRepository
+    private let liveEditingSession: SceneLiveEditingSession
     private var resolutions: [Int: AutomationControlResolution] = [:]
     private var loadingCurrentValues: Set<Int> = []
     private var actionErrors: [Int: String] = [:]
@@ -711,6 +762,9 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
     ) {
         self.source = source
         self.repository = repository
+        liveEditingSession = SceneLiveEditingSession(
+            client: repository.client
+        )
 
         guard case .newScene(let suggestedIdentifier) = source else {
             return
@@ -737,7 +791,12 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
     }
 
     var isBusy: Bool {
-        isSaving || isDeleting
+        isSaving || isDeleting || isUpdatingLiveEditing
+    }
+
+    var canToggleLiveEditing: Bool {
+        state == .loaded && !isSaving && !isDeleting
+            && !isUpdatingLiveEditing
     }
 
     var isDirty: Bool {
@@ -899,6 +958,72 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         await forceReload()
     }
 
+    func setLiveEditingEnabled(_ enabled: Bool) async {
+        guard state == .loaded,
+              !isSaving,
+              !isDeleting,
+              !isUpdatingLiveEditing,
+              enabled != isLiveEditing else {
+            return
+        }
+
+        if !enabled {
+            _ = await stopLiveEditingForExit()
+            return
+        }
+
+        isUpdatingLiveEditing = true
+        defer { isUpdatingLiveEditing = false }
+
+        do {
+            try await liveEditingSession.start(
+                targets: liveEditingTargets
+            )
+            isLiveEditing = true
+        } catch is CancellationError {
+            await recoverFromLiveEditingFailure(
+                title: "Live Editing Was Interrupted",
+                error: CancellationError()
+            )
+        } catch {
+            await recoverFromLiveEditingFailure(
+                title: "Live Editing Could Not Start",
+                error: error
+            )
+        }
+    }
+
+    func stopLiveEditingForExit() async -> Bool {
+        guard !isUpdatingLiveEditing else { return false }
+        let sessionIsActive = await liveEditingSession.isActive()
+        let hasOutstandingHolds =
+            await liveEditingSession.hasOutstandingHolds()
+        guard isLiveEditing || sessionIsActive || hasOutstandingHolds else {
+            return true
+        }
+
+        isUpdatingLiveEditing = true
+        defer { isUpdatingLiveEditing = false }
+
+        do {
+            try await liveEditingSession.stop()
+            isLiveEditing = false
+            return true
+        } catch is CancellationError {
+            isLiveEditing = true
+            return false
+        } catch {
+            isLiveEditing = true
+            presentedAlert = SceneEditorAlert(
+                kind: .message,
+                title: "Live Editing Could Not Stop",
+                message:
+                    "HomeBase could not release every temporary scene hold. The editor will remain open so you can try again. \(error.localizedDescription)"
+            )
+            return false
+        }
+    }
+
     func confirmDiscardAndClose() {
         guard !isBusy else { return }
         presentedAlert = SceneEditorAlert(
@@ -947,6 +1072,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
               case .existing(let sceneName) = source else {
             return
         }
+        guard await stopLiveEditingForExit() else { return }
         state = .loading
         draft = nil
         resolutions = [:]
@@ -1023,6 +1149,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         actionErrors[actionIndex] = nil
         saveConfirmation = nil
         objectWillChange.send()
+        try await reconcileLiveEditingAfterMutation()
     }
 
     func setAction(
@@ -1047,6 +1174,15 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         }
         objectWillChange.send()
 
+        do {
+            try await reconcileLiveEditingAfterMutation()
+        } catch {
+            if needsResolution {
+                await resolveControls()
+            }
+            throw error
+        }
+
         if needsResolution {
             await resolveControls()
         }
@@ -1068,6 +1204,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
             )
             saveConfirmation = nil
             objectWillChange.send()
+            scheduleLiveEditingReconciliation()
         } catch {
             presentedAlert = SceneEditorAlert(
                 kind: .message,
@@ -1092,6 +1229,15 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         }
         objectWillChange.send()
 
+        do {
+            try await reconcileLiveEditingAfterMutation()
+        } catch {
+            if needsResolution {
+                await resolveControls()
+            }
+            throw error
+        }
+
         if needsResolution {
             await resolveControls()
         }
@@ -1114,6 +1260,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
             )
             saveConfirmation = nil
             objectWillChange.send()
+            scheduleLiveEditingReconciliation()
         } catch {
             presentedAlert = SceneEditorAlert(
                 kind: .message,
@@ -1124,7 +1271,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
     }
 
     func addControlSet(
-        device: HBDeviceDescriptor,
+        deviceAddressableName: String,
         control: HBControlDescriptor,
         valueSource: SceneControlSetValueSource
     ) async throws -> Int {
@@ -1133,7 +1280,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         }
 
         let resolved = SceneResolvedControl(
-            device: device,
+            path: "\(deviceAddressableName):\(control.identifier)",
             descriptor: control
         )
         guard !configuredControlPaths.contains(
@@ -1168,7 +1315,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         }
         updated = latestDraft
         let actionIndex = try updated.appendControlSet(
-            device: device.addressableName,
+            device: deviceAddressableName,
             control: control.identifier,
             value: value
         )
@@ -1178,6 +1325,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         actionErrors[actionIndex] = nil
         saveConfirmation = nil
         objectWillChange.send()
+        try await reconcileLiveEditingAfterMutation()
         return actionIndex
     }
 
@@ -1327,6 +1475,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
             install(restored, retainingResolutions: true)
             pendingRecovery = nil
             saveConfirmation = "Original file restored and reloaded"
+            try? await reconcileLiveEditingAfterMutation()
         } catch let error as SceneConfigurationSaveError {
             if case .conflict = error {
                 presentedAlert = conflictAlert(message: error.localizedDescription)
@@ -1360,6 +1509,72 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
 
     func actionError(for actionIndex: Int) -> String? {
         actionErrors[actionIndex]
+    }
+
+    private var liveEditingTargets: [SceneLiveEditingTarget] {
+        SceneLiveEditingTarget.targets(for: scene?.actions ?? [])
+    }
+
+    private func reconcileLiveEditingAfterMutation() async throws {
+        guard isLiveEditing else { return }
+        isUpdatingLiveEditing = true
+        defer { isUpdatingLiveEditing = false }
+
+        do {
+            try await liveEditingSession.reconcile(
+                targets: liveEditingTargets
+            )
+        } catch {
+            await recoverFromLiveEditingFailure(
+                title: "Live Editing Stopped",
+                error: error
+            )
+            throw error
+        }
+    }
+
+    private func scheduleLiveEditingReconciliation() {
+        guard isLiveEditing, !isUpdatingLiveEditing else { return }
+        isUpdatingLiveEditing = true
+
+        Task { [weak self] in
+            guard let self else { return }
+            defer { isUpdatingLiveEditing = false }
+            do {
+                try await liveEditingSession.reconcile(
+                    targets: liveEditingTargets
+                )
+            } catch {
+                await recoverFromLiveEditingFailure(
+                    title: "Live Editing Stopped",
+                    error: error
+                )
+            }
+        }
+    }
+
+    private func recoverFromLiveEditingFailure(
+        title: String,
+        error: Error
+    ) async {
+        do {
+            try await liveEditingSession.stop()
+            isLiveEditing = false
+            presentedAlert = SceneEditorAlert(
+                kind: .message,
+                title: title,
+                message:
+                    "The live preview could not be updated, so its temporary holds were released. \(error.localizedDescription)"
+            )
+        } catch let cleanupError {
+            isLiveEditing = true
+            presentedAlert = SceneEditorAlert(
+                kind: .message,
+                title: "Live Editing Needs Attention",
+                message:
+                    "The live preview failed and HomeBase could not release every temporary hold. Keep this editor open and try turning Live Editing off again. Preview error: \(error.localizedDescription) Cleanup error: \(cleanupError.localizedDescription)"
+            )
+        }
     }
 
     private func validatedCurrentValue(

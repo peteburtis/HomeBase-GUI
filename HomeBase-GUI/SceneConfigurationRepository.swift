@@ -6,8 +6,21 @@
 import Foundation
 import HomeBaseProtocol
 
-protocol SceneConfigurationRemoteClient: Sendable {
+protocol SceneLiveEditingRemoteClient: Sendable {
     func reactivate() async throws
+    func currentSessionIdentifier() async -> UUID?
+    func holdControl(
+        _ control: String,
+        at value: HBJSONValue,
+        transitionSeconds: TimeInterval?,
+        priority: Int?,
+        lifetime: HBControlHoldLifetime?
+    ) async throws -> HBControlHoldResult
+    func releaseControlHold(token: String) async throws
+        -> HBControlReleaseResult
+}
+
+protocol SceneConfigurationRemoteClient: SceneLiveEditingRemoteClient {
     func listTopology() async throws -> HBTopologyListResult
     func listConfigurationFiles(
         at path: String?

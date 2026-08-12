@@ -301,9 +301,9 @@ private struct ControlSetActionPlugin:
             repository: operations.controlRepository,
             excludedControlPaths: operations.excludedControlPaths,
             configurationKind: operations.configurationKind
-        ) { device, control, valueSource in
+        ) { deviceAddressableName, control, valueSource in
             _ = try await operations.addControlSet(
-                device: device,
+                deviceAddressableName: deviceAddressableName,
                 control: control,
                 valueSource: valueSource
             )

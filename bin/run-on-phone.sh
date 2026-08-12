@@ -18,6 +18,7 @@ DYNAMIC_PORTS="${HOMEBASE_COREDEVICE_PORTS:-55000-59000}"
 LOCAL_CONTROL_PORT="${HOMEBASE_COREDEVICE_LOCAL_PORT:-49151}"
 BONJOUR_STATE_DIRECTORY="${HOMEBASE_BONJOUR_STATE_DIR:-${REPOSITORY_ROOT}/.build/CoreDeviceVPN}"
 DRY_RUN=false
+ATTACH_CONSOLE=false
 
 log() {
     print -r -- "==> $*"
@@ -33,7 +34,7 @@ usage() {
 Build, install, and launch HomeBase GUI on a physical iPhone.
 
 Usage:
-  bin/run-on-phone.sh [--device <name-or-id>] [--dry-run]
+  bin/run-on-phone.sh [--device <name-or-id>] [--dry-run] [--console]
                       [--no-vpn-discovery]
 
 Options:
@@ -42,6 +43,8 @@ Options:
                          physical iPhone, sorted by name.
   --dry-run              Discover the iPhone and print what would run without
                          building or installing anything.
+  --console              Attach to the launched app's console and wait until
+                         the app exits. Useful for reproducing crashes.
   --no-vpn-discovery     Do not publish and relay the cached CoreDevice Bonjour
                          service through the iPhone's VPN address.
   -h, --help             Show this help.
@@ -72,6 +75,10 @@ while (( $# > 0 )); do
             ;;
         --dry-run)
             DRY_RUN=true
+            shift
+            ;;
+        --console)
+            ATTACH_CONSOLE=true
             shift
             ;;
         --no-vpn-discovery)
@@ -538,9 +545,17 @@ xcrun devicectl device install app \
     "$APP_BUNDLE"
 
 log "Launching ${BUNDLE_IDENTIFIER} on ${device_name}"
-xcrun devicectl device process launch \
-    --device "$device_identifier" \
-    --terminate-existing \
-    "$BUNDLE_IDENTIFIER"
+if $ATTACH_CONSOLE; then
+    xcrun devicectl device process launch \
+        --device "$device_identifier" \
+        --terminate-existing \
+        --console \
+        "$BUNDLE_IDENTIFIER"
+else
+    xcrun devicectl device process launch \
+        --device "$device_identifier" \
+        --terminate-existing \
+        "$BUNDLE_IDENTIFIER"
+fi
 
 log "HomeBase GUI is running on ${device_name}"

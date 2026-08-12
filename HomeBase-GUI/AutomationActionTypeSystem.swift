@@ -192,24 +192,29 @@ struct AutomationActionCreationOperations {
     let excludedControlPaths: Set<String>
     let configurationKind: String
 
-    private let addControlSetImplementation: (
-        HBDeviceDescriptor,
+    // These callbacks mutate editor models. Preserve their actor contract
+    // through type erasure so Swift does not synthesize an `Actor?` argument
+    // reabstraction thunk between the picker and the model.
+    private let addControlSetImplementation: @MainActor @Sendable (
+        String,
         HBControlDescriptor,
         SceneControlSetValueSource
     ) async throws -> Int
     private let appendActionImplementation:
-        (HBJSONValue) async throws -> Int
+        @MainActor @Sendable (HBJSONValue) async throws -> Int
 
     init<Repository: AutomationControlRepository>(
         controlRepository: Repository,
         excludedControlPaths: Set<String>,
         configurationKind: String,
-        addControlSet: @escaping (
-            HBDeviceDescriptor,
+        addControlSet: @escaping @MainActor @Sendable (
+            String,
             HBControlDescriptor,
             SceneControlSetValueSource
         ) async throws -> Int,
-        appendAction: @escaping (HBJSONValue) async throws -> Int
+        appendAction: @escaping @MainActor @Sendable (
+            HBJSONValue
+        ) async throws -> Int
     ) {
         self.controlRepository = AnyAutomationControlRepository(
             controlRepository
@@ -221,11 +226,15 @@ struct AutomationActionCreationOperations {
     }
 
     func addControlSet(
-        device: HBDeviceDescriptor,
+        deviceAddressableName: String,
         control: HBControlDescriptor,
         valueSource: SceneControlSetValueSource
     ) async throws -> Int {
-        try await addControlSetImplementation(device, control, valueSource)
+        try await addControlSetImplementation(
+            deviceAddressableName,
+            control,
+            valueSource
+        )
     }
 
     func appendAction(_ rawValue: HBJSONValue) async throws -> Int {

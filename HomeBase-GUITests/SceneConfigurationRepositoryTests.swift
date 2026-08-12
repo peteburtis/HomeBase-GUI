@@ -758,6 +758,7 @@ private final class SceneConfigurationRemoteClientSpy:
     let controlResult: HBControlGetResult?
     let deviceListResult: HBDeviceListResult?
     let topologyResult: HBTopologyListResult
+    private var nextHoldToken = 1
 
     init(
         files: [String: String],
@@ -783,6 +784,34 @@ private final class SceneConfigurationRemoteClientSpy:
 
     func reactivate() async throws {
         events.append("reactivate")
+    }
+
+    func currentSessionIdentifier() async -> UUID? {
+        UUID(uuidString: "00000000-0000-0000-0000-000000000001")
+    }
+
+    func holdControl(
+        _ control: String,
+        at value: HBJSONValue,
+        transitionSeconds: TimeInterval?,
+        priority: Int?,
+        lifetime: HBControlHoldLifetime?
+    ) async throws -> HBControlHoldResult {
+        let token = "hold-\(nextHoldToken)"
+        nextHoldToken += 1
+        events.append("hold:\(control):\(token)")
+        return HBControlHoldResult(
+            token: token,
+            control: control,
+            value: value
+        )
+    }
+
+    func releaseControlHold(token: String) async throws
+        -> HBControlReleaseResult
+    {
+        events.append("release:\(token)")
+        return HBControlReleaseResult(releasedCount: 1)
     }
 
     func listTopology() async throws -> HBTopologyListResult {

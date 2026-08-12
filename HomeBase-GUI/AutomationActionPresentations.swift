@@ -804,8 +804,8 @@ private func sequenceSetDetail(_ payload: HBJSONValue) -> String? {
 }
 
 enum AutomationPresentationFormat {
-    static let userPriority = Int64(Int32.max)
-    static let userPriorityLabel = "P-User"
+    nonisolated static let userPriority = Int64(Int32.max)
+    nonisolated static let userPriorityLabel = "P-User"
 
     static func priority(_ value: HBJSONValue) -> String {
         guard let number = exactInteger(value) else {

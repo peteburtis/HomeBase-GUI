@@ -392,18 +392,25 @@ struct SceneControlPickerCatalog {
     }
 }
 
-private typealias SceneControlPickerChoose = (
-    HBDeviceDescriptor,
+private typealias SceneControlPickerChoose = @MainActor @Sendable (
+    String,
     HBControlDescriptor,
     SceneControlSetValueSource
 ) -> Void
 
-private typealias SceneControlPickerChooseRawValue = (
-    HBDeviceDescriptor,
+private typealias SceneControlPickerChooseRawValue = @MainActor @Sendable (
+    String,
     HBControlDescriptor,
     HBJSONValue
 ) async throws -> Void
 
+private struct SceneControlPickerSelection: Sendable {
+    let deviceAddressableName: String
+    let control: HBControlDescriptor
+    let valueSource: SceneControlSetValueSource
+}
+
+@MainActor
 struct SceneControlPickerView<Repository: AutomationControlRepository>: View {
     private struct PresentedError: Identifiable {
         let id = UUID()
@@ -417,8 +424,8 @@ struct SceneControlPickerView<Repository: AutomationControlRepository>: View {
     let configurationKind: String
     let excludedControlPaths: Set<String>
     let onSelect:
-        (
-            HBDeviceDescriptor,
+        @MainActor @Sendable (
+            String,
             HBControlDescriptor,
             SceneControlSetValueSource
         ) async throws -> Void
@@ -427,8 +434,8 @@ struct SceneControlPickerView<Repository: AutomationControlRepository>: View {
         repository: Repository,
         excludedControlPaths: Set<String>,
         configurationKind: String = "scene",
-        onSelect: @escaping (
-            HBDeviceDescriptor,
+        onSelect: @escaping @MainActor @Sendable (
+            String,
             HBControlDescriptor,
             SceneControlSetValueSource
         ) async throws -> Void
@@ -540,17 +547,19 @@ struct SceneControlPickerView<Repository: AutomationControlRepository>: View {
     }
 
     private func choose(
-        device: HBDeviceDescriptor,
+        deviceAddressableName: String,
         control: HBControlDescriptor,
         valueSource: SceneControlSetValueSource
     ) {
-        Task {
+        let selection = SceneControlPickerSelection(
+            deviceAddressableName: deviceAddressableName,
+            control: control,
+            valueSource: valueSource
+        )
+
+        Task { @MainActor [selection] in
             do {
-                try await submit(
-                    device: device,
-                    control: control,
-                    valueSource: valueSource
-                )
+                try await submit(selection: selection)
                 dismiss()
             } catch is CancellationError {
                 return
@@ -564,12 +573,12 @@ struct SceneControlPickerView<Repository: AutomationControlRepository>: View {
     }
 
     private func chooseRawValue(
-        device: HBDeviceDescriptor,
+        deviceAddressableName: String,
         control: HBControlDescriptor,
         value: HBJSONValue
     ) async throws {
         try await submit(
-            device: device,
+            deviceAddressableName: deviceAddressableName,
             control: control,
             valueSource: .explicit(value)
         )
@@ -577,15 +586,26 @@ struct SceneControlPickerView<Repository: AutomationControlRepository>: View {
     }
 
     private func submit(
-        device: HBDeviceDescriptor,
+        selection: SceneControlPickerSelection
+    ) async throws {
+        try await submit(
+            deviceAddressableName: selection.deviceAddressableName,
+            control: selection.control,
+            valueSource: selection.valueSource
+        )
+        withExtendedLifetime(selection) {}
+    }
+
+    private func submit(
+        deviceAddressableName: String,
         control: HBControlDescriptor,
         valueSource: SceneControlSetValueSource
     ) async throws {
-        let path = "\(device.addressableName):\(control.identifier)"
+        let path = "\(deviceAddressableName):\(control.identifier)"
         guard submittingPath == nil else { throw CancellationError() }
         submittingPath = path
         defer { submittingPath = nil }
-        try await onSelect(device, control, valueSource)
+        try await onSelect(deviceAddressableName, control, valueSource)
     }
 }
 
@@ -704,7 +724,8 @@ private struct SceneControlPickerGroupView: View {
         List {
             if let controlDevice = catalog.controlDevice(for: group) {
                 SceneControlPickerControlSections(
-                    device: controlDevice.descriptor,
+                    deviceAddressableName:
+                        controlDevice.descriptor.addressableName,
                     supportedControls: controlDevice.supportedControls,
                     otherWritableControls:
                         controlDevice.otherWritableControls,
@@ -771,23 +792,13 @@ private struct SceneControlPickerControlList: View {
     let supportedControls: [HBControlDescriptor]
     let otherWritableControls: [HBControlDescriptor]
     let submittingPath: String?
-    let choose:
-        (
-            HBDeviceDescriptor,
-            HBControlDescriptor,
-            SceneControlSetValueSource
-        ) -> Void
-    let chooseRawValue:
-        (
-            HBDeviceDescriptor,
-            HBControlDescriptor,
-            HBJSONValue
-        ) async throws -> Void
+    let choose: SceneControlPickerChoose
+    let chooseRawValue: SceneControlPickerChooseRawValue
 
     var body: some View {
         List {
             SceneControlPickerControlSections(
-                device: device,
+                deviceAddressableName: device.addressableName,
                 supportedControls: supportedControls,
                 otherWritableControls: otherWritableControls,
                 submittingPath: submittingPath,
@@ -803,7 +814,7 @@ private struct SceneControlPickerControlList: View {
 }
 
 private struct SceneControlPickerControlSections: View {
-    let device: HBDeviceDescriptor
+    let deviceAddressableName: String
     let supportedControls: [HBControlDescriptor]
     let otherWritableControls: [HBControlDescriptor]
     let submittingPath: String?
@@ -826,7 +837,7 @@ private struct SceneControlPickerControlSections: View {
                     ForEach(supportedControls, id: \.identifier) { control in
                         Button {
                             choose(
-                                device,
+                                deviceAddressableName,
                                 control,
                                 .currentPresentation
                             )
@@ -855,7 +866,7 @@ private struct SceneControlPickerControlSections: View {
                                     actionLabel: "Add"
                                 ) { value in
                                     try await chooseRawValue(
-                                        device,
+                                        deviceAddressableName,
                                         control,
                                         value
                                     )
@@ -895,7 +906,7 @@ private struct SceneControlPickerControlSections: View {
     }
 
     private func controlPath(_ control: HBControlDescriptor) -> String {
-        "\(device.addressableName):\(control.identifier)"
+        "\(deviceAddressableName):\(control.identifier)"
     }
 
     private func controlLabel(
