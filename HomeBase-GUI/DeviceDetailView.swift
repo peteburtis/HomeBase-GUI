@@ -276,7 +276,16 @@ final class LiveDeviceControlsModel: ObservableObject {
                 }
             )
 
-            let subscription = try await client.subscribe(to: device)
+            // Interactive controls present the engine's authoritative target.
+            // This makes writes through a derived peer (for example,
+            // BinarySwitch -> MultilevelSwitch) update every widget in the
+            // device immediately, without pretending that provider feedback
+            // has already arrived. The Advanced screen remains observed-state
+            // based for physical diagnostics.
+            let subscription = try await client.subscribe(
+                to: device,
+                projection: .model
+            )
             if Task.isCancelled {
                 try? await client.cancelSubscription(
                     subscription.identifier
@@ -408,7 +417,8 @@ final class LiveDeviceControlsModel: ObservableObject {
                 do {
                     try await client.reactivate()
                     let subscription = try await client.subscribe(
-                        to: subscriptionDevice
+                        to: subscriptionDevice,
+                        projection: .model
                     )
                     subscriptionID = subscription.identifier
 

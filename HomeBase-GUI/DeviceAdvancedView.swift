@@ -524,7 +524,8 @@ private final class DeviceAdvancedModel: ObservableObject {
 
             let controlSubscription = try await client.subscribe(
                 to: device,
-                includeCompatibility: true
+                includeCompatibility: true,
+                projection: .observed
             )
             if Task.isCancelled {
                 try? await client.cancelSubscription(

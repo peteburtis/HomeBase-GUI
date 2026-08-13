@@ -946,7 +946,8 @@ actor HomeBaseWebSocketClient {
 
     func subscribe(
         to device: HBTopologyDeviceDescriptor,
-        includeCompatibility: Bool = false
+        includeCompatibility: Bool = false,
+        projection: HBControlStateProjection = .observed
     ) async throws -> ControlSubscription {
         let request = try sessionRequest(
             operation: HBProtocolOperations.streamControls,
@@ -958,7 +959,8 @@ actor HomeBaseWebSocketClient {
                     )
                 ],
                 includeCompatibility: includeCompatibility,
-                heartbeatSeconds: 30
+                heartbeatSeconds: 30,
+                projection: projection
             )
         )
         let response = try await sendRequest(request)
