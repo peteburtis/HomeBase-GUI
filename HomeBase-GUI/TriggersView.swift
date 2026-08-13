@@ -34,7 +34,10 @@ struct TriggersView: View {
                 if !activeTriggers.isEmpty {
                     Section {
                         ForEach(activeTriggers, id: \.name) { trigger in
-                            triggerRow(trigger)
+                            triggerRow(
+                                trigger,
+                                firedAt: model.recentFireDate(for: trigger.name)
+                            )
                         }
                     } header: {
                         Text("Active & Satisfied")
@@ -44,7 +47,10 @@ struct TriggersView: View {
                 if !inactiveTriggers.isEmpty {
                     Section {
                         ForEach(inactiveTriggers, id: \.name) { trigger in
-                            triggerRow(trigger)
+                            triggerRow(
+                                trigger,
+                                firedAt: model.recentFireDate(for: trigger.name)
+                            )
                         }
                     } header: {
                         Text("Inactive")
@@ -123,14 +129,17 @@ struct TriggersView: View {
     }
 
     @ViewBuilder
-    private func triggerRow(_ trigger: HBTriggerSummaryDescriptor) -> some View {
+    private func triggerRow(
+        _ trigger: HBTriggerSummaryDescriptor,
+        firedAt: Date?
+    ) -> some View {
         NavigationLink {
             TriggerOverviewView(
                 triggerName: trigger.name,
                 client: client
             )
         } label: {
-            TriggerRowLabel(trigger: trigger)
+            TriggerRowLabel(trigger: trigger, firedAt: firedAt)
         }
         .id(trigger.name)
     }
@@ -201,7 +210,12 @@ private struct HiddenTriggersView: View {
                                 client: client
                             )
                         } label: {
-                            TriggerRowLabel(trigger: trigger)
+                            TriggerRowLabel(
+                                trigger: trigger,
+                                firedAt: model.recentFireDate(
+                                    for: trigger.name
+                                )
+                            )
                         }
                         .id(trigger.name)
                     }
@@ -255,6 +269,7 @@ private struct HiddenTriggersView: View {
 
 private struct TriggerRowLabel: View {
     let trigger: HBTriggerSummaryDescriptor
+    let firedAt: Date?
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
@@ -268,7 +283,7 @@ private struct TriggerRowLabel: View {
 
             Spacer(minLength: 8)
 
-            TriggerStatusAccessory(trigger: trigger)
+            TriggerStatusAccessory(trigger: trigger, firedAt: firedAt)
         }
         .accessibilityElement(children: .combine)
     }
@@ -291,26 +306,32 @@ private struct TriggerRowLabel: View {
 
 private struct TriggerStatusAccessory: View {
     let trigger: HBTriggerSummaryDescriptor
+    let firedAt: Date?
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 5)) { context in
-            VStack(alignment: .trailing, spacing: 4) {
+        VStack(alignment: .trailing, spacing: 4) {
+            ZStack {
                 Image(systemName: statusSystemImage)
                     .font(.system(size: 30, weight: .regular))
                     .frame(width: 32, height: 32)
-                    .foregroundStyle(statusStyle(at: context.date))
+                    .foregroundStyle(statusStyle)
                     .accessibilityLabel(statusAccessibilityLabel)
 
-                if !trigger.valid {
-                    Label(
-                        "Invalid",
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
-                    .foregroundStyle(.red)
+                if let firedAt, trigger.state != .active,
+                   trigger.enabled, trigger.schedulerRunning {
+                    TriggerFiredPulse(firedAt: firedAt)
                 }
             }
-            .font(.caption)
+
+            if !trigger.valid {
+                Label(
+                    "Invalid",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .foregroundStyle(.red)
+            }
         }
+        .font(.caption)
     }
 
     private var statusAccessibilityLabel: String {
@@ -347,28 +368,54 @@ private struct TriggerStatusAccessory: View {
         }
     }
 
-    private func statusStyle(at date: Date) -> AnyShapeStyle {
+    private var statusStyle: AnyShapeStyle {
         if !trigger.enabled {
             return AnyShapeStyle(.secondary)
         }
         if !trigger.schedulerRunning {
-            return AnyShapeStyle(Color.orange)
+            return AnyShapeStyle(.secondary)
         }
         switch trigger.state {
         case .inactive:
             return AnyShapeStyle(.tertiary)
         case .satisfied:
-            return AnyShapeStyle(
-                firedWithinLastMinute(at: date) ? Color.green : Color.orange
-            )
+            return AnyShapeStyle(Color.green)
         case .active:
             return AnyShapeStyle(Color.green)
         }
     }
+}
 
-    private func firedWithinLastMinute(at date: Date) -> Bool {
-        guard let lastFiredAt = trigger.lastFiredAt else { return false }
-        return (0...60).contains(date.timeIntervalSince(lastFiredAt))
+private struct TriggerFiredPulse: View {
+    let firedAt: Date
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 30, weight: .regular))
+                .frame(width: 32, height: 32)
+                .foregroundStyle(Color.green)
+                .opacity(
+                    TriggerFiredPulsePresentation.opacity(
+                        elapsed: context.date.timeIntervalSince(firedAt)
+                    )
+                )
+                .accessibilityHidden(true)
+        }
+    }
+}
+
+enum TriggerFiredPulsePresentation {
+    static let fadeInDuration: TimeInterval = 0.15
+    static let totalDuration: TimeInterval = 5
+
+    static func opacity(elapsed: TimeInterval) -> Double {
+        guard elapsed >= 0, elapsed < totalDuration else { return 0 }
+        if elapsed < fadeInDuration {
+            return elapsed / fadeInDuration
+        }
+        return 1 - (elapsed - fadeInDuration)
+            / (totalDuration - fadeInDuration)
     }
 }
 
@@ -383,10 +430,12 @@ private final class ServerTriggersModel: ObservableObject {
 
     @Published private(set) var state: State = .idle
     @Published private(set) var triggers: [HBTriggerSummaryDescriptor] = []
+    @Published private(set) var recentFireDates: [String: Date] = [:]
 
     private let client: HomeBaseWebSocketClient
     private var subscriptionID: UUID?
     private var runGeneration: UUID?
+    private var fireExpirationTasks: [String: Task<Void, Never>] = [:]
 
     init(client: HomeBaseWebSocketClient) {
         self.client = client
@@ -449,6 +498,7 @@ private final class ServerTriggersModel: ObservableObject {
     func stop() async {
         runGeneration = nil
         state = .idle
+        clearRecentFires()
         guard let subscriptionID else { return }
         self.subscriptionID = nil
         try? await client.cancelSubscription(subscriptionID)
@@ -475,6 +525,9 @@ private final class ServerTriggersModel: ObservableObject {
         switch event.kind {
         case .change, .triggerAdded, .fired:
             guard let trigger = event.trigger?.trigger else { return }
+            if event.kind == .fired {
+                recordFire(for: trigger.name)
+            }
             var updated = triggers
             if let index = Self.index(
                 ofTriggerNamed: trigger.name,
@@ -491,6 +544,7 @@ private final class ServerTriggersModel: ObservableObject {
 
         case .triggerRemoved:
             guard let name = event.trigger?.trigger.name else { return }
+            removeRecentFire(for: name)
             var updated = triggers
             updated.removeAll(where: {
                 $0.name.caseInsensitiveCompare(name) == .orderedSame
@@ -502,6 +556,48 @@ private final class ServerTriggersModel: ObservableObject {
         case .heartbeat:
             break
         }
+    }
+
+    func recentFireDate(for triggerName: String) -> Date? {
+        recentFireDates[Self.normalizedName(triggerName)]
+    }
+
+    private func recordFire(for triggerName: String) {
+        let name = Self.normalizedName(triggerName)
+        let firedAt = Date.now
+        fireExpirationTasks[name]?.cancel()
+        recentFireDates[name] = firedAt
+        fireExpirationTasks[name] = Task { [weak self] in
+            do {
+                try await Task.sleep(
+                    for: .seconds(
+                        TriggerFiredPulsePresentation.totalDuration
+                    )
+                )
+            } catch {
+                return
+            }
+            guard let self,
+                  recentFireDates[name] == firedAt else { return }
+            recentFireDates.removeValue(forKey: name)
+            fireExpirationTasks.removeValue(forKey: name)
+        }
+    }
+
+    private func removeRecentFire(for triggerName: String) {
+        let name = Self.normalizedName(triggerName)
+        fireExpirationTasks.removeValue(forKey: name)?.cancel()
+        recentFireDates.removeValue(forKey: name)
+    }
+
+    private func clearRecentFires() {
+        fireExpirationTasks.values.forEach { $0.cancel() }
+        fireExpirationTasks.removeAll()
+        recentFireDates.removeAll()
+    }
+
+    nonisolated private static func normalizedName(_ name: String) -> String {
+        name.lowercased()
     }
 
     private func index(ofTriggerNamed name: String) -> Int? {

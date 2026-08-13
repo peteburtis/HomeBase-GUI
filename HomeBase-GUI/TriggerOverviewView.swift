@@ -110,7 +110,7 @@ struct TriggerOverviewView: View {
                 }
                 if !state.trigger.schedulerRunning {
                     Label("Trigger scheduler is paused", systemImage: "pause.circle")
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(.secondary)
                 }
                 if !state.trigger.valid {
                     Label(
@@ -302,7 +302,7 @@ struct TriggerOverviewCondition: Identifiable, Equatable {
         case .invalid:
             "exclamationmark.circle.fill"
         case .satisfied:
-            "checkmark.circle.fill"
+            "checkmark.circle"
         case .unsatisfied:
             "circle"
         }
