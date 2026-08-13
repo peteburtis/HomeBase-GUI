@@ -593,10 +593,11 @@ private struct AutomationControlSetValueRow: View {
     private func resolvedValue(_ target: SceneResolvedControl) -> some View {
         let presentation = target.presentationContext(
             value: controlSet.value,
-            isEnabled: !context.isBusy
+            isEnabled: context.canEditControlValues
                 && !context.isLoadingCurrentValue(
                     actionIndex: controlSet.actionIndex
                 ),
+            isUpdating: context.isUpdatingControlValues,
             commit: { value, _ in
                 try await context.setControlValue(
                     actionIndex: controlSet.actionIndex,

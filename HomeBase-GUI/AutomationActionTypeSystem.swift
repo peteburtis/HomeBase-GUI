@@ -73,6 +73,8 @@ struct AutomationActionUICapabilities: OptionSet, Equatable, Sendable {
 protocol AutomationActionEditingModel: ObservableObject {
     var isBusy: Bool { get }
     var canMutateStructure: Bool { get }
+    var canEditControlValues: Bool { get }
+    var isUpdatingControlValues: Bool { get }
     var supportsGenericActionMutation: Bool { get }
 
     func controlResolution(for actionIndex: Int) -> AutomationControlResolution
@@ -86,6 +88,8 @@ protocol AutomationActionEditingModel: ObservableObject {
 }
 
 extension AutomationActionEditingModel {
+    var canEditControlValues: Bool { !isBusy }
+    var isUpdatingControlValues: Bool { isBusy }
     var supportsGenericActionMutation: Bool { false }
 
     func setAction(
@@ -103,6 +107,8 @@ struct AutomationActionPresentationContext {
     let action: SceneActionConfiguration
     let isBusy: Bool
     let canMutateStructure: Bool
+    let canEditControlValues: Bool
+    let isUpdatingControlValues: Bool
     let supportsGenericActionMutation: Bool
 
     private let controlResolutionImplementation:
@@ -124,6 +130,8 @@ struct AutomationActionPresentationContext {
         self.action = action
         isBusy = model.isBusy
         canMutateStructure = model.canMutateStructure
+        canEditControlValues = model.canEditControlValues
+        isUpdatingControlValues = model.isUpdatingControlValues
         supportsGenericActionMutation = model.supportsGenericActionMutation
         controlResolutionImplementation = model.controlResolution
         isLoadingCurrentValueImplementation = model.isLoadingCurrentValue

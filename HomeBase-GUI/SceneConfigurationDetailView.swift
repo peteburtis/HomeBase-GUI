@@ -831,6 +831,15 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         state == .loaded && !isBusy && loadingCurrentValues.isEmpty
     }
 
+    var canEditControlValues: Bool {
+        state == .loaded && !isSaving && !isDeleting
+            && loadingCurrentValues.isEmpty
+    }
+
+    var isUpdatingControlValues: Bool {
+        isUpdatingLiveEditing
+    }
+
     var supportsGenericActionMutation: Bool { true }
 
     var showsDeleteAction: Bool {

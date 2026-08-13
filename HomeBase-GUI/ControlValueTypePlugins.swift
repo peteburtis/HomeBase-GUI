@@ -148,13 +148,14 @@ private struct UnitIntervalControlValueBody: View {
             ControlSlider(
                 value: editor.value,
                 range: editor.range,
-                interactionEnabled:
-                    context.interaction.isEnabled
-                        && !context.interaction.isUpdating,
+                // A transient write must not interrupt an active drag. The
+                // slider serializes and coalesces its own writes; isEnabled
+                // still reflects durable availability such as connectivity.
+                interactionEnabled: context.interaction.isEnabled,
                 controlPath: context.controlPath,
                 accessibilityLabel: context.accessibilityLabel,
                 setValue: { value in
-                    try? await context.interaction.commit(
+                    try await context.interaction.commit(
                         .number(value),
                         .inline
                     )
@@ -367,15 +368,25 @@ private struct ControlValueTextReadout: View {
 }
 
 private struct ControlSlider: View {
+    private static var interactiveWriteInterval: Duration {
+        .milliseconds(150)
+    }
+
     let value: Double
     let range: ClosedRange<Double>
     let interactionEnabled: Bool
     let controlPath: String
     let accessibilityLabel: String
-    let setValue: (Double) async -> Void
+    let setValue: (Double) async throws -> Void
 
     @State private var draftValue: Double
     @State private var isEditing = false
+    @State private var pendingInteractiveWrite: Double?
+    @State private var interactiveWriteTask: Task<Void, Never>?
+    @State private var interactiveWriteGeneration: UUID?
+    @State private var pendingWrite: Double?
+    @State private var activeWrite: Double?
+    @State private var deferredExternalValue: Double?
 
     init(
         value: Double,
@@ -383,7 +394,7 @@ private struct ControlSlider: View {
         interactionEnabled: Bool,
         controlPath: String,
         accessibilityLabel: String,
-        setValue: @escaping (Double) async -> Void
+        setValue: @escaping (Double) async throws -> Void
     ) {
         self.value = value
         self.range = range
@@ -396,37 +407,125 @@ private struct ControlSlider: View {
 
     var body: some View {
         Slider(
-            value: $draftValue,
+            value: Binding(
+                get: { draftValue },
+                set: { requestedValue in
+                    let requestedValue = requestedValue.clamped(to: range)
+                    draftValue = requestedValue
+                    guard isEditing, interactionEnabled else { return }
+                    scheduleInteractiveWrite(requestedValue)
+                }
+            ),
             in: range,
             onEditingChanged: { editing in
                 if editing {
+                    deferredExternalValue = nil
                     isEditing = true
                     return
                 }
 
                 isEditing = false
                 let requestedValue = draftValue.clamped(to: range)
+                interactiveWriteTask?.cancel()
+                interactiveWriteTask = nil
+                interactiveWriteGeneration = nil
+                pendingInteractiveWrite = nil
                 guard interactionEnabled,
-                      requestedValue != value else {
+                      requestedValue != value
+                        || activeWrite != nil
+                        || pendingWrite != nil else {
                     return
                 }
-                Task {
-                    ControlWriteDiagnostics.logNumeric(
-                        stage: "slider-ui",
-                        control: controlPath,
-                        value: requestedValue
-                    )
-                    await setValue(requestedValue)
-                }
+                enqueue(requestedValue)
             }
         )
         .frame(minWidth: 120, idealWidth: 160, maxWidth: 200)
         .disabled(!interactionEnabled)
         .accessibilityLabel(accessibilityLabel)
         .onChange(of: value) { _, updatedValue in
-            guard !isEditing else { return }
-            draftValue = updatedValue.clamped(to: range)
+            let updatedValue = updatedValue.clamped(to: range)
+            guard !ownsPresentedValue else {
+                deferredExternalValue = updatedValue
+                return
+            }
+            deferredExternalValue = nil
+            draftValue = updatedValue
         }
+        .onDisappear {
+            interactiveWriteTask?.cancel()
+            interactiveWriteTask = nil
+            interactiveWriteGeneration = nil
+        }
+    }
+
+    private func scheduleInteractiveWrite(_ value: Double) {
+        pendingInteractiveWrite = value
+        guard interactiveWriteTask == nil else { return }
+
+        let generation = UUID()
+        interactiveWriteGeneration = generation
+        interactiveWriteTask = Task { @MainActor in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: Self.interactiveWriteInterval)
+                } catch {
+                    break
+                }
+                guard let nextValue = pendingInteractiveWrite else { break }
+                pendingInteractiveWrite = nil
+                enqueue(nextValue)
+            }
+            if interactiveWriteGeneration == generation {
+                interactiveWriteTask = nil
+                interactiveWriteGeneration = nil
+            }
+        }
+    }
+
+    /// Serializes writes and retains only the newest value while one is in
+    /// flight. This bounds traffic without allowing an old response to win
+    /// over a later finger position.
+    private func enqueue(_ value: Double) {
+        guard value != activeWrite || pendingWrite != nil else { return }
+        pendingWrite = value
+        guard activeWrite == nil else { return }
+
+        Task { @MainActor in
+            while let nextValue = pendingWrite {
+                pendingWrite = nil
+                activeWrite = nextValue
+                ControlWriteDiagnostics.logNumeric(
+                    stage: "slider-ui",
+                    control: controlPath,
+                    value: nextValue
+                )
+                do {
+                    try await setValue(nextValue)
+                } catch {
+                    // The source adapter owns error presentation. If the last
+                    // queued write failed, return to the newest authoritative
+                    // value that arrived while the interaction owned the
+                    // thumb instead of leaving a value that was never set.
+                    if pendingWrite == nil,
+                       !isEditing,
+                       let deferredExternalValue {
+                        draftValue = deferredExternalValue
+                    }
+                }
+                activeWrite = nil
+            }
+
+            // Successful local writes are authoritative for this interaction.
+            // Discard their deferred echoes; a genuinely later engine update
+            // will arrive after ownership ends and update the thumb normally.
+            if !isEditing {
+                deferredExternalValue = nil
+            }
+        }
+    }
+
+    private var ownsPresentedValue: Bool {
+        isEditing || activeWrite != nil || pendingWrite != nil
     }
 }
 

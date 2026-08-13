@@ -90,20 +90,44 @@ extension LiveDeviceControl {
 /// control today; scene-file drafts can construct the same presentation
 /// context without depending on `LiveDeviceControl`.
 struct ControlValueView: View {
+    private static let activityIndicatorDelay: Duration = .milliseconds(500)
+
     let control: LiveDeviceControl
     let interactionEnabled: Bool
     let setValue:
         (HBJSONValue, ControlValueCommitOrigin) async throws -> Void
     let values: () -> AsyncThrowingStream<ControlValueObservation, Error>
 
+    @State private var showsActivityIndicator = false
+
     var body: some View {
         HStack(spacing: 8) {
-            ControlValuePluginView(context: context)
-
-            if control.isUpdating {
+            // Keep a permanent slot for write feedback. Conditionally adding
+            // this view changes the slider's available width and makes its
+            // thumb move underneath a stationary finger. Leading placement
+            // also leaves the control itself aligned to the natural trailing
+            // margin of the row.
+            ZStack {
                 ProgressView()
                     .controlSize(.small)
+                    .opacity(showsActivityIndicator ? 1 : 0)
             }
+            .frame(width: 16, height: 16)
+            .accessibilityHidden(!showsActivityIndicator)
+
+            ControlValuePluginView(context: context)
+        }
+        .task(id: control.isUpdating) {
+            showsActivityIndicator = false
+            guard control.isUpdating else { return }
+
+            do {
+                try await Task.sleep(for: Self.activityIndicatorDelay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, control.isUpdating else { return }
+            showsActivityIndicator = true
         }
     }
 

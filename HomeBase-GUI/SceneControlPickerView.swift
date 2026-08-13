@@ -129,6 +129,7 @@ struct SceneResolvedControl: Equatable, Sendable {
     func presentationContext(
         value: HBJSONValue,
         isEnabled: Bool,
+        isUpdating: Bool = false,
         commit: @escaping (
             HBJSONValue,
             ControlValueCommitOrigin
@@ -137,12 +138,14 @@ struct SceneResolvedControl: Equatable, Sendable {
         presentationContext(
             snapshot: draftSnapshot(value: value),
             isEnabled: isEnabled,
+            isUpdating: isUpdating,
             commit: commit
         )
     }
 
     func listedPresentationContext(
         isEnabled: Bool,
+        isUpdating: Bool = false,
         commit: @escaping (
             HBJSONValue,
             ControlValueCommitOrigin
@@ -151,6 +154,7 @@ struct SceneResolvedControl: Equatable, Sendable {
         presentationContext(
             snapshot: descriptor.listedControlValueSnapshot,
             isEnabled: isEnabled,
+            isUpdating: isUpdating,
             commit: commit
         )
     }
@@ -184,6 +188,7 @@ struct SceneResolvedControl: Equatable, Sendable {
     private func presentationContext(
         snapshot: ControlValueSnapshot,
         isEnabled: Bool,
+        isUpdating: Bool = false,
         commit: @escaping (
             HBJSONValue,
             ControlValueCommitOrigin
@@ -194,7 +199,7 @@ struct SceneResolvedControl: Equatable, Sendable {
             snapshot: snapshot,
             interaction: ControlValueInteraction(
                 isEnabled: isEnabled,
-                isUpdating: false,
+                isUpdating: isUpdating,
                 commit: commit,
                 observations: {
                     AsyncThrowingStream { continuation in
