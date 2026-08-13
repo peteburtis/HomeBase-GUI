@@ -326,7 +326,7 @@ final class TriggerConditionTypeSystemTests: XCTestCase {
         let source = """
         {
           "Identifier": "Presence",
-          "Type": "When",
+          "Mode": "Trigger",
           "Conditions": [
             {"Compare": [{"ControlValue": ["Sensor", "Presence"]}, "=", 1]}
           ],
@@ -355,7 +355,7 @@ final class TriggerConditionTypeSystemTests: XCTestCase {
         let source = """
         {
           "Identifier": "Daylight",
-          "Type": "While",
+          "Mode": "Overlay",
           "Conditions": [
             {
               "Compare": [
@@ -406,7 +406,7 @@ final class TriggerConditionTypeSystemTests: XCTestCase {
         let source = """
         {
           "Identifier": "Level",
-          "Type": "While",
+          "Mode": "Overlay",
           "Conditions": [
             {"Compare": [{"ControlValue": ["Lamp", "Level"]}, "==", 1]}
           ],

@@ -8,13 +8,53 @@ import XCTest
 @testable import HomeBase_GUI
 
 final class TriggerConfigurationDocumentTests: XCTestCase {
+    func testMissingModeDefaultsToTriggerAndRevertingKeepsItOmitted()
+        throws
+    {
+        let source = """
+        {
+          "Identifier": "Arrival",
+          "Conditions": [],
+          "Actions": []
+        }
+        """
+        let document = try RemoteJSONDocument(
+            path: "triggers/Arrival.json",
+            source: source
+        )
+        let trigger = try TriggerConfigurationCatalog(documents: [document])
+            .trigger(named: "Arrival")
+
+        XCTAssertNil(trigger.configuredMode)
+        XCTAssertEqual(trigger.mode, .trigger)
+
+        var draft = TriggerConfigurationDraft(trigger: trigger)
+        try draft.setMode("Overlay")
+        XCTAssertEqual(draft.trigger.configuredMode, "Overlay")
+        XCTAssertEqual(draft.trigger.mode, .overlay)
+        XCTAssertTrue(draft.hasSemanticChanges)
+
+        try draft.setMode("Trigger")
+        XCTAssertNil(draft.trigger.configuredMode)
+        XCTAssertEqual(draft.trigger.mode, .trigger)
+        XCTAssertFalse(draft.hasSemanticChanges)
+        XCTAssertEqual(draft.root, trigger.source.root)
+    }
+
+    func testNewOverlayTriggerAuthorsModeExplicitly() throws {
+        let draft = try TriggerConfigurationDraft.newTrigger(mode: "Overlay")
+
+        XCTAssertEqual(draft.trigger.configuredMode, "Overlay")
+        XCTAssertEqual(draft.trigger.mode, .overlay)
+    }
+
     func testSingleObjectTriggerRetainsSourceConditionsActionsAndUnknownContent()
         throws
     {
         let source = """
         {
           "Identifier": "Arrival",
-          "Type": "When",
+          "Mode": "Trigger",
           "Conditions": [
             {"ControlValueGreaterThan": ["Sensor", "Presence", 0.5]}
           ],
@@ -35,8 +75,8 @@ final class TriggerConfigurationDocumentTests: XCTestCase {
         XCTAssertEqual(trigger.source.originalSource, source)
         XCTAssertEqual(trigger.jsonPath, "$")
         XCTAssertEqual(trigger.identifier, "Arrival")
-        XCTAssertEqual(trigger.triggerType, "When")
-        XCTAssertEqual(trigger.kind, .when)
+        XCTAssertEqual(trigger.configuredMode, "Trigger")
+        XCTAssertEqual(trigger.mode, .trigger)
         XCTAssertEqual(trigger.conditions.count, 1)
         XCTAssertEqual(trigger.conditions[0].type, "ControlValueGreaterThan")
         XCTAssertEqual(
@@ -59,14 +99,14 @@ final class TriggerConfigurationDocumentTests: XCTestCase {
             [
               {
                 "Identifier": "First",
-                "Type": "When",
+                "Mode": "Trigger",
                 "Conditions": [],
                 "Actions": []
               },
               42,
               {
                 "Identifier": "Second",
-                "Type": "While",
+                "Mode": "Overlay",
                 "Conditions": [],
                 "Actions": []
               }
@@ -110,7 +150,7 @@ final class TriggerConfigurationDocumentTests: XCTestCase {
         let originalSource = """
         {
           "Identifier": "Arrival",
-          "Type": "When",
+          "Mode": "Trigger",
           "Conditions": [
             {"DayOfWeek": [1, 2, 3]},
             {"ControlValueEqual": ["Sensor", "Presence", 0]}
@@ -169,14 +209,14 @@ final class TriggerConfigurationDocumentTests: XCTestCase {
         var draft = TriggerConfigurationDraft(trigger: trigger)
 
         try draft.setIdentifier("Changed")
-        try draft.setTriggerType("While")
+        try draft.setMode("Overlay")
         try draft.setCondition(
             at: 0,
             rawValue: .object(["DayOfWeek": .array([.integer(1)])])
         )
         try draft.setControlValue(actionIndex: 0, value: .integer(1))
         try draft.setIdentifier("Arrival")
-        try draft.setTriggerType("When")
+        try draft.setMode("Trigger")
         try draft.setCondition(at: 0, rawValue: originalCondition.rawValue)
         try draft.setControlValue(actionIndex: 0, value: originalValue)
 
@@ -218,7 +258,7 @@ final class TriggerConfigurationDocumentTests: XCTestCase {
             source: """
             {
               "Identifier": "Arrival",
-              "Type": "When",
+              "Mode": "Trigger",
               "Conditions": [],
               "Actions": [{"ExtensionAction": {"Keep": true}}]
             }
@@ -246,11 +286,11 @@ final class TriggerConfigurationDocumentTests: XCTestCase {
     func testMetadataAndDerivedPathRulesMirrorSourceShape() throws {
         var singleDraft = TriggerConfigurationDraft(trigger: try makeTrigger())
         try singleDraft.setIdentifier("Arrived")
-        try singleDraft.setTriggerType("While")
+        try singleDraft.setMode("Overlay")
 
         XCTAssertEqual(singleDraft.trigger.identifier, "Arrived")
-        XCTAssertEqual(singleDraft.trigger.triggerType, "While")
-        XCTAssertEqual(singleDraft.trigger.kind, .while)
+        XCTAssertEqual(singleDraft.trigger.configuredMode, "Overlay")
+        XCTAssertEqual(singleDraft.trigger.mode, .overlay)
         XCTAssertEqual(
             singleDraft.proposedSourcePath,
             "triggers/Arrived.json"
@@ -263,7 +303,7 @@ final class TriggerConfigurationDocumentTests: XCTestCase {
             )
         )
 
-        XCTAssertThrowsError(try singleDraft.setTriggerType("whenever"))
+        XCTAssertThrowsError(try singleDraft.setMode("persistent"))
     }
 
     func testSharedFileDoesNotRenameWhenIdentifierChanges() throws {
@@ -289,7 +329,8 @@ final class TriggerConfigurationDocumentTests: XCTestCase {
         XCTAssertTrue(draft.isDirty)
         XCTAssertFalse(draft.hasSemanticChanges)
         XCTAssertEqual(draft.trigger.identifier, "UntitledTrigger")
-        XCTAssertEqual(draft.trigger.triggerType, "When")
+        XCTAssertNil(draft.trigger.configuredMode)
+        XCTAssertEqual(draft.trigger.mode, .trigger)
         XCTAssertEqual(draft.trigger.conditions, [])
         XCTAssertEqual(draft.trigger.actions, [])
         XCTAssertEqual(
@@ -304,7 +345,7 @@ final class TriggerConfigurationDocumentTests: XCTestCase {
             source: """
             {
               "Identifier": "Arrival",
-              "Type": "When",
+              "Mode": "Trigger",
               "Conditions": [
                 {"ControlValueEqual": ["Sensor", "Presence", 0]}
               ],
@@ -323,7 +364,7 @@ final class TriggerConfigurationDocumentTests: XCTestCase {
         """
         {
           "Identifier": "\(identifier)",
-          "Type": "When",
+          "Mode": "Trigger",
           "Conditions": [],
           "Actions": []
         }

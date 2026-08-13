@@ -260,7 +260,7 @@ private struct ControlSetActionPlugin:
         in context: AutomationActionConfigurationContext
     ) -> Bool {
         guard applicability.supports(context) else { return false }
-        guard context == .trigger(.when),
+        guard context == .trigger(.trigger),
               let value = action.controlSet?.value else { return true }
         return value.objectValue?["Cycle"] == nil
     }
@@ -423,7 +423,7 @@ private struct SceneActivateActionPlugin:
     let actionType: String? = "SceneActivate"
     let displayName = "Activate Scene"
     let systemImage = "sparkles.rectangle.stack"
-    let applicability: AutomationActionApplicability = .whileTrigger
+    let applicability: AutomationActionApplicability = .overlayMode
 
     func presentation(
         for action: SceneActionConfiguration

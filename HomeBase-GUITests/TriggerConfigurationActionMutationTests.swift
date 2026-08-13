@@ -103,7 +103,7 @@ final class TriggerConfigurationActionMutationTests: XCTestCase {
             source: """
             {
               "Identifier": "Command",
-              "Type": "When",
+              "Mode": "Trigger",
               "Conditions": [],
               "FutureTriggerField": {"Keep": true},
               "Actions": [
@@ -176,13 +176,13 @@ final class TriggerConfigurationActionMutationTests: XCTestCase {
         [
           {
             "Identifier": "Other",
-            "Type": "When",
+            "Mode": "Trigger",
             "Conditions": [],
             "Actions": [{"FutureAction": {"Keep": true}}]
           },
           {
             "Identifier": "Lighting",
-            "Type": "When",
+            "Mode": "Trigger",
             "Conditions": [],
             "FutureTriggerField": {"Opaque": [1, 2, 3]},
             "Actions": [

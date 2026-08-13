@@ -8,16 +8,16 @@ import SwiftUI
 
 enum AutomationActionConfigurationContext: Equatable, Sendable {
     case scene
-    case trigger(HBTriggerKind)
+    case trigger(HBTriggerMode)
 
     var applicability: AutomationActionApplicability {
         switch self {
         case .scene:
             .scene
-        case .trigger(.when):
-            .whenTrigger
-        case .trigger(.while):
-            .whileTrigger
+        case .trigger(.trigger):
+            .triggerMode
+        case .trigger(.overlay):
+            .overlayMode
         }
     }
 }
@@ -26,10 +26,10 @@ struct AutomationActionApplicability: OptionSet, Equatable, Sendable {
     let rawValue: Int
 
     static let scene = Self(rawValue: 1 << 0)
-    static let whenTrigger = Self(rawValue: 1 << 1)
-    static let whileTrigger = Self(rawValue: 1 << 2)
-    static let triggers: Self = [.whenTrigger, .whileTrigger]
-    static let all: Self = [.scene, .whenTrigger, .whileTrigger]
+    static let triggerMode = Self(rawValue: 1 << 1)
+    static let overlayMode = Self(rawValue: 1 << 2)
+    static let triggers: Self = [.triggerMode, .overlayMode]
+    static let all: Self = [.scene, .triggerMode, .overlayMode]
 
     func supports(_ context: AutomationActionConfigurationContext) -> Bool {
         contains(context.applicability)

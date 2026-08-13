@@ -407,9 +407,9 @@ enum BuiltInAutomationActionKind: String, CaseIterable, Sendable {
     var applicability: AutomationActionApplicability {
         switch self {
         case .sceneActivate:
-            .whileTrigger
+            .overlayMode
         case .sceneClear, .sceneClearAll, .sceneToggle:
-            .whenTrigger
+            .triggerMode
         default:
             .all
         }

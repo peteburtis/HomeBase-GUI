@@ -23,12 +23,16 @@ struct TriggerConfigurationDocument: Identifiable, Equatable, Sendable {
         fields["Identifier"]?.stringValue
     }
 
-    var triggerType: String? {
-        fields["Type"]?.stringValue
+    /// The explicitly authored mode. A missing field is valid and means
+    /// Trigger mode at the engine boundary.
+    var configuredMode: String? {
+        fields["Mode"]?.stringValue
     }
 
-    var kind: HBTriggerKind? {
-        TriggerKindUICatalog.registration(forWireValue: triggerType)?.kind
+    var mode: HBTriggerMode? {
+        let wireValue = configuredMode
+            ?? TriggerModeUICatalog.defaultRegistration.wireValue
+        return TriggerModeUICatalog.registration(forWireValue: wireValue)?.mode
     }
 
     var conditions: [TriggerConditionConfiguration] {
@@ -52,7 +56,7 @@ struct TriggerConfigurationDocument: Identifiable, Equatable, Sendable {
         fields
             .filter {
                 $0.key != "Identifier"
-                    && $0.key != "Type"
+                    && $0.key != "Mode"
                     && $0.key != "Conditions"
                     && $0.key != "Actions"
             }
@@ -112,7 +116,7 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
 
     enum MutationError: LocalizedError, Equatable {
         case invalidTriggerLocation
-        case invalidTriggerType
+        case invalidTriggerMode
         case conditionsAreNotAnArray
         case missingCondition(Int)
         case invalidCondition(Int)
@@ -126,9 +130,9 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
             switch self {
             case .invalidTriggerLocation:
                 "The trigger no longer has a valid location in its source file."
-            case .invalidTriggerType:
-                "Trigger type must be "
-                    + TriggerKindUICatalog.supportedWireValueDescription
+            case .invalidTriggerMode:
+                "Trigger mode must be "
+                    + TriggerModeUICatalog.supportedWireValueDescription
                     + "."
             case .conditionsAreNotAnArray:
                 "The trigger's Conditions field is not an array."
@@ -165,19 +169,22 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
 
     static func newTrigger(
         identifier: String = "UntitledTrigger",
-        triggerType: String = TriggerKindUICatalog.defaultRegistration.wireValue
+        mode: String = TriggerModeUICatalog.defaultRegistration.wireValue
     ) throws -> Self {
-        guard TriggerKindUICatalog.registration(
-            forWireValue: triggerType
+        guard TriggerModeUICatalog.registration(
+            forWireValue: mode
         ) != nil else {
-            throw MutationError.invalidTriggerType
+            throw MutationError.invalidTriggerMode
         }
-        let root = HBJSONValue.object([
+        var fields: [String: HBJSONValue] = [
             "Identifier": .string(identifier),
-            "Type": .string(triggerType),
             "Conditions": .array([]),
             "Actions": .array([]),
-        ])
+        ]
+        if mode != TriggerModeUICatalog.defaultRegistration.wireValue {
+            fields["Mode"] = .string(mode)
+        }
+        let root = HBJSONValue.object(fields)
         let source = try root.configurationJSONSource(prettyPrinted: true)
             + "\n"
         let document = try RemoteJSONDocument(
@@ -265,13 +272,24 @@ struct TriggerConfigurationDraft: Equatable, Sendable {
         try setTriggerField("Identifier", value: .string(identifier))
     }
 
-    mutating func setTriggerType(_ triggerType: String) throws {
-        guard TriggerKindUICatalog.registration(
-            forWireValue: triggerType
+    mutating func setMode(_ mode: String) throws {
+        guard TriggerModeUICatalog.registration(
+            forWireValue: mode
         ) != nil else {
-            throw MutationError.invalidTriggerType
+            throw MutationError.invalidTriggerMode
         }
-        try setTriggerField("Type", value: .string(triggerType))
+
+        let originalMode = original.configuredMode
+            ?? TriggerModeUICatalog.defaultRegistration.wireValue
+        if mode == originalMode {
+            // Preserve whether the default was explicitly authored. This also
+            // makes changing away and back a true semantic no-op.
+            try setTriggerField("Mode", value: original.fields["Mode"])
+        } else if mode == TriggerModeUICatalog.defaultRegistration.wireValue {
+            try setTriggerField("Mode", value: nil)
+        } else {
+            try setTriggerField("Mode", value: .string(mode))
+        }
     }
 
     mutating func setCondition(

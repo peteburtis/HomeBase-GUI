@@ -82,9 +82,9 @@ struct TriggerOverviewView: View {
         List {
             Section {
                 TriggerOverviewTextRow(
-                    label: "Type",
-                    value: TriggerKindUICatalog.registration(
-                        for: state.trigger.kind
+                    label: "Mode",
+                    value: TriggerModeUICatalog.registration(
+                        for: state.trigger.mode
                     ).displayName
                 )
                 TriggerOverviewTextRow(
@@ -343,7 +343,7 @@ enum TriggerOverviewPresentation {
     static func lastFired(
         for trigger: HBTriggerSummaryDescriptor
     ) -> LastFired {
-        guard TriggerKindUICatalog.registration(for: trigger.kind)
+        guard TriggerModeUICatalog.registration(for: trigger.mode)
             .showsLastFired else { return .omitted }
         return trigger.lastFiredAt.map(LastFired.date) ?? .never
     }

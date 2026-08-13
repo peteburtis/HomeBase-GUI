@@ -8,24 +8,24 @@ import XCTest
 @testable import HomeBase_GUI
 
 final class TriggerOverviewPresentationTests: XCTestCase {
-    func testLastFiredPresentationOnlyAppliesToWhenTriggers() {
+    func testLastFiredPresentationOnlyAppliesToTriggerMode() {
         let date = Date(timeIntervalSince1970: 1_234)
 
         XCTAssertEqual(
             TriggerOverviewPresentation.lastFired(
-                for: trigger(kind: .when, lastFiredAt: date)
+                for: trigger(mode: .trigger, lastFiredAt: date)
             ),
             .date(date)
         )
         XCTAssertEqual(
             TriggerOverviewPresentation.lastFired(
-                for: trigger(kind: .when, lastFiredAt: nil)
+                for: trigger(mode: .trigger, lastFiredAt: nil)
             ),
             .never
         )
         XCTAssertEqual(
             TriggerOverviewPresentation.lastFired(
-                for: trigger(kind: .while, lastFiredAt: date)
+                for: trigger(mode: .overlay, lastFiredAt: date)
             ),
             .omitted
         )
@@ -157,13 +157,13 @@ final class TriggerOverviewPresentationTests: XCTestCase {
     }
 
     private func trigger(
-        kind: HBTriggerKind,
+        mode: HBTriggerMode,
         lastFiredAt: Date?
     ) -> HBTriggerSummaryDescriptor {
         HBTriggerSummaryDescriptor(
             name: "Example",
-            kind: kind,
-            state: kind == .when ? .satisfied : .active,
+            mode: mode,
+            state: mode == .trigger ? .satisfied : .active,
             schedulerRunning: true,
             lastFiredAt: lastFiredAt
         )

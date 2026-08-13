@@ -1,38 +1,38 @@
 //
-//  TriggerKindUICatalog.swift
+//  TriggerModeUICatalog.swift
 //  HomeBase-GUI
 //
 
 import Foundation
 import HomeBaseProtocol
 
-/// The UI and protocol mapping for one supported trigger configuration type.
-struct TriggerKindUIRegistration: Identifiable, Equatable, Sendable {
+/// The UI and protocol mapping for one supported trigger mode.
+struct TriggerModeUIRegistration: Identifiable, Equatable, Sendable {
     let wireValue: String
     let displayName: String
-    let kind: HBTriggerKind
+    let mode: HBTriggerMode
     let showsLastFired: Bool
 
     var id: String { wireValue }
 
     var actionConfigurationContext: AutomationActionConfigurationContext {
-        .trigger(kind)
+        .trigger(mode)
     }
 }
 
-/// The single catalog of trigger kinds that can be configured in the app.
-enum TriggerKindUICatalog {
-    static let supported: [TriggerKindUIRegistration] = [
+/// The single catalog of trigger modes that can be configured in the app.
+enum TriggerModeUICatalog {
+    static let supported: [TriggerModeUIRegistration] = [
         .init(
-            wireValue: "When",
-            displayName: "When",
-            kind: .when,
+            wireValue: "Trigger",
+            displayName: "Trigger",
+            mode: .trigger,
             showsLastFired: true
         ),
         .init(
-            wireValue: "While",
-            displayName: "While",
-            kind: .while,
+            wireValue: "Overlay",
+            displayName: "Overlay",
+            mode: .overlay,
             showsLastFired: false
         ),
     ]
@@ -41,18 +41,18 @@ enum TriggerKindUICatalog {
 
     static func registration(
         forWireValue wireValue: String?
-    ) -> TriggerKindUIRegistration? {
+    ) -> TriggerModeUIRegistration? {
         guard let wireValue else { return nil }
         return supported.first { $0.wireValue == wireValue }
     }
 
     static func registration(
-        for kind: HBTriggerKind
-    ) -> TriggerKindUIRegistration {
-        guard let registration = supported.first(where: { $0.kind == kind })
+        for mode: HBTriggerMode
+    ) -> TriggerModeUIRegistration {
+        guard let registration = supported.first(where: { $0.mode == mode })
         else {
             preconditionFailure(
-                "Every protocol trigger kind must have a UI registration."
+                "Every protocol trigger mode must have a UI registration."
             )
         }
         return registration
@@ -60,14 +60,14 @@ enum TriggerKindUICatalog {
 
     static func registration(
         caseInsensitiveWireValue wireValue: String
-    ) -> TriggerKindUIRegistration? {
+    ) -> TriggerModeUIRegistration? {
         supported.first {
             $0.wireValue.caseInsensitiveCompare(wireValue) == .orderedSame
         }
     }
 
-    /// Retains the editor's existing behavior: values other than While use
-    /// the default When action context until validation rejects them.
+    /// Unrecognized editor values use the default Trigger action context until
+    /// validation rejects them.
     static func actionConfigurationContext(
         forEditorWireValue wireValue: String
     ) -> AutomationActionConfigurationContext {

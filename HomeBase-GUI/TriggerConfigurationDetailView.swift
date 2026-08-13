@@ -284,13 +284,13 @@ private struct TriggerConfigurationContents: View {
                         )
 
                         Picker(
-                            "Type",
+                            "Mode",
                             selection: Binding(
-                                get: { model.triggerTypeInput },
-                                set: model.setTriggerTypeInput
+                                get: { model.triggerModeInput },
+                                set: model.setTriggerModeInput
                             )
                         ) {
-                            ForEach(TriggerKindUICatalog.supported) {
+                            ForEach(TriggerModeUICatalog.supported) {
                                 registration in
                                 Text(registration.displayName)
                                     .tag(registration.wireValue)
@@ -799,8 +799,8 @@ private final class TriggerConfigurationDetailModel:
     @Published private(set) var isDeleting = false
     @Published private(set) var saveConfirmation: String?
     @Published private(set) var identifierInput = ""
-    @Published private(set) var triggerTypeInput =
-        TriggerKindUICatalog.defaultRegistration.wireValue
+    @Published private(set) var triggerModeInput =
+        TriggerModeUICatalog.defaultRegistration.wireValue
     @Published var presentedAlert: TriggerEditorAlert?
 
     private let source: TriggerConfigurationEditingSource
@@ -811,8 +811,8 @@ private final class TriggerConfigurationDetailModel:
     private var pendingRecovery: TriggerConfigurationRecovery?
     private var pendingCreatedTrigger: TriggerConfigurationDocument?
     private var initialIdentifierInput = ""
-    private var initialTriggerTypeInput =
-        TriggerKindUICatalog.defaultRegistration.wireValue
+    private var initialTriggerModeInput =
+        TriggerModeUICatalog.defaultRegistration.wireValue
 
     init(
         source: TriggerConfigurationEditingSource,
@@ -830,10 +830,10 @@ private final class TriggerConfigurationDetailModel:
             )
             draft = newDraft
             identifierInput = suggestedIdentifier
-            triggerTypeInput =
-                TriggerKindUICatalog.defaultRegistration.wireValue
+            triggerModeInput =
+                TriggerModeUICatalog.defaultRegistration.wireValue
             initialIdentifierInput = identifierInput
-            initialTriggerTypeInput = triggerTypeInput
+            initialTriggerModeInput = triggerModeInput
             state = .loaded
         } catch {
             state = .failed(error.localizedDescription)
@@ -852,13 +852,13 @@ private final class TriggerConfigurationDetailModel:
         draft?.isDirty == true
             || pendingCreatedTrigger != nil
             || identifierInput != initialIdentifierInput
-            || triggerTypeInput != initialTriggerTypeInput
+            || triggerModeInput != initialTriggerModeInput
     }
 
     var hasChangesToDiscard: Bool {
         draft?.hasSemanticChanges == true
             || identifierInput != initialIdentifierInput
-            || triggerTypeInput != initialTriggerTypeInput
+            || triggerModeInput != initialTriggerModeInput
     }
 
     var isAwaitingCreatedTriggerReload: Bool {
@@ -872,8 +872,8 @@ private final class TriggerConfigurationDetailModel:
     var supportsGenericActionMutation: Bool { true }
 
     var actionConfigurationContext: AutomationActionConfigurationContext {
-        TriggerKindUICatalog.actionConfigurationContext(
-            forEditorWireValue: triggerTypeInput
+        TriggerModeUICatalog.actionConfigurationContext(
+            forEditorWireValue: triggerModeInput
         )
     }
 
@@ -917,7 +917,9 @@ private final class TriggerConfigurationDetailModel:
         let actionList = incompatible.formatted(
             .list(type: .and, width: .standard)
         )
-        return "\(actionList) cannot be used in a \(triggerTypeInput) trigger. Remove the incompatible action or change the trigger type."
+        return "\(actionList) cannot be used in "
+            + "\(triggerModeInput.lowercased()) mode. Remove the incompatible "
+            + "action or change the trigger mode."
     }
 
     var presentedFilePath: String {
@@ -1033,11 +1035,11 @@ private final class TriggerConfigurationDetailModel:
         }
     }
 
-    func setTriggerTypeInput(_ input: String) {
-        triggerTypeInput = input
+    func setTriggerModeInput(_ input: String) {
+        triggerModeInput = input
         saveConfirmation = nil
         updateTrigger { draft in
-            try draft.setTriggerType(input)
+            try draft.setMode(input)
         }
     }
 
@@ -1474,10 +1476,10 @@ private final class TriggerConfigurationDetailModel:
         draft = TriggerConfigurationDraft(trigger: trigger)
         pendingCreatedTrigger = nil
         identifierInput = trigger.identifier ?? ""
-        triggerTypeInput = trigger.triggerType
-            ?? TriggerKindUICatalog.defaultRegistration.wireValue
+        triggerModeInput = trigger.configuredMode
+            ?? TriggerModeUICatalog.defaultRegistration.wireValue
         initialIdentifierInput = identifierInput
-        initialTriggerTypeInput = triggerTypeInput
+        initialTriggerModeInput = triggerModeInput
         if !retainingResolutions {
             resolutions = Dictionary(
                 uniqueKeysWithValues: trigger.actions.compactMap { action in

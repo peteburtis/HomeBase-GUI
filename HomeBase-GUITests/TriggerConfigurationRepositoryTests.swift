@@ -95,7 +95,8 @@ final class TriggerConfigurationRepositoryTests: XCTestCase {
             return XCTFail("Expected a saved outcome")
         }
         XCTAssertEqual(trigger.identifier, "UntitledTrigger")
-        XCTAssertEqual(trigger.triggerType, "When")
+        XCTAssertNil(trigger.configuredMode)
+        XCTAssertEqual(trigger.mode, .trigger)
         XCTAssertEqual(trigger.conditions, [])
         XCTAssertEqual(trigger.actions, [])
         XCTAssertEqual(reload.name, "UntitledTrigger")
@@ -296,7 +297,7 @@ final class TriggerConfigurationRepositoryTests: XCTestCase {
         )
         let repository = TriggerConfigurationRepository(client: client)
         var draft = try makeDraft(source: source)
-        try draft.setTriggerType("While")
+        try draft.setMode("Overlay")
 
         do {
             _ = try await repository.save(draft)
@@ -307,7 +308,8 @@ final class TriggerConfigurationRepositoryTests: XCTestCase {
                 return XCTFail("Expected reload failure, received \(error)")
             }
             XCTAssertEqual(recovery.savedPath, path)
-            XCTAssertEqual(presumed.triggerType, "While")
+            XCTAssertEqual(presumed.configuredMode, "Overlay")
+            XCTAssertEqual(presumed.mode, .overlay)
         }
         XCTAssertEqual(client.events.last, "reload:Arrival")
     }
@@ -468,7 +470,7 @@ final class TriggerConfigurationRepositoryTests: XCTestCase {
         """
         {
           "Identifier": "\(identifier)",
-          "Type": "When",
+          "Mode": "Trigger",
           "Conditions": [
             {"ControlValueEqual": ["Sensor", "Presence", \(conditionValue)]}
           ],

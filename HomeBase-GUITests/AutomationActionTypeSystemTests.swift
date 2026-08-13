@@ -74,11 +74,11 @@ final class AutomationActionTypeSystemTests: XCTestCase {
             ["control-set", "wait", "scene-apply", "raw-json"]
         )
         XCTAssertEqual(
-            pluginIdentifiers(for: .trigger(.when)),
+            pluginIdentifiers(for: .trigger(.trigger)),
             ["control-set", "wait", "scene-apply", "raw-json"]
         )
         XCTAssertEqual(
-            pluginIdentifiers(for: .trigger(.while)),
+            pluginIdentifiers(for: .trigger(.overlay)),
             [
                 "control-set",
                 "wait",
@@ -90,8 +90,8 @@ final class AutomationActionTypeSystemTests: XCTestCase {
 
         for context in [
             AutomationActionConfigurationContext.scene,
-            .trigger(.when),
-            .trigger(.while),
+            .trigger(.trigger),
+            .trigger(.overlay),
         ] {
             XCTAssertTrue(
                 AutomationActionTypeRegistry.standard
@@ -488,14 +488,14 @@ final class AutomationActionTypeSystemTests: XCTestCase {
             .plugin
 
         XCTAssertFalse(
-            plugin.supports(action: cycling, in: .trigger(.when))
+            plugin.supports(action: cycling, in: .trigger(.trigger))
         )
         XCTAssertTrue(
-            plugin.supports(action: cycling, in: .trigger(.while))
+            plugin.supports(action: cycling, in: .trigger(.overlay))
         )
         XCTAssertTrue(plugin.supports(action: cycling, in: .scene))
         XCTAssertTrue(
-            plugin.supports(action: ordinary, in: .trigger(.when))
+            plugin.supports(action: ordinary, in: .trigger(.trigger))
         )
     }
 
