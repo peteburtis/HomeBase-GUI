@@ -67,17 +67,33 @@ struct ServerDetailView: View {
 
     private var homeView: some View {
         let topology = connection.presentedTopology
-        let topLevelGroups = TopologyGroupPlacement(
-            topology: topology
-        ).topLevelGroups
+        let placement = TopologyGroupPlacement(topology: topology)
+        let topLevelGroups = placement.topLevelGroups.filter {
+            !$0.metadata.hasHiddenFlag
+        }
+        let hiddenTopLevelGroups = placement.topLevelGroups.filter {
+            $0.metadata.hasHiddenFlag
+        }
+        let topLevelDeviceItems = placement.topLevelDeviceItems.filter {
+            !$0.isHidden
+        }
+        let hiddenTopLevelDeviceItems = placement.topLevelDeviceItems.filter(
+            \.isHidden
+        )
+        let visibleRooms = topology.rooms.filter {
+            !$0.metadata.hasHiddenFlag
+        }
+        let hiddenRooms = topology.rooms.filter {
+            $0.metadata.hasHiddenFlag
+        }
 
         return List {
             Section {
-                if topology.rooms.isEmpty {
+                if visibleRooms.isEmpty {
                     Text(emptyRoomsMessage)
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(topology.rooms, id: \.identifier) { room in
+                    ForEach(visibleRooms, id: \.identifier) { room in
                         NavigationLink {
                             RoomDetailView(
                                 room: room,
@@ -89,7 +105,9 @@ struct ServerDetailView: View {
                                 title: room.displayName,
                                 technicalName: roomTechnicalName(room),
                                 detail: TopologyRowLabel.deviceCountDescription(
-                                    room.resolvedDeviceIdentifiers.count
+                                    placement.deviceItems(in: room).filter {
+                                        !$0.isHidden
+                                    }.count
                                 )
                             )
                         }
@@ -97,6 +115,17 @@ struct ServerDetailView: View {
                 }
             } header: {
                 Text("Rooms")
+            }
+
+            if !topLevelDeviceItems.isEmpty {
+                Section("Devices") {
+                    TopologyDeviceRows(
+                        emptyMessage: "No devices are available.",
+                        items: topLevelDeviceItems,
+                        topology: topology,
+                        client: connection.client
+                    )
+                }
             }
 
             if !topLevelGroups.isEmpty {
@@ -114,6 +143,29 @@ struct ServerDetailView: View {
                     }
                 } header: {
                     Text("Groups")
+                }
+            }
+
+            if !hiddenRooms.isEmpty
+                || !hiddenTopLevelDeviceItems.isEmpty
+                || !hiddenTopLevelGroups.isEmpty {
+                Section("Hidden") {
+                    NavigationLink {
+                        HiddenTopologyItemsView(
+                            rooms: hiddenRooms,
+                            deviceItems: hiddenTopLevelDeviceItems,
+                            groups: hiddenTopLevelGroups,
+                            topology: topology,
+                            client: connection.client
+                        )
+                    } label: {
+                        HiddenItemsRowLabel(
+                            title: "Hidden Items",
+                            count: hiddenRooms.count
+                                + hiddenTopLevelDeviceItems.count
+                                + hiddenTopLevelGroups.count
+                        )
+                    }
                 }
             }
         }
@@ -246,4 +298,20 @@ final class ServerConnectionModel: ObservableObject {
         state = .disconnected
     }
 
+}
+
+struct HiddenItemsRowLabel: View {
+    let title: String
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Label(title, systemImage: "eye.slash")
+            Spacer(minLength: 8)
+            Text(count, format: .number)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+        .accessibilityElement(children: .combine)
+    }
 }

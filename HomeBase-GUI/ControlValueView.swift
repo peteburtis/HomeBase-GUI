@@ -60,10 +60,13 @@ enum ControlWriteDiagnostics {
 
 extension LiveDeviceControl {
     var valueSchema: ControlValueSchema {
-        ControlValueSchema(
+        var metadata = descriptor.metadata
+        for (key, value) in details?.metadata ?? [:] {
+            metadata[key] = value
+        }
+        return ControlValueSchema(
             kind: descriptor.kind,
-            metadata: details?.metadata ?? [:],
-            tags: Set(descriptor.tags).union(details?.tags ?? [])
+            metadata: metadata
         )
     }
 

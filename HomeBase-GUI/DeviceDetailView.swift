@@ -75,11 +75,11 @@ struct LiveDeviceControlSections: View {
     @ViewBuilder
     var body: some View {
         Section {
-            if model.controls.isEmpty {
+            if visibleControls.isEmpty {
                 Text(emptyControlsMessage)
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(model.controls) { control in
+                ForEach(visibleControls) { control in
                     ControlStateRow(
                         control: control,
                         interactionEnabled: model.state == .live,
@@ -107,10 +107,14 @@ struct LiveDeviceControlSections: View {
         }
     }
 
+    private var visibleControls: [LiveDeviceControl] {
+        model.controls.filter { !$0.isHidden }
+    }
+
     private var emptyControlsMessage: String {
         switch model.state {
         case .live:
-            "This \(subjectKind) has no readable controls."
+            "This \(subjectKind) has no visible readable controls."
         case .failed:
             "Controls could not be loaded."
         case .idle, .loading:
@@ -173,7 +177,7 @@ private struct ControlStateRow: View {
 }
 
 struct LiveDeviceControl: Identifiable {
-    private static let primaryControlTag = "primary-control"
+    private static let primaryControlMetadataKey = "primary-control"
 
     let descriptor: HBControlWatchStreamControl
     var details: HBControlDescriptor? = nil
@@ -197,8 +201,14 @@ struct LiveDeviceControl: Identifiable {
     }
 
     var isPrimary: Bool {
-        descriptor.tags.contains(Self.primaryControlTag)
-            || details?.tags.contains(Self.primaryControlTag) == true
+        descriptor.metadata[Self.primaryControlMetadataKey]?.boolValue == true
+            || details?.metadata[Self.primaryControlMetadataKey]?.boolValue
+                == true
+    }
+
+    var isHidden: Bool {
+        descriptor.metadata.hasHiddenFlag
+            || details?.metadata.hasHiddenFlag == true
     }
 
     var subtitleText: String {
@@ -276,6 +286,21 @@ final class LiveDeviceControlsModel: ObservableObject {
                 }
             )
 
+            // A virtual group can describe controls even when none of its
+            // standard controls are currently readable. The stream API
+            // correctly rejects that selector because it expands to no
+            // controls; present it as an ordinary empty state instead of a
+            // monitoring failure. Compatibility controls remain available on
+            // the Advanced screen, whose subscription explicitly includes
+            // them.
+            guard Self.hasPotentiallyReadableStandardControl(
+                in: details.controls
+            ) else {
+                install([])
+                state = .live
+                return
+            }
+
             // Interactive controls present the engine's authoritative target.
             // This makes writes through a derived peer (for example,
             // BinarySwitch -> MultilevelSwitch) update every widget in the
@@ -312,6 +337,19 @@ final class LiveDeviceControlsModel: ObservableObject {
         }
 
         await stopSubscription()
+    }
+
+    static func hasPotentiallyReadableStandardControl(
+        in descriptors: [HBControlDescriptor]
+    ) -> Bool {
+        descriptors.contains { descriptor in
+            guard descriptor.metadata["compatibility"]?.boolValue != true
+            else { return false }
+
+            // Missing metadata is treated as unknown so an older or custom
+            // provider still gets a chance to resolve through the stream API.
+            return descriptor.metadata["readable"]?.boolValue != false
+        }
     }
 
     func stop() async {

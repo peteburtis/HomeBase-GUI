@@ -50,6 +50,19 @@ struct TriggersView: View {
                         Text("Inactive")
                     }
                 }
+
+                if !hiddenTriggers.isEmpty {
+                    Section("Hidden") {
+                        NavigationLink {
+                            HiddenTriggersView(client: client)
+                        } label: {
+                            HiddenItemsRowLabel(
+                                title: "Hidden Triggers",
+                                count: hiddenTriggers.count
+                            )
+                        }
+                    }
+                }
             }
         }
         .navigationTitle("Triggers")
@@ -87,7 +100,7 @@ struct TriggersView: View {
     }
 
     private var activeTriggers: [HBTriggerSummaryDescriptor] {
-        model.triggers.filter { trigger in
+        visibleTriggers.filter { trigger in
             switch trigger.state {
             case .active, .satisfied:
                 true
@@ -98,7 +111,15 @@ struct TriggersView: View {
     }
 
     private var inactiveTriggers: [HBTriggerSummaryDescriptor] {
-        model.triggers.filter { $0.state == .inactive }
+        visibleTriggers.filter { $0.state == .inactive }
+    }
+
+    private var visibleTriggers: [HBTriggerSummaryDescriptor] {
+        model.triggers.filter { !$0.metadata.hasHiddenFlag }
+    }
+
+    private var hiddenTriggers: [HBTriggerSummaryDescriptor] {
+        model.triggers.filter { $0.metadata.hasHiddenFlag }
     }
 
     @ViewBuilder
@@ -153,6 +174,83 @@ struct TriggersView: View {
         return "\(base)\(suffix)"
     }
 
+}
+
+private struct HiddenTriggersView: View {
+    @Environment(\.scenePhase) private var scenePhase
+
+    private let client: HomeBaseWebSocketClient
+    @StateObject private var model: ServerTriggersModel
+
+    init(client: HomeBaseWebSocketClient) {
+        self.client = client
+        _model = StateObject(wrappedValue: ServerTriggersModel(client: client))
+    }
+
+    var body: some View {
+        List {
+            Section("Triggers") {
+                if hiddenTriggers.isEmpty {
+                    Text(emptyMessage)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(hiddenTriggers, id: \.name) { trigger in
+                        NavigationLink {
+                            TriggerOverviewView(
+                                triggerName: trigger.name,
+                                client: client
+                            )
+                        } label: {
+                            TriggerRowLabel(trigger: trigger)
+                        }
+                        .id(trigger.name)
+                    }
+                }
+            }
+        }
+        .navigationTitle("Hidden Triggers")
+        .connectionStatusOverlay(connectionStatus) {
+            Task { await model.run() }
+        }
+        .task(id: scenePhase) {
+            if scenePhase == .active {
+                await model.run(reactivating: true)
+            } else {
+                await model.stop()
+            }
+        }
+        .onDisappear {
+            Task { await model.stop() }
+        }
+    }
+
+    private var hiddenTriggers: [HBTriggerSummaryDescriptor] {
+        model.triggers.filter { $0.metadata.hasHiddenFlag }
+    }
+
+    private var emptyMessage: String {
+        switch model.state {
+        case .live:
+            "No triggers are currently hidden."
+        case .failed:
+            "Hidden triggers could not be loaded."
+        case .idle, .loading:
+            "Hidden triggers will appear when monitoring begins."
+        }
+    }
+
+    private var connectionStatus: ConnectionStatusPresentation {
+        switch model.state {
+        case .idle:
+            .disconnected("Not Monitoring", systemImage: "pause.circle")
+        case .loading:
+            .pending("Loading hidden triggers…")
+        case .live:
+            .connected
+        case .failed(let message):
+            .failed(title: "Monitoring Failed", message: message)
+        }
+    }
 }
 
 private struct TriggerRowLabel: View {

@@ -34,6 +34,17 @@ struct TopologyGroupRow: View {
     }
 }
 
+struct TopologyDeviceGroupRow: View {
+    let group: HBTopologyGroupDescriptor
+
+    var body: some View {
+        TopologyRowLabel(
+            title: group.displayName,
+            technicalName: group.controlDeviceIdentifier
+        )
+    }
+}
+
 struct TopologyRowLabel: View {
     let title: String
     let technicalName: String?

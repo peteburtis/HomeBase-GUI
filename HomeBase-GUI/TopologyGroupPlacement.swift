@@ -3,35 +3,147 @@
 //  HomeBase-GUI
 //
 
+import Foundation
 import HomeBaseProtocol
 
+@MainActor
 struct TopologyGroupPlacement {
     let topLevelGroups: [HBTopologyGroupDescriptor]
+    let topLevelDeviceGroups: [HBTopologyGroupDescriptor]
+    private let topology: HBTopologyListResult
     private let groupsByRoomIdentifier: [String: [HBTopologyGroupDescriptor]]
+    private let deviceGroupsByRoomIdentifier:
+        [String: [HBTopologyGroupDescriptor]]
+    private let groupsByIdentifier: [String: HBTopologyGroupDescriptor]
 
     init(topology: HBTopologyListResult) {
         let rooms = topology.rooms.map(Room.init)
+        let groupsByIdentifier = Dictionary(
+            uniqueKeysWithValues: topology.groups.map {
+                ($0.identifier, $0)
+            }
+        )
+        let groupsSuppressedByPresentingAncestors = Set(
+            topology.groups
+                .filter(\.presentsAsDevice)
+                .flatMap {
+                    Self.descendantGroupIdentifiers(
+                        of: $0,
+                        groupsByIdentifier: groupsByIdentifier
+                    )
+                }
+        )
         var topLevelGroups: [HBTopologyGroupDescriptor] = []
+        var topLevelDeviceGroups: [HBTopologyGroupDescriptor] = []
         var groupsByRoomIdentifier: [String: [HBTopologyGroupDescriptor]] = [:]
+        var deviceGroupsByRoomIdentifier:
+            [String: [HBTopologyGroupDescriptor]] = [:]
 
         for group in topology.groups {
+            guard !groupsSuppressedByPresentingAncestors.contains(
+                group.identifier
+            ) else {
+                continue
+            }
             guard let roomIdentifier = Self.roomIdentifier(
                 containing: group,
                 among: rooms
             ) else {
-                topLevelGroups.append(group)
+                if group.presentsAsDevice {
+                    topLevelDeviceGroups.append(group)
+                } else {
+                    topLevelGroups.append(group)
+                }
                 continue
             }
 
-            groupsByRoomIdentifier[roomIdentifier, default: []].append(group)
+            if group.presentsAsDevice {
+                deviceGroupsByRoomIdentifier[
+                    roomIdentifier,
+                    default: []
+                ].append(group)
+            } else {
+                groupsByRoomIdentifier[roomIdentifier, default: []].append(
+                    group
+                )
+            }
         }
 
+        self.topology = topology
         self.topLevelGroups = topLevelGroups
+        self.topLevelDeviceGroups = topLevelDeviceGroups
         self.groupsByRoomIdentifier = groupsByRoomIdentifier
+        self.deviceGroupsByRoomIdentifier = deviceGroupsByRoomIdentifier
+        self.groupsByIdentifier = groupsByIdentifier
     }
 
     func groups(in room: HBTopologyRoomDescriptor) -> [HBTopologyGroupDescriptor] {
         groupsByRoomIdentifier[room.identifier] ?? []
+    }
+
+    func deviceItems(in room: HBTopologyRoomDescriptor)
+        -> [TopologyDeviceListItem]
+    {
+        let deviceGroups = deviceGroupsByRoomIdentifier[room.identifier] ?? []
+        let suppressedIdentifiers = Set(
+            (topLevelDeviceGroups + deviceGroups)
+                .flatMap(\.resolvedDeviceIdentifiers)
+        )
+        let physicalDevices = topology.devices(
+            identifiedBy: room.resolvedDeviceIdentifiers.filter {
+                !suppressedIdentifiers.contains($0)
+            }
+        )
+        return Self.sortedDeviceItems(
+            physicalDevices.map(TopologyDeviceListItem.device)
+                + deviceGroups.map(TopologyDeviceListItem.group)
+        )
+    }
+
+    func deviceItems(in group: HBTopologyGroupDescriptor)
+        -> [TopologyDeviceListItem]
+    {
+        let deviceGroups: [HBTopologyGroupDescriptor] =
+            group.members.compactMap { member -> HBTopologyGroupDescriptor? in
+            guard member.kind == .group,
+                  let nestedGroup = groupsByIdentifier[member.identifier],
+                  nestedGroup.presentsAsDevice else {
+                return nil
+            }
+            return nestedGroup
+        }
+        let suppressedIdentifiers = Set(
+            deviceGroups.flatMap { $0.resolvedDeviceIdentifiers }
+        )
+        let physicalDevices = topology.devices(
+            identifiedBy: group.resolvedDeviceIdentifiers.filter {
+                !suppressedIdentifiers.contains($0)
+            }
+        )
+        return Self.sortedDeviceItems(
+            physicalDevices.map(TopologyDeviceListItem.device)
+                + deviceGroups.map(TopologyDeviceListItem.group)
+        )
+    }
+
+    var topLevelDeviceItems: [TopologyDeviceListItem] {
+        Self.sortedDeviceItems(
+            topLevelDeviceGroups.map(TopologyDeviceListItem.group)
+        )
+    }
+
+    private static func sortedDeviceItems(
+        _ items: [TopologyDeviceListItem]
+    ) -> [TopologyDeviceListItem] {
+        items.sorted {
+            let displayOrder = $0.displayName.localizedCaseInsensitiveCompare(
+                $1.displayName
+            )
+            if displayOrder != .orderedSame {
+                return displayOrder == .orderedAscending
+            }
+            return $0.id < $1.id
+        }
     }
 
     private static func roomIdentifier(
@@ -61,6 +173,28 @@ struct TopologyGroupPlacement {
         }?.identifier
     }
 
+    private static func descendantGroupIdentifiers(
+        of group: HBTopologyGroupDescriptor,
+        groupsByIdentifier: [String: HBTopologyGroupDescriptor]
+    ) -> Set<String> {
+        var descendants: Set<String> = []
+        var pending = group.members.compactMap { member in
+            member.kind == .group ? member.identifier : nil
+        }
+        while let identifier = pending.popLast() {
+            guard descendants.insert(identifier).inserted,
+                  let nestedGroup = groupsByIdentifier[identifier] else {
+                continue
+            }
+            pending.append(
+                contentsOf: nestedGroup.members.compactMap { member in
+                    member.kind == .group ? member.identifier : nil
+                }
+            )
+        }
+        return descendants
+    }
+
     private struct Room {
         let identifier: String
         let deviceIdentifiers: Set<String>
@@ -69,6 +203,44 @@ struct TopologyGroupPlacement {
             identifier = room.identifier
             deviceIdentifiers = Set(room.resolvedDeviceIdentifiers)
         }
+    }
+}
+
+enum TopologyDeviceListItem: Identifiable, Equatable, Sendable {
+    case device(HBTopologyDeviceDescriptor)
+    case group(HBTopologyGroupDescriptor)
+
+    var id: String {
+        switch self {
+        case .device(let device):
+            "device:\(device.identifier)"
+        case .group(let group):
+            "group:\(group.identifier)"
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .device(let device):
+            device.displayName
+        case .group(let group):
+            group.displayName
+        }
+    }
+
+    var isHidden: Bool {
+        switch self {
+        case .device(let device):
+            device.metadata.hasHiddenFlag
+        case .group(let group):
+            group.metadata.hasHiddenFlag
+        }
+    }
+}
+
+extension HBTopologyGroupDescriptor {
+    var presentsAsDevice: Bool {
+        metadata.topologyPresentationDisposition == .device
     }
 }
 

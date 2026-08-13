@@ -299,8 +299,7 @@ struct TriggerCompareConditionEditorRows: View {
             }
             let schema = ControlValueSchema(
                 kind: control.kind,
-                metadata: control.metadata,
-                tags: control.tags
+                metadata: control.metadata
             )
             guard schema.isReadable, !schema.isStructured else {
                 resolutionMessage =
@@ -385,8 +384,7 @@ private struct TriggerCompareLiteralEditor: View {
         metadata["writable"] = .bool(true)
         return ControlValueSchema(
             kind: control.kind,
-            metadata: metadata,
-            tags: control.tags
+            metadata: metadata
         )
     }
 }
@@ -628,8 +626,7 @@ private struct TriggerConditionControlPicker: View {
         device.controls.filter { control in
             let schema = ControlValueSchema(
                 kind: control.kind,
-                metadata: control.metadata,
-                tags: control.tags
+                metadata: control.metadata
             )
             return schema.isReadable && !schema.isStructured
         }.sorted {

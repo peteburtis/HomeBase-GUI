@@ -38,23 +38,17 @@ struct DeviceAdvancedView: View {
                 details: model.deviceDetails
             )
 
-            if model.controls.isEmpty {
-                Text(emptyMessage)
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(model.controls) { control in
-                    AdvancedControlSections(
-                        control: control,
-                        client: client,
-                        overrideClearingEnabled: model.state == .live,
-                        clearExternalOverride: {
-                            try await model.clearExternalOverride(
-                                for: control.id
-                            )
-                        }
+            AdvancedControlsSection(
+                controls: model.controls,
+                emptyMessage: emptyMessage,
+                client: client,
+                overrideClearingEnabled: model.state == .live,
+                clearExternalOverride: { control in
+                    try await model.clearExternalOverride(
+                        for: control.id
                     )
                 }
-            }
+            )
         }
         .navigationTitle(title)
 #if os(iOS)
@@ -90,6 +84,84 @@ struct DeviceAdvancedView: View {
             "This device has no controls."
         case .failed:
             "Control details could not be loaded."
+        }
+    }
+}
+
+private struct AdvancedControlsSection: View {
+    let controls: [DeviceAdvancedControl]
+    let emptyMessage: String
+    let client: HomeBaseWebSocketClient
+    let overrideClearingEnabled: Bool
+    let clearExternalOverride: (DeviceAdvancedControl) async throws -> Void
+
+    var body: some View {
+        Section {
+            if controls.isEmpty {
+                Text(emptyMessage)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(controls) { control in
+                    DisclosureGroup {
+                        if let externalOverride = control.stack?.externalOverride {
+                            AdvancedExternalOverrideRow(
+                                override: externalOverride,
+                                canClear: overrideClearingEnabled
+                                    && control.activeHold != nil,
+                                clear: {
+                                    try await clearExternalOverride(control)
+                                }
+                            )
+                        }
+
+                        ForEach(control.holds, id: \.identifier) { hold in
+                            AdvancedRawValueRow(
+                                title: "Priority \(hold.priority)",
+                                value: hold.value,
+                                details: control.holdDetails(hold),
+                                prominence:
+                                    control.stack?.externalOverride == nil
+                                        && hold.active
+                                        ? .active
+                                        : .inactive
+                            )
+                        }
+
+                        AdvancedRawValueRow(
+                            title: nil,
+                            value: control.observedValue,
+                            displayValue: control.observedDisplayValue,
+                            details: control.observedDetails,
+                            prominence: .observed
+                        )
+
+                        NavigationLink {
+                            ControlHistoryView(
+                                control: control.controlPath,
+                                displayName: control.descriptor.name,
+                                client: client
+                            )
+                        } label: {
+                            Label(
+                                "History",
+                                systemImage: "clock.arrow.circlepath"
+                            )
+                        }
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(control.descriptor.name)
+                            Text(control.descriptor.identifier)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        } header: {
+            Text("Controls")
+                .textCase(nil)
+                .font(.headline)
+                .foregroundStyle(.primary)
         }
     }
 }
@@ -159,15 +231,6 @@ private struct AdvancedDeviceInformationSection: View {
                     )
                 )
             }
-            if !details.tags.isEmpty {
-                identityRows.append(
-                    AdvancedDeviceInformationRow(
-                        id: "tags",
-                        label: "Tags",
-                        value: details.tags.joined(separator: ", ")
-                    )
-                )
-            }
             metadataRows.append(
                 contentsOf: details.metadata.keys.sorted().compactMap { key in
                     guard let value = details.metadata[key] else { return nil }
@@ -200,110 +263,6 @@ private struct AdvancedDeviceInformationRow: Identifiable {
     let id: String
     let label: String
     let value: String
-}
-
-private struct AdvancedControlSections: View {
-    let control: DeviceAdvancedControl
-    let client: HomeBaseWebSocketClient
-    let overrideClearingEnabled: Bool
-    let clearExternalOverride: () async throws -> Void
-
-    var body: some View {
-        if control.stackAvailable {
-            Section {
-                if let externalOverride = control.stack?.externalOverride {
-                    AdvancedExternalOverrideRow(
-                        override: externalOverride,
-                        canClear: overrideClearingEnabled
-                            && control.activeHold != nil,
-                        clear: clearExternalOverride
-                    )
-                }
-
-                ForEach(control.holds, id: \.identifier) { hold in
-                    AdvancedRawValueRow(
-                        title: "Priority \(hold.priority)",
-                        value: hold.value,
-                        details: holdDetails(hold),
-                        prominence: control.stack?.externalOverride == nil
-                            && hold.active
-                            ? .active
-                            : .inactive
-                    )
-                }
-            } header: {
-                controlHeader
-            }
-        }
-
-        Section {
-            AdvancedRawValueRow(
-                title: nil,
-                value: control.observedValue,
-                displayValue: control.observedDisplayValue,
-                details: observedDetails,
-                prominence: .observed
-            )
-
-            NavigationLink {
-                ControlHistoryView(
-                    control: control.controlPath,
-                    displayName: control.descriptor.name,
-                    client: client
-                )
-            } label: {
-                Label("History", systemImage: "clock.arrow.circlepath")
-            }
-        } header: {
-            if !control.stackAvailable {
-                controlHeader
-            }
-        }
-    }
-
-    private var controlHeader: some View {
-        Text(control.descriptor.identifier)
-            .textCase(nil)
-            .font(.headline)
-            .foregroundStyle(.primary)
-    }
-
-    private var observedDetails: [String] {
-        var ordinaryDetails = ["kind: \(control.descriptor.kind)"]
-        if let valid = control.observation?.valid
-            ?? control.descriptor.metadata["valid"]?.boolValue {
-            ordinaryDetails.append("valid: \(valid)")
-        }
-        let metadataKeys = control.descriptor.metadata.keys.sorted {
-            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
-        }
-        var metadataDetails: [String] = []
-        for key in metadataKeys {
-            guard let value = control.descriptor.metadata[key] else {
-                continue
-            }
-            metadataDetails.append(
-                "metadata.\(key): \(value.rawJSONString)"
-            )
-        }
-        return ordinaryDetails.sorted {
-            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
-        } + metadataDetails
-    }
-
-    private func holdDetails(_ hold: HBHoldDescriptor) -> [String] {
-        var details: [String] = []
-        if let sourceName = hold.sourceName {
-            details.append("source: \(sourceName)")
-        }
-        if let timing = hold.timing {
-            details.append(
-                "timing: {\"delay\":\(timing.delay.rawJSONString),"
-                    + "\"duration\":\(timing.duration.rawJSONString)}"
-            )
-        }
-        return details
-    }
 }
 
 private struct AdvancedExternalOverrideRow: View {
@@ -457,6 +416,37 @@ private struct DeviceAdvancedControl: Identifiable {
 
     var isDerived: Bool {
         descriptor.metadata["derived"]?.boolValue == true
+    }
+
+    var observedDetails: [String] {
+        var ordinaryDetails = ["kind: \(descriptor.kind)"]
+        if let valid = observation?.valid
+            ?? descriptor.metadata["valid"]?.boolValue {
+            ordinaryDetails.append("valid: \(valid)")
+        }
+        let metadataDetails = descriptor.metadata.keys.sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        }.compactMap { key -> String? in
+            guard let value = descriptor.metadata[key] else { return nil }
+            return "metadata.\(key): \(value.rawJSONString)"
+        }
+        return ordinaryDetails.sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        } + metadataDetails
+    }
+
+    func holdDetails(_ hold: HBHoldDescriptor) -> [String] {
+        var details: [String] = []
+        if let sourceName = hold.sourceName {
+            details.append("source: \(sourceName)")
+        }
+        if let timing = hold.timing {
+            details.append(
+                "timing: {\"delay\":\(timing.delay.rawJSONString),"
+                    + "\"duration\":\(timing.duration.rawJSONString)}"
+            )
+        }
+        return details
     }
 }
 
@@ -704,7 +694,7 @@ private final class DeviceAdvancedModel: ObservableObject {
                         kind: streamedControl.kind,
                         value: event.value,
                         projection: event.projection,
-                        tags: streamedControl.tags
+                        metadata: streamedControl.metadata
                     ),
                     controlPath: streamedControl.control,
                     stackAvailable: false,

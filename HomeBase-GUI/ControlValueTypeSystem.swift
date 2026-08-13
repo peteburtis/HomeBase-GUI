@@ -16,16 +16,13 @@ import SwiftUI
 struct ControlValueSchema: Equatable {
     let kind: String
     let metadata: [String: HBJSONValue]
-    let tags: Set<String>
 
     init(
         kind: String,
-        metadata: [String: HBJSONValue] = [:],
-        tags: some Sequence<String> = []
+        metadata: [String: HBJSONValue] = [:]
     ) {
         self.kind = kind
         self.metadata = metadata
-        self.tags = Set(tags)
     }
 
     var normalizedKind: String {
@@ -135,8 +132,7 @@ extension HBControlDescriptor {
     var controlValueSchema: ControlValueSchema {
         ControlValueSchema(
             kind: kind,
-            metadata: metadata,
-            tags: tags
+            metadata: metadata
         )
     }
 

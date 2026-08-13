@@ -24,17 +24,30 @@ struct ScenesView: View {
 
     var body: some View {
         List {
-            Section {
-                if model.scenes.isEmpty {
+            if model.scenes.isEmpty {
+                Section {
                     Text(emptyScenesMessage)
                         .foregroundStyle(.secondary)
-                } else {
-                    ForEach(model.scenes, id: \.name) { scene in
-                        sceneRow(scene)
-                    }
+                } header: {
+                    Text("Scenes")
                 }
+            } else if !visibleScenes.isEmpty {
+                Section {
+                    ForEach(visibleScenes, id: \.name) { scene in
+                        SceneListRow(
+                            scene: scene,
+                            isEditing: isEditingScenes,
+                            model: model,
+                            client: client
+                        )
+                    }
+                } header: {
+                    Text("Scenes")
+                }
+            }
 
-                if let actionError = model.actionError {
+            if let actionError = model.actionError {
+                Section {
                     VStack(alignment: .leading, spacing: 8) {
                         Label(
                             actionError,
@@ -44,8 +57,19 @@ struct ScenesView: View {
                         .foregroundStyle(.red)
                     }
                 }
-            } header: {
-                Text("Scenes")
+            }
+
+            if !hiddenScenes.isEmpty {
+                Section("Hidden") {
+                    NavigationLink {
+                        HiddenScenesView(client: client)
+                    } label: {
+                        HiddenItemsRowLabel(
+                            title: "Hidden Scenes",
+                            count: hiddenScenes.count
+                        )
+                    }
+                }
             }
         }
         .navigationTitle("Scenes")
@@ -124,62 +148,12 @@ struct ScenesView: View {
         }
     }
 
-    @ViewBuilder
-    private func sceneRow(_ scene: HBSceneStateResult) -> some View {
-        if isEditingScenes {
-            NavigationLink {
-                SceneConfigurationDetailView(
-                    sceneName: scene.name,
-                    client: client
-                )
-            } label: {
-                Text(scene.name)
-            }
-            .transition(.opacity)
-        } else {
-            Toggle(
-                isOn: Binding(
-                    get: {
-                        model.isPresented(sceneNamed: scene.name)
-                    },
-                    set: { isActive in
-                        Task {
-                            await model.setScene(
-                                named: scene.name,
-                                active: isActive
-                            )
-                        }
-                    }
-                )
-            ) {
-                HStack(spacing: 8) {
-                    Text(scene.name)
-                    Spacer(minLength: 8)
-                    SceneActivationAccessory(
-                        countdownDeadline: model.activationDeadline(
-                            sceneNamed: scene.name
-                        ),
-                        priority: model.activePriority(
-                            sceneNamed: scene.name
-                        )
-                    )
-                }
-            }
-            .tint(
-                model.isMatchedOnly(sceneNamed: scene.name)
-                    ? .orange
-                    : .accentColor
-            )
-            .disabled(
-                model.state != .live
-                    || model.isUpdating(sceneNamed: scene.name)
-                    || !model.canToggle(sceneNamed: scene.name)
-            )
-            .accessibilityValue(
-                model.accessibilityValue(sceneNamed: scene.name)
-            )
-            .transition(.opacity)
-        }
+    private var visibleScenes: [HBSceneStateResult] {
+        model.scenes.filter { !$0.metadata.hasHiddenFlag }
+    }
+
+    private var hiddenScenes: [HBSceneStateResult] {
+        model.scenes.filter { $0.metadata.hasHiddenFlag }
     }
 
     private var connectionStatus: ConnectionStatusPresentation {
@@ -221,6 +195,172 @@ struct ScenesView: View {
             suffix += 1
         }
         return "\(base)\(suffix)"
+    }
+}
+
+private struct HiddenScenesView: View {
+    @Environment(\.scenePhase) private var scenePhase
+
+    private let client: HomeBaseWebSocketClient
+    @StateObject private var model: ServerScenesModel
+    @State private var isEditingScenes = false
+
+    init(client: HomeBaseWebSocketClient) {
+        self.client = client
+        _model = StateObject(wrappedValue: ServerScenesModel(client: client))
+    }
+
+    var body: some View {
+        List {
+            Section("Scenes") {
+                if hiddenScenes.isEmpty {
+                    Text(emptyMessage)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(hiddenScenes, id: \.name) { scene in
+                        SceneListRow(
+                            scene: scene,
+                            isEditing: isEditingScenes,
+                            model: model,
+                            client: client
+                        )
+                    }
+                }
+            }
+        }
+        .navigationTitle("Hidden Scenes")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                if isEditingScenes {
+                    Button {
+                        setEditing(false)
+                    } label: {
+                        Label("Done Editing", systemImage: "checkmark")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonStyle(.glassProminent)
+                    .disabled(model.state != .live)
+                } else {
+                    Button {
+                        setEditing(true)
+                    } label: {
+                        Label("Edit Scenes", systemImage: "pencil.line")
+                            .labelStyle(.iconOnly)
+                    }
+                    .disabled(model.state != .live)
+                }
+            }
+        }
+        .connectionStatusOverlay(connectionStatus) {
+            Task { await model.run() }
+        }
+        .task(id: scenePhase) {
+            if scenePhase == .active {
+                await model.run(reactivating: true)
+            } else {
+                await model.stop()
+            }
+        }
+        .onDisappear {
+            Task { await model.stop() }
+        }
+    }
+
+    private var hiddenScenes: [HBSceneStateResult] {
+        model.scenes.filter { $0.metadata.hasHiddenFlag }
+    }
+
+    private func setEditing(_ editing: Bool) {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            isEditingScenes = editing
+        }
+    }
+
+    private var emptyMessage: String {
+        switch model.state {
+        case .live:
+            "No scenes are currently hidden."
+        case .failed:
+            "Hidden scenes could not be loaded."
+        case .idle, .loading:
+            "Hidden scenes will appear when monitoring begins."
+        }
+    }
+
+    private var connectionStatus: ConnectionStatusPresentation {
+        switch model.state {
+        case .idle:
+            .disconnected("Not Monitoring", systemImage: "pause.circle")
+        case .loading:
+            .pending("Loading hidden scenes…")
+        case .live:
+            .connected
+        case .failed(let message):
+            .failed(title: "Monitoring Failed", message: message)
+        }
+    }
+}
+
+private struct SceneListRow: View {
+    let scene: HBSceneStateResult
+    let isEditing: Bool
+    @ObservedObject var model: ServerScenesModel
+    let client: HomeBaseWebSocketClient
+
+    @ViewBuilder
+    var body: some View {
+        if isEditing {
+            NavigationLink {
+                SceneConfigurationDetailView(
+                    sceneName: scene.name,
+                    client: client
+                )
+            } label: {
+                Text(scene.name)
+            }
+            .transition(.opacity)
+        } else {
+            Toggle(
+                isOn: Binding(
+                    get: { model.isPresented(sceneNamed: scene.name) },
+                    set: { isActive in
+                        Task {
+                            await model.setScene(
+                                named: scene.name,
+                                active: isActive
+                            )
+                        }
+                    }
+                )
+            ) {
+                HStack(spacing: 8) {
+                    Text(scene.name)
+                    Spacer(minLength: 8)
+                    SceneActivationAccessory(
+                        countdownDeadline: model.activationDeadline(
+                            sceneNamed: scene.name
+                        ),
+                        priority: model.activePriority(
+                            sceneNamed: scene.name
+                        )
+                    )
+                }
+            }
+            .tint(
+                model.isMatchedOnly(sceneNamed: scene.name)
+                    ? .orange
+                    : .accentColor
+            )
+            .disabled(
+                model.state != .live
+                    || model.isUpdating(sceneNamed: scene.name)
+                    || !model.canToggle(sceneNamed: scene.name)
+            )
+            .accessibilityValue(
+                model.accessibilityValue(sceneNamed: scene.name)
+            )
+            .transition(.opacity)
+        }
     }
 }
 

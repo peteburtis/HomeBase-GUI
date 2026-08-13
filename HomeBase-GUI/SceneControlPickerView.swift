@@ -65,8 +65,7 @@ struct SceneRawControlValueValidator {
     init(control: HBControlDescriptor) {
         schema = ControlValueSchema(
             kind: control.kind,
-            metadata: control.metadata,
-            tags: control.tags
+            metadata: control.metadata
         )
     }
 
@@ -318,7 +317,9 @@ struct SceneControlPickerCatalog {
 
     var rooms: [HBTopologyRoomDescriptor] {
         topology.rooms.filter { room in
-            !devices(in: room).isEmpty || !groups(in: room).isEmpty
+            !devices(in: room).isEmpty
+                || !deviceGroups(in: room).isEmpty
+                || !groups(in: room).isEmpty
         }
     }
 
@@ -328,8 +329,16 @@ struct SceneControlPickerCatalog {
         )
     }
 
+    var topLevelDeviceGroups: [HBTopologyGroupDescriptor] {
+        TopologyGroupPlacement(topology: topology).topLevelDeviceGroups.filter(
+            isSelectable
+        )
+    }
+
     var isEmpty: Bool {
-        rooms.isEmpty && topLevelGroups.isEmpty
+        rooms.isEmpty
+            && topLevelDeviceGroups.isEmpty
+            && topLevelGroups.isEmpty
     }
 
     func groups(
@@ -341,11 +350,39 @@ struct SceneControlPickerCatalog {
     }
 
     func devices(in room: HBTopologyRoomDescriptor) -> [Device] {
-        devices(withIdentifiers: room.resolvedDeviceIdentifiers)
+        devices(
+            in: TopologyGroupPlacement(topology: topology).deviceItems(
+                in: room
+            )
+        )
+    }
+
+    func deviceGroups(
+        in room: HBTopologyRoomDescriptor
+    ) -> [HBTopologyGroupDescriptor] {
+        groups(
+            in: TopologyGroupPlacement(topology: topology).deviceItems(
+                in: room
+            )
+        )
     }
 
     func devices(in group: HBTopologyGroupDescriptor) -> [Device] {
-        devices(withIdentifiers: group.resolvedDeviceIdentifiers)
+        devices(
+            in: TopologyGroupPlacement(topology: topology).deviceItems(
+                in: group
+            )
+        )
+    }
+
+    func deviceGroups(
+        in group: HBTopologyGroupDescriptor
+    ) -> [HBTopologyGroupDescriptor] {
+        groups(
+            in: TopologyGroupPlacement(topology: topology).deviceItems(
+                in: group
+            )
+        )
     }
 
     func controlDevice(for group: HBTopologyGroupDescriptor) -> Device? {
@@ -362,15 +399,23 @@ struct SceneControlPickerCatalog {
         controlDevice(for: group) != nil || !devices(in: group).isEmpty
     }
 
-    private func devices(withIdentifiers identifiers: [String]) -> [Device] {
-        var seen: Set<String> = []
-        return identifiers.compactMap { identifier in
-            guard let device = device(matching: identifier),
-                  seen.insert(device.id).inserted else {
+    private func devices(in items: [TopologyDeviceListItem]) -> [Device] {
+        items.compactMap { item in
+            guard case .device(let descriptor) = item else { return nil }
+            return device(matching: descriptor.identifier)
+        }
+    }
+
+    private func groups(in items: [TopologyDeviceListItem])
+        -> [HBTopologyGroupDescriptor]
+    {
+        items.compactMap { item in
+            guard case .group(let group) = item,
+                  isSelectable(group) else {
                 return nil
             }
-            return device
-        }.sorted(by: Self.deviceSort)
+            return group
+        }
     }
 
     private func device(matching identifier: String) -> Device? {
@@ -413,7 +458,8 @@ struct SceneControlPickerCatalog {
                 HBTopologyDeviceDescriptor(
                     identifier: device.descriptor.identifier,
                     addressableName: device.descriptor.addressableName,
-                    displayName: device.descriptor.displayName
+                    displayName: device.descriptor.displayName,
+                    metadata: device.descriptor.metadata
                 )
             )
         }
@@ -700,10 +746,23 @@ private struct SceneControlPickerTopologyList: View {
                             title: room.displayName,
                             technicalName: catalog.technicalName(for: room),
                             detail: TopologyRowLabel.deviceCountDescription(
-                                room.resolvedDeviceIdentifiers.count
+                                catalog.devices(in: room).count
+                                    + catalog.deviceGroups(in: room).count
                             )
                         )
                     }
+                }
+            }
+
+            if !catalog.topLevelDeviceGroups.isEmpty {
+                Section("Devices") {
+                    SceneControlPickerGroupRows(
+                        groups: catalog.topLevelDeviceGroups,
+                        catalog: catalog,
+                        submittingPath: submittingPath,
+                        choose: choose,
+                        chooseRawValue: chooseRawValue
+                    )
                 }
             }
 
@@ -746,13 +805,26 @@ private struct SceneControlPickerRoomView: View {
         catalog.groups(in: room)
     }
 
+    private var deviceGroups: [HBTopologyGroupDescriptor] {
+        catalog.deviceGroups(in: room)
+    }
+
     var body: some View {
         List {
             Section("Devices") {
                 SceneControlPickerDeviceRows(
                     devices: devices,
-                    emptyMessage:
-                        "No devices with writable controls are available in this room.",
+                    emptyMessage: deviceGroups.isEmpty
+                        ? "No devices with writable controls are available in this room."
+                        : nil,
+                    submittingPath: submittingPath,
+                    choose: choose,
+                    chooseRawValue: chooseRawValue
+                )
+
+                SceneControlPickerGroupRows(
+                    groups: deviceGroups,
+                    catalog: catalog,
                     submittingPath: submittingPath,
                     choose: choose,
                     chooseRawValue: chooseRawValue
@@ -788,6 +860,14 @@ private struct SceneControlPickerGroupView: View {
     let choose: SceneControlPickerChoose
     let chooseRawValue: SceneControlPickerChooseRawValue
 
+    private var devices: [SceneControlPickerCatalog.Device] {
+        catalog.devices(in: group)
+    }
+
+    private var deviceGroups: [HBTopologyGroupDescriptor] {
+        catalog.deviceGroups(in: group)
+    }
+
     var body: some View {
         List {
             if let controlDevice = catalog.controlDevice(for: group) {
@@ -805,9 +885,18 @@ private struct SceneControlPickerGroupView: View {
 
             Section("Devices") {
                 SceneControlPickerDeviceRows(
-                    devices: catalog.devices(in: group),
-                    emptyMessage:
-                        "No member devices with writable controls are available in this group.",
+                    devices: devices,
+                    emptyMessage: deviceGroups.isEmpty
+                        ? "No member devices with writable controls are available in this group."
+                        : nil,
+                    submittingPath: submittingPath,
+                    choose: choose,
+                    chooseRawValue: chooseRawValue
+                )
+
+                SceneControlPickerGroupRows(
+                    groups: deviceGroups,
+                    catalog: catalog,
                     submittingPath: submittingPath,
                     choose: choose,
                     chooseRawValue: chooseRawValue
@@ -820,13 +909,13 @@ private struct SceneControlPickerGroupView: View {
 
 private struct SceneControlPickerDeviceRows: View {
     let devices: [SceneControlPickerCatalog.Device]
-    let emptyMessage: String
+    let emptyMessage: String?
     let submittingPath: String?
     let choose: SceneControlPickerChoose
     let chooseRawValue: SceneControlPickerChooseRawValue
 
     var body: some View {
-        if devices.isEmpty {
+        if devices.isEmpty, let emptyMessage {
             Text(emptyMessage)
                 .foregroundStyle(.secondary)
         } else {
@@ -850,6 +939,30 @@ private struct SceneControlPickerDeviceRows: View {
                             : nil
                     )
                 }
+            }
+        }
+    }
+}
+
+private struct SceneControlPickerGroupRows: View {
+    let groups: [HBTopologyGroupDescriptor]
+    let catalog: SceneControlPickerCatalog
+    let submittingPath: String?
+    let choose: SceneControlPickerChoose
+    let chooseRawValue: SceneControlPickerChooseRawValue
+
+    var body: some View {
+        ForEach(groups, id: \.identifier) { group in
+            NavigationLink {
+                SceneControlPickerGroupView(
+                    group: group,
+                    catalog: catalog,
+                    submittingPath: submittingPath,
+                    choose: choose,
+                    chooseRawValue: chooseRawValue
+                )
+            } label: {
+                TopologyDeviceGroupRow(group: group)
             }
         }
     }

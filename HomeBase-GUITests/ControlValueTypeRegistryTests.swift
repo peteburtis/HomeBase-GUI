@@ -10,6 +10,41 @@ import XCTest
 
 @MainActor
 final class ControlValueTypeRegistryTests: XCTestCase {
+    func testHiddenMetadataRequiresBooleanTrue() {
+        XCTAssertTrue(["hidden": HBJSONValue.bool(true)].hasHiddenFlag)
+        XCTAssertFalse(["hidden": HBJSONValue.bool(false)].hasHiddenFlag)
+        XCTAssertFalse(["hidden": HBJSONValue.string("true")].hasHiddenFlag)
+        XCTAssertFalse([String: HBJSONValue]().hasHiddenFlag)
+    }
+
+    func testTopologyHiddenDeviceLookupUsesTopologyMetadata() {
+        let topology = HBTopologyListResult(
+            devices: [
+                HBTopologyDeviceDescriptor(
+                    identifier: "hidden-device-id",
+                    addressableName: "HiddenDevice",
+                    displayName: "Hidden Device",
+                    metadata: ["hidden": true]
+                ),
+                HBTopologyDeviceDescriptor(
+                    identifier: "visible-device-id",
+                    addressableName: "VisibleDevice",
+                    displayName: "Visible Device"
+                ),
+            ],
+            rooms: [],
+            groups: []
+        )
+
+        XCTAssertTrue(
+            topology.isHiddenDevice(identifiedBy: "hidden-device-id")
+        )
+        XCTAssertFalse(
+            topology.isHiddenDevice(identifiedBy: "visible-device-id")
+        )
+        XCTAssertFalse(topology.isHiddenDevice(identifiedBy: "missing"))
+    }
+
     func testStandardRegistrySelectsKnownKindsCaseInsensitively() {
         XCTAssertEqual(
             resolve("bInArYsWiTcH").plugin.identifier,
