@@ -807,6 +807,19 @@ private final class SceneConfigurationRemoteClientSpy:
         )
     }
 
+    func replaceControlHold(
+        token: String,
+        with value: HBJSONValue,
+        transitionSeconds: TimeInterval?
+    ) async throws -> HBControlHoldReplaceResult {
+        events.append("replace:\(token)")
+        return HBControlHoldReplaceResult(
+            token: token,
+            control: "",
+            value: value
+        )
+    }
+
     func releaseControlHold(token: String) async throws
         -> HBControlReleaseResult
     {

@@ -786,6 +786,32 @@ actor HomeBaseWebSocketClient {
         return try body.decodedResult(as: HBControlHoldResult.self)
     }
 
+    func replaceControlHold(
+        token: String,
+        with value: HBJSONValue,
+        transitionSeconds: TimeInterval? = nil
+    ) async throws -> HBControlHoldReplaceResult {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.replaceControlHold,
+            payload: HBControlHoldReplaceRequest(
+                token: token,
+                value: value,
+                transitionSeconds: transitionSeconds
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(
+            as: HBControlHoldReplaceResult.self
+        )
+        guard result.token == token else {
+            throw ClientError.invalidMessage(
+                "a hold replacement returned a different token"
+            )
+        }
+        return result
+    }
+
     func releaseControlHold(token: String) async throws
         -> HBControlReleaseResult
     {
@@ -799,6 +825,24 @@ actor HomeBaseWebSocketClient {
         let response = try await sendRequest(request)
         let body = try response.decodedPayload(as: HBProtocolResponse.self)
         return try body.decodedResult(as: HBControlReleaseResult.self)
+    }
+
+    func clearControlOverride(_ control: String) async throws {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.clearControlOverride,
+            payload: HBControlOverrideClearRequest(control: control)
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        try body.validate()
+        if let error = body.error {
+            throw error
+        }
+        guard body.status == .success else {
+            throw ClientError.invalidMessage(
+                "an external-override clear failed without an error"
+            )
+        }
     }
 
     func deviceDetails(

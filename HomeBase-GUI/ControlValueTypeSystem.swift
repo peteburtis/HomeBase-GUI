@@ -56,6 +56,39 @@ struct ControlValueSchema: Equatable {
         }
         return minimum ... maximum
     }
+
+    var selectionChoices: [ControlValueSelectionChoice]? {
+        guard !isStructured,
+              let entries = metadata["choices"]?.arrayValue,
+              entries.count >= 2 else {
+            return nil
+        }
+
+        var choices: [ControlValueSelectionChoice] = []
+        choices.reserveCapacity(entries.count)
+        for entry in entries {
+            guard let object = entry.objectValue,
+                  let value = object["value"],
+                  value.isScalarControlValue,
+                  let label = object["label"]?.stringValue,
+                  !label.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty,
+                  !choices.contains(where: {
+                      $0.value.isEquivalentControlValue(to: value)
+                  }) else {
+                return nil
+            }
+            choices.append(
+                ControlValueSelectionChoice(value: value, label: label)
+            )
+        }
+        return choices
+    }
+}
+
+struct ControlValueSelectionChoice: Equatable {
+    let value: HBJSONValue
+    let label: String
 }
 
 /// One source-independent value snapshot. Live controls and scene drafts both
@@ -177,6 +210,22 @@ extension HBControlDescriptor {
 }
 
 extension HBJSONValue {
+    fileprivate var isScalarControlValue: Bool {
+        switch self {
+        case .null, .bool, .integer, .number, .string:
+            true
+        case .array, .object:
+            false
+        }
+    }
+
+    func isEquivalentControlValue(to other: HBJSONValue) -> Bool {
+        if let number = numberValue, let otherNumber = other.numberValue {
+            return number == otherNumber
+        }
+        return self == other
+    }
+
     var presentationText: String {
         switch self {
         case .null:

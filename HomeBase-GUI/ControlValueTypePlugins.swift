@@ -14,6 +14,7 @@ extension ControlValueTypeRegistry {
                 standaloneEditing: ColorControlValuePlugin()
             ),
             AnyControlValueTypePlugin(BinarySwitchControlValuePlugin()),
+            AnyControlValueTypePlugin(SelectionControlValuePlugin()),
             AnyControlValueTypePlugin(ScalarSliderControlValuePlugin()),
         ],
         fallback: AnyControlValueTypePlugin(FallbackControlValuePlugin())
@@ -35,6 +36,100 @@ private struct FallbackControlValuePlugin: ControlValueTypePlugin {
 
     func makeBody(context: ControlValuePresentationContext) -> some View {
         ControlValueTextReadout(context.snapshot.displayText)
+    }
+}
+
+private struct SelectionControlValuePlugin: ControlValueTypePlugin {
+    let identifier = "selection"
+
+    func matchScore(for schema: ControlValueSchema) -> Int? {
+        guard schema.presentationHint == "selection",
+              schema.selectionChoices != nil else {
+            return nil
+        }
+        return ControlValueTypeMatchSpecificity.genericCapabilities
+    }
+
+    func presentsStaleness(
+        for snapshot: ControlValueSnapshot
+    ) -> Bool {
+        false
+    }
+
+    func supportsEditing(
+        context: ControlValuePresentationContext
+    ) -> Bool {
+        SelectionControlValueBody.editor(for: context) != nil
+    }
+
+    func makeBody(context: ControlValuePresentationContext) -> some View {
+        SelectionControlValueBody(context: context)
+    }
+}
+
+private struct SelectionControlValueBody: View {
+    struct Editor {
+        let choices: [ControlValueSelectionChoice]
+        let selectedIndex: Int
+    }
+
+    let context: ControlValuePresentationContext
+
+    var body: some View {
+        if let editor {
+            Picker(
+                "",
+                selection: Binding(
+                    get: { editor.selectedIndex },
+                    set: { selectedIndex in
+                        guard editor.choices.indices.contains(selectedIndex)
+                        else { return }
+                        let value = editor.choices[selectedIndex].value
+                        Task {
+                            try? await context.interaction.commit(value, .inline)
+                        }
+                    }
+                )
+            ) {
+                ForEach(editor.choices.indices, id: \.self) { index in
+                    Text(editor.choices[index].label).tag(index)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .disabled(
+                !context.interaction.isEnabled
+                    || context.interaction.isUpdating
+            )
+            .accessibilityLabel(context.accessibilityLabel)
+            .accessibilityValue(
+                editor.choices[editor.selectedIndex].label
+            )
+        } else {
+            ControlValueTextReadout(context.snapshot.displayText)
+        }
+    }
+
+    private var editor: Editor? {
+        Self.editor(for: context)
+    }
+
+    fileprivate static func editor(
+        for context: ControlValuePresentationContext
+    ) -> Editor? {
+        guard context.schema.isReadable,
+              context.schema.isWritable,
+              !context.schema.isStructured,
+              context.snapshot.aggregateState != .mixed,
+              context.snapshot.aggregateState != .unavailable,
+              let value = context.snapshot.value,
+              let choices = context.schema.selectionChoices,
+              let selectedIndex = choices.firstIndex(where: {
+                  $0.value.isEquivalentControlValue(to: value)
+              }) else {
+            return nil
+        }
+        return Editor(choices: choices, selectedIndex: selectedIndex)
     }
 }
 

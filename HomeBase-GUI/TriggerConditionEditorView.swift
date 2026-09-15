@@ -623,13 +623,19 @@ private struct TriggerConditionControlPicker: View {
     private func supportedControls(
         _ device: HBDeviceDescriptor
     ) -> [HBControlDescriptor] {
-        device.controls.filter { control in
+        let readableControls = device.controls.filter { control in
             let schema = ControlValueSchema(
                 kind: control.kind,
                 metadata: control.metadata
             )
             return schema.isReadable && !schema.isStructured
-        }.sorted {
+        }
+        return SuggestedControlDisplayOrder(
+            metadata: device.metadata
+        ).sorted(
+            readableControls,
+            identifier: { $0.identifier }
+        ) {
             let order = $0.name.localizedCaseInsensitiveCompare($1.name)
             return order == .orderedSame
                 ? $0.identifier < $1.identifier

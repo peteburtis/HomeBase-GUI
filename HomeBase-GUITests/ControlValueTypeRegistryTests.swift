@@ -133,6 +133,101 @@ final class ControlValueTypeRegistryTests: XCTestCase {
         )
     }
 
+    func testSelectionPresentationHintSelectsChoicePopupForUnknownKind() {
+        let schema = ControlValueSchema(
+            kind: "PTZ.Cruise",
+            metadata: selectionMetadata()
+        )
+        let resolution = ControlValueTypeRegistry.standard.resolve(schema)
+        let context = editableContext(
+            kind: "PTZ.Cruise",
+            value: .integer(1),
+            metadata: selectionMetadata(choiceValueRepresentation: .number)
+        )
+
+        XCTAssertEqual(resolution.plugin.identifier, "selection")
+        XCTAssertEqual(
+            resolution.score,
+            ControlValueTypeMatchSpecificity.genericCapabilities
+        )
+        XCTAssertEqual(
+            schema.selectionChoices,
+            [
+                .init(value: .integer(0), label: "off"),
+                .init(value: .integer(1), label: "horizontal"),
+                .init(value: .integer(2), label: "vertical"),
+            ]
+        )
+        XCTAssertTrue(resolution.plugin.supportsEditing(context: context))
+    }
+
+    func testSelectionRequiresValidDistinctScalarChoices() {
+        let missingLabel: [String: HBJSONValue] = [
+            "presentation": "selection",
+            "structured": false,
+            "choices": [
+                ["value": 0, "label": "off"],
+                ["value": 1],
+            ],
+        ]
+        let duplicateNumericValue: [String: HBJSONValue] = [
+            "presentation": "selection",
+            "structured": false,
+            "choices": .array([
+                .object(["value": .integer(1), "label": "integer"]),
+                .object(["value": .number(1), "label": "number"]),
+            ]),
+        ]
+
+        XCTAssertEqual(
+            ControlValueTypeRegistry.standard.resolve(
+                ControlValueSchema(kind: "MissingLabel", metadata: missingLabel)
+            ).plugin.identifier,
+            "fallback"
+        )
+        XCTAssertEqual(
+            ControlValueTypeRegistry.standard.resolve(
+                ControlValueSchema(
+                    kind: "DuplicateValue",
+                    metadata: duplicateNumericValue
+                )
+            ).plugin.identifier,
+            "fallback"
+        )
+        XCTAssertEqual(
+            ControlValueTypeRegistry.standard.resolve(
+                ControlValueSchema(
+                    kind: "Structured",
+                    metadata: selectionMetadata().merging([
+                        "structured": true,
+                    ]) { _, new in new }
+                )
+            ).plugin.identifier,
+            "fallback"
+        )
+    }
+
+    func testSelectionEditorRequiresWritableValuePresentInChoices() {
+        let resolution = ControlValueTypeRegistry.standard.resolve(
+            ControlValueSchema(
+                kind: "PTZ.Cruise",
+                metadata: selectionMetadata()
+            )
+        )
+
+        XCTAssertFalse(resolution.plugin.supportsEditing(context: editableContext(
+            kind: "PTZ.Cruise",
+            value: 3,
+            metadata: selectionMetadata()
+        )))
+        XCTAssertFalse(resolution.plugin.supportsEditing(context: editableContext(
+            kind: "PTZ.Cruise",
+            value: 0,
+            writable: false,
+            metadata: selectionMetadata()
+        )))
+    }
+
     func testUnknownAndUnsupportedSchemaVersionsUseFallback() {
         XCTAssertEqual(
             resolve("position-v1").plugin.identifier,
@@ -383,16 +478,17 @@ final class ControlValueTypeRegistryTests: XCTestCase {
     private func editableContext(
         kind: String,
         value: HBJSONValue,
-        writable: Bool = true
+        writable: Bool = true,
+        metadata additionalMetadata: [String: HBJSONValue] = [:]
     ) -> ControlValuePresentationContext {
-        ControlValuePresentationContext(
+        var metadata = additionalMetadata
+        metadata["readable"] = true
+        metadata["writable"] = .bool(writable)
+        metadata["structured"] = false
+        return ControlValuePresentationContext(
             schema: ControlValueSchema(
                 kind: kind,
-                metadata: [
-                    "readable": true,
-                    "writable": .bool(writable),
-                    "structured": false,
-                ]
+                metadata: metadata
             ),
             snapshot: ControlValueSnapshot(
                 value: value,
@@ -411,6 +507,35 @@ final class ControlValueTypeRegistryTests: XCTestCase {
             accessibilityLabel: "Test Control",
             controlPath: "TestDevice:\(kind)"
         )
+    }
+
+    private enum ChoiceValueRepresentation {
+        case integer
+        case number
+    }
+
+    private func selectionMetadata(
+        choiceValueRepresentation: ChoiceValueRepresentation = .integer
+    ) -> [String: HBJSONValue] {
+        func value(_ integer: Int64) -> HBJSONValue {
+            switch choiceValueRepresentation {
+            case .integer: .integer(integer)
+            case .number: .number(Double(integer))
+            }
+        }
+        return [
+            "presentation": "selection",
+            "readable": true,
+            "writable": true,
+            "structured": false,
+            "minimum": 0,
+            "maximum": 2,
+            "choices": .array([
+                .object(["value": value(0), "label": "off"]),
+                .object(["value": value(1), "label": "horizontal"]),
+                .object(["value": value(2), "label": "vertical"]),
+            ]),
+        ]
     }
 
     private func rawControl(

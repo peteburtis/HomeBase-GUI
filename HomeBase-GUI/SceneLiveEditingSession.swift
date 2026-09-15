@@ -66,6 +66,7 @@ actor SceneLiveEditingSession {
 
     private let client: any SceneLiveEditingRemoteClient
     private var currentHolds: [String: HeldTarget] = [:]
+    private var currentOrder: [String] = []
     private var cleanupHolds: [String: HeldTarget] = [:]
     private var owningSessionIdentifier: UUID?
     private var active = false
@@ -92,6 +93,13 @@ actor SceneLiveEditingSession {
         guard active else { return }
         try await prepareActiveSession()
 
+        // A structurally removed token that failed release still owns its
+        // original leaf footprint. Resolve that cleanup before calculating or
+        // acquiring a replacement order for any path.
+        for hold in cleanupHolds.values.sorted(by: { $0.token < $1.token }) {
+            try await release(hold)
+        }
+
         var desired: [String: SceneLiveEditingTarget] = [:]
         var desiredPaths: [String] = []
         for target in targets {
@@ -101,15 +109,62 @@ actor SceneLiveEditingSession {
             desired[path] = target
         }
 
-        // Acquire each addition or replacement before releasing the hold it
-        // supersedes. That prevents the real device from briefly falling
-        // through to its lower-priority state as an editor value changes.
-        for path in desiredPaths {
+        let orderedCurrentPaths = currentOrder.filter {
+            currentHolds[$0] != nil
+        }
+        let survivingCurrentPaths = orderedCurrentPaths.filter {
+            desired[$0] != nil
+        }
+        var survivingIndex = 0
+        var rebuildStart: Int?
+        for (index, path) in desiredPaths.enumerated() {
+            guard currentHolds[path] != nil,
+                  survivingIndex < survivingCurrentPaths.count,
+                  survivingCurrentPaths[survivingIndex] == path else {
+                rebuildStart = index
+                break
+            }
+            survivingIndex += 1
+        }
+        let rebuildPaths = Set(
+            rebuildStart.map {
+                desiredPaths[$0...].filter { currentHolds[$0] != nil }
+            } ?? []
+        )
+
+        // A value-only edit retains its logical layer and authored order.
+        // Structural insertion or reordering releases the affected existing
+        // suffix first, then reacquires that suffix in authored order.
+        let stablePaths = rebuildStart.map {
+            Array(desiredPaths[..<$0])
+        } ?? desiredPaths
+        for path in stablePaths {
             guard let target = desired[path] else { continue }
-            if currentHolds[path]?.target == target {
+            if let current = currentHolds[path] {
+                guard current.target != target else { continue }
+                let result = try await client.replaceControlHold(
+                    token: current.token,
+                    with: target.value,
+                    transitionSeconds: nil
+                )
+                currentHolds[path] = HeldTarget(
+                    target: target,
+                    token: result.token
+                )
+            }
+        }
+
+        for path in orderedCurrentPaths where rebuildPaths.contains(path) {
+            try await stageAndRelease(path: path)
+        }
+
+        let acquisitionPaths = rebuildStart.map {
+            Array(desiredPaths[$0...])
+        } ?? []
+        for path in acquisitionPaths {
+            guard let target = desired[path], currentHolds[path] == nil else {
                 continue
             }
-
             let result = try await client.holdControl(
                 target.controlPath,
                 at: target.value,
@@ -117,28 +172,18 @@ actor SceneLiveEditingSession {
                 priority: Int(AutomationPresentationFormat.userPriority),
                 lifetime: .session
             )
-            let replacement = HeldTarget(
+            currentHolds[path] = HeldTarget(
                 target: target,
                 token: result.token
             )
-
-            if let previous = currentHolds.updateValue(
-                replacement,
-                forKey: path
-            ) {
-                cleanupHolds[previous.token] = previous
-                try await release(previous)
-            }
+            currentOrder.append(path)
         }
 
-        let removedPaths = currentHolds.keys.filter { desired[$0] == nil }
+        let removedPaths = orderedCurrentPaths.filter { desired[$0] == nil }
         for path in removedPaths {
-            guard let removed = currentHolds.removeValue(forKey: path) else {
-                continue
-            }
-            cleanupHolds[removed.token] = removed
-            try await release(removed)
+            try await stageAndRelease(path: path)
         }
+        currentOrder = desiredPaths.filter { currentHolds[$0] != nil }
     }
 
     func stop() async throws {
@@ -150,6 +195,7 @@ actor SceneLiveEditingSession {
         )
 
         guard !allHolds.isEmpty else {
+            currentOrder.removeAll()
             active = false
             owningSessionIdentifier = nil
             return
@@ -165,6 +211,7 @@ actor SceneLiveEditingSession {
             // The server releases session-scoped holds with the old session.
             // Its tokens cannot belong to this replacement session.
             currentHolds.removeAll()
+            currentOrder.removeAll()
             cleanupHolds.removeAll()
             self.owningSessionIdentifier = nil
             active = false
@@ -186,6 +233,7 @@ actor SceneLiveEditingSession {
             throw firstError
         }
         owningSessionIdentifier = nil
+        currentOrder.removeAll()
         active = false
     }
 
@@ -206,8 +254,24 @@ actor SceneLiveEditingSession {
             // valid token. The hold is already gone, which is our goal.
         }
 
+        let releasedPaths = Set(
+            currentHolds.compactMap { path, current in
+                current.token == hold.token ? path : nil
+            }
+        )
         currentHolds = currentHolds.filter { $0.value.token != hold.token }
+        currentOrder.removeAll { releasedPaths.contains($0) }
         cleanupHolds[hold.token] = nil
+    }
+
+    private func stageAndRelease(path: String) async throws {
+        guard let removed = currentHolds.removeValue(forKey: path) else {
+            currentOrder.removeAll { $0 == path }
+            return
+        }
+        currentOrder.removeAll { $0 == path }
+        cleanupHolds[removed.token] = removed
+        try await release(removed)
     }
 
     private func prepareActiveSession() async throws {
@@ -223,6 +287,7 @@ actor SceneLiveEditingSession {
             // retire) the old session-scoped holds. Reacquire every desired
             // target rather than trusting now-stale local tokens.
             currentHolds.removeAll()
+            currentOrder.removeAll()
             cleanupHolds.removeAll()
         }
         owningSessionIdentifier = sessionIdentifier

@@ -258,6 +258,7 @@ final class LiveDeviceControlsModel: ObservableObject {
     private var subscriptionID: UUID?
     private var detailsByIdentifier: [String: HBControlDescriptor] = [:]
     private var controlsByIdentity: [String: LiveDeviceControl] = [:]
+    private var suggestedControlOrder = SuggestedControlDisplayOrder()
 
     init(
         device: HBTopologyDeviceDescriptor?,
@@ -280,6 +281,9 @@ final class LiveDeviceControlsModel: ObservableObject {
             }
             let details = try await client.deviceDetails(for: device)
             try Task.checkCancellation()
+            suggestedControlOrder = SuggestedControlDisplayOrder(
+                metadata: details.metadata
+            )
             detailsByIdentifier = Dictionary(
                 uniqueKeysWithValues: details.controls.map {
                     ($0.identifier.lowercased(), $0)
@@ -605,19 +609,22 @@ final class LiveDeviceControlsModel: ObservableObject {
     }
 
     private func publishControls() {
-        controls = controlsByIdentity.values.sorted {
-            if $0.isPrimary != $1.isPrimary {
-                return $0.isPrimary
+        controls = suggestedControlOrder.sorted(
+            Array(controlsByIdentity.values),
+            identifier: { $0.descriptor.controlIdentifier }
+        ) { left, right in
+            if left.isPrimary != right.isPrimary {
+                return left.isPrimary
             }
 
-            let displayOrder = $0.displayName
-                .localizedCaseInsensitiveCompare($1.displayName)
+            let displayOrder = left.displayName
+                .localizedCaseInsensitiveCompare(right.displayName)
             if displayOrder != .orderedSame {
                 return displayOrder == .orderedAscending
             }
-            return $0.descriptor.controlIdentifier
+            return left.descriptor.controlIdentifier
                 .localizedCaseInsensitiveCompare(
-                    $1.descriptor.controlIdentifier
+                    right.descriptor.controlIdentifier
                 ) == .orderedAscending
         }
     }

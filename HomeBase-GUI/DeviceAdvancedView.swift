@@ -103,28 +103,39 @@ private struct AdvancedControlsSection: View {
             } else {
                 ForEach(controls) { control in
                     DisclosureGroup {
-                        if let externalOverride = control.stack?.externalOverride {
-                            AdvancedExternalOverrideRow(
-                                override: externalOverride,
-                                canClear: overrideClearingEnabled
-                                    && control.activeHold != nil,
-                                clear: {
+                        if let aggregate = control.stack?.aggregateStack {
+                            AdvancedAggregateStackRows(
+                                control: control,
+                                aggregate: aggregate,
+                                canClearOverride: overrideClearingEnabled,
+                                clearOverride: {
                                     try await clearExternalOverride(control)
                                 }
                             )
-                        }
+                        } else {
+                            if let externalOverride =
+                                control.stack?.externalOverride {
+                                AdvancedExternalOverrideRow(
+                                    override: externalOverride,
+                                    canClear: overrideClearingEnabled,
+                                    clear: {
+                                        try await clearExternalOverride(control)
+                                    }
+                                )
+                            }
 
-                        ForEach(control.holds, id: \.identifier) { hold in
-                            AdvancedRawValueRow(
-                                title: "Priority \(hold.priority)",
-                                value: hold.value,
-                                details: control.holdDetails(hold),
-                                prominence:
-                                    control.stack?.externalOverride == nil
-                                        && hold.active
-                                        ? .active
-                                        : .inactive
-                            )
+                            ForEach(control.holds, id: \.identifier) { hold in
+                                AdvancedRawValueRow(
+                                    title: "Priority \(hold.priority)",
+                                    value: hold.value,
+                                    details: control.holdDetails(hold),
+                                    prominence:
+                                        control.stack?.externalOverride == nil
+                                            && hold.active
+                                            ? .active
+                                            : .inactive
+                                )
+                            }
                         }
 
                         AdvancedRawValueRow(
@@ -163,6 +174,206 @@ private struct AdvancedControlsSection: View {
                 .font(.headline)
                 .foregroundStyle(.primary)
         }
+    }
+}
+
+private struct AdvancedAggregateStackRows: View {
+    let control: DeviceAdvancedControl
+    let aggregate: HBControlStackAggregate
+    let canClearOverride: Bool
+    let clearOverride: () async throws -> Void
+
+    var body: some View {
+        if let externalOverride = aggregate.externalOverride {
+            AdvancedAggregateExternalOverrideRow(
+                presentation: DeviceAdvancedAggregateOverridePresentation(
+                    value: externalOverride,
+                    constituentCount: aggregate.constituentCount
+                ),
+                canClear: canClearOverride,
+                clear: clearOverride
+            )
+        }
+
+        ForEach(
+            aggregate.layers.map {
+                DeviceAdvancedAggregateLayerPresentation(
+                    controlPath: control.controlPath,
+                    layer: $0,
+                    constituentCount: aggregate.constituentCount
+                )
+            }
+        ) { layer in
+            AdvancedAggregateLayerRow(presentation: layer)
+        }
+
+        DisclosureGroup("Constituent stacks") {
+            if aggregate.constituents.isEmpty {
+                Text("No constituent stacks are available.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(
+                    aggregate.constituents.map(
+                        DeviceAdvancedConstituentPresentation.init
+                    )
+                ) { constituent in
+                    AdvancedConstituentStackRows(
+                        presentation: constituent
+                    )
+                }
+            }
+        }
+    }
+}
+
+private struct AdvancedAggregateLayerRow: View {
+    let presentation: DeviceAdvancedAggregateLayerPresentation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(presentation.title)
+                .font(.subheadline)
+
+            Text(presentation.valueText)
+                .font(.body.monospaced())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            ForEach(presentation.details, id: \.self) { detail in
+                Text(detail)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(.vertical, 2)
+        .foregroundStyle(
+            presentation.isActive ? Color.primary : Color.secondary
+        )
+    }
+}
+
+private struct AdvancedAggregateExternalOverrideRow: View {
+    let presentation: DeviceAdvancedAggregateOverridePresentation
+    let canClear: Bool
+    let clear: () async throws -> Void
+
+    @State private var isClearing = false
+    @State private var clearError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("External override")
+                        .font(.subheadline)
+                    Text(presentation.observedValueText)
+                        .font(.body.monospaced())
+                        .textSelection(.enabled)
+                    Text("return: \(presentation.returnValueText)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Text(presentation.coverageText)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Button {
+                    Task {
+                        isClearing = true
+                        clearError = nil
+                        do {
+                            try await clear()
+                        } catch {
+                            clearError = error.localizedDescription
+                        }
+                        isClearing = false
+                    }
+                } label: {
+                    if isClearing {
+                        ProgressView()
+                            .controlSize(.small)
+                            .frame(width: 28, height: 28)
+                    } else {
+                        Image(systemName: "xmark.circle")
+                            .font(.title2)
+                            .frame(width: 28, height: 28)
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(!canClear || isClearing)
+                .accessibilityLabel("Clear external override")
+            }
+
+            if let clearError {
+                Label(clearError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private struct AdvancedConstituentStackRows: View {
+    let presentation: DeviceAdvancedConstituentPresentation
+
+    var body: some View {
+        DisclosureGroup {
+            if let externalOverride = presentation.externalOverride {
+                AdvancedExternalOverrideRow(
+                    override: externalOverride,
+                    canClear: false,
+                    clear: {}
+                )
+            } else if presentation.hasUnavailableExternalOverride {
+                AdvancedUnavailableExternalOverrideRow()
+            }
+
+            if presentation.holds.isEmpty {
+                Text("No retained layers.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(presentation.holds) { row in
+                    AdvancedRawValueRow(
+                        title: "Priority \(row.hold.priority)",
+                        value: row.hold.value,
+                        valueText: row.valueText,
+                        details: DeviceAdvancedControl.constituentHoldDetails(
+                            row.hold
+                        ),
+                        prominence:
+                            presentation.hasExternalOverrideSuppression == false
+                                && row.hold.active
+                                ? .active
+                                : .inactive
+                    )
+                }
+            }
+        } label: {
+            Text(presentation.controlPath)
+                .font(.subheadline.monospaced())
+        }
+    }
+}
+
+private struct AdvancedUnavailableExternalOverrideRow: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("External override")
+                .font(.subheadline)
+            Text("Unavailable")
+                .font(.body.monospaced())
+            Text(
+                "This leaf is suppressing retained intent, but its override "
+                    + "value is unavailable."
+            )
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
     }
 }
 
@@ -340,6 +551,7 @@ private struct AdvancedRawValueRow: View {
 
     let title: String?
     let value: HBJSONValue
+    var valueText: String? = nil
     var displayValue: String? = nil
     let details: [String]
     let prominence: Prominence
@@ -351,7 +563,7 @@ private struct AdvancedRawValueRow: View {
                     .font(.subheadline)
             }
 
-            Text(value.rawJSONString)
+            Text(presentedValueText)
                 .font(.body.monospaced())
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -379,10 +591,178 @@ private struct AdvancedRawValueRow: View {
         let trimmed = displayValue.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
-        guard !trimmed.isEmpty, trimmed != value.rawJSONString else {
+        guard !trimmed.isEmpty, trimmed != presentedValueText else {
             return nil
         }
         return trimmed
+    }
+
+    private var presentedValueText: String {
+        valueText ?? value.rawJSONString
+    }
+}
+
+struct DeviceAdvancedAggregateLayerPresentation: Identifiable, Equatable {
+    let controlPath: String
+    let layer: HBControlStackLayer
+    let constituentCount: Int
+
+    var id: String {
+        "\(controlPath.lowercased())#\(layer.identifier.uuidString.lowercased())"
+    }
+
+    var title: String {
+        switch layer.kind {
+        case .base:
+            "Base"
+        case .hold:
+            "Priority \(layer.priority)"
+        }
+    }
+
+    var valueText: String {
+        DeviceAdvancedAggregateValuePresentation.text(
+            state: layer.aggregateState,
+            value: layer.value,
+            values: layer.values,
+            valueStates: layer.valueStates
+        )
+    }
+
+    var details: [String] {
+        var result = [
+            "coverage: \(layer.coverageCount) of \(constituentCount)",
+            "retained winner: \(layer.activeCount) of \(constituentCount)",
+            "logical layer: \(layer.identifier.uuidString.lowercased())",
+        ]
+        if let sourceName = layer.sourceName {
+            result.append("source: \(sourceName)")
+        }
+        if let timing = layer.timing {
+            result.append(
+                "timing: {\"delay\":\(timing.delay.rawJSONString),"
+                    + "\"duration\":\(timing.duration.rawJSONString)}"
+            )
+        }
+        return result
+    }
+
+    var isActive: Bool {
+        layer.activeCount > 0
+    }
+}
+
+struct DeviceAdvancedAggregateOverridePresentation: Equatable {
+    let value: HBControlStackAggregateOverride
+    let constituentCount: Int
+
+    var observedValueText: String {
+        DeviceAdvancedAggregateValuePresentation.text(
+            state: value.observedState,
+            value: value.observedValue,
+            values: value.observedValues,
+            valueStates: value.observedValueStates
+        )
+    }
+
+    var returnValueText: String {
+        DeviceAdvancedAggregateValuePresentation.text(
+            state: value.capturedReturnState,
+            value: value.capturedReturnValue,
+            values: value.capturedReturnValues,
+            valueStates: value.capturedReturnValueStates
+        )
+    }
+
+    var coverageText: String {
+        "coverage: \(value.coverageCount) of \(constituentCount)"
+    }
+}
+
+struct DeviceAdvancedConstituentHoldPresentation: Identifiable, Equatable {
+    let controlPath: String
+    let hold: HBHoldDescriptor
+
+    var id: String {
+        let layerID = hold.logicalLayerID ?? hold.identifier
+        return "\(controlPath.lowercased())#\(layerID.uuidString.lowercased())"
+    }
+
+    var valueText: String {
+        switch hold.valueState {
+        case .unavailable:
+            "Unavailable"
+        case .uncovered:
+            "Uncovered"
+        case .defined, .none:
+            hold.value.rawJSONString
+        }
+    }
+}
+
+struct DeviceAdvancedConstituentPresentation: Identifiable, Equatable {
+    let value: HBControlStackConstituent
+
+    var id: String {
+        controlPath.lowercased()
+    }
+
+    var controlPath: String {
+        "\(value.control.deviceIdentifier):\(value.control.controlIdentifier)"
+    }
+
+    var holds: [DeviceAdvancedConstituentHoldPresentation] {
+        value.holds.map {
+            DeviceAdvancedConstituentHoldPresentation(
+                controlPath: controlPath,
+                hold: $0
+            )
+        }
+    }
+
+    var externalOverride: HBExternalControlOverrideDescriptor? {
+        value.externalOverride
+    }
+
+    var hasUnavailableExternalOverride: Bool {
+        hasExternalOverrideSuppression && value.externalOverride == nil
+    }
+
+    var hasExternalOverrideSuppression: Bool {
+        value.hasExternalOverrideSuppression
+            ?? (value.externalOverride != nil)
+    }
+}
+
+private enum DeviceAdvancedAggregateValuePresentation {
+    static func text(
+        state: HBControlAggregateState,
+        value: HBJSONValue?,
+        values: [HBJSONValue?]?,
+        valueStates: [HBControlStackValueState]? = nil
+    ) -> String {
+        switch state {
+        case .defined:
+            return value?.rawJSONString ?? "Defined"
+        case .mixed:
+            guard let values, !values.isEmpty else { return "Mixed" }
+            let alignedValues = values.enumerated().map { index, value in
+                guard let valueStates, index < valueStates.count else {
+                    return value?.rawJSONString ?? "—"
+                }
+                switch valueStates[index] {
+                case .defined:
+                    return value?.rawJSONString ?? HBJSONValue.null.rawJSONString
+                case .unavailable:
+                    return "Unavailable"
+                case .uncovered:
+                    return "—"
+                }
+            }.joined(separator: ", ")
+            return "Mixed [\(alignedValues)]"
+        case .unavailable:
+            return "Unavailable"
+        }
     }
 }
 
@@ -399,10 +779,6 @@ private struct DeviceAdvancedControl: Identifiable {
 
     var holds: [HBHoldDescriptor] {
         stack?.holds ?? []
-    }
-
-    var activeHold: HBHoldDescriptor? {
-        holds.first { $0.active }
     }
 
     var observedValue: HBJSONValue {
@@ -436,7 +812,26 @@ private struct DeviceAdvancedControl: Identifiable {
     }
 
     func holdDetails(_ hold: HBHoldDescriptor) -> [String] {
+        Self.holdDetails(hold, includeLogicalLayer: false)
+    }
+
+    static func constituentHoldDetails(
+        _ hold: HBHoldDescriptor
+    ) -> [String] {
+        holdDetails(hold, includeLogicalLayer: true)
+    }
+
+    private static func holdDetails(
+        _ hold: HBHoldDescriptor,
+        includeLogicalLayer: Bool
+    ) -> [String] {
         var details: [String] = []
+        if includeLogicalLayer,
+           let logicalLayerID = hold.logicalLayerID {
+            details.append(
+                "logical layer: \(logicalLayerID.uuidString.lowercased())"
+            )
+        }
         if let sourceName = hold.sourceName {
             details.append("source: \(sourceName)")
         }
@@ -467,14 +862,11 @@ private final class DeviceAdvancedModel: ObservableObject {
 
     private enum OverrideReleaseError: LocalizedError {
         case unavailable
-        case noRetainedValue
 
         var errorDescription: String? {
             switch self {
             case .unavailable:
                 "The override is no longer available."
-            case .noRetainedValue:
-                "The control has no active retained value to return to."
             }
         }
     }
@@ -489,6 +881,7 @@ private final class DeviceAdvancedModel: ObservableObject {
     private var stackSubscriptionID: UUID?
     private var stackMonitorTask: Task<Void, Never>?
     private var controlsByIdentifier: [String: DeviceAdvancedControl] = [:]
+    private var suggestedControlOrder = SuggestedControlDisplayOrder()
 
     init(
         device: HBTopologyDeviceDescriptor,
@@ -511,6 +904,9 @@ private final class DeviceAdvancedModel: ObservableObject {
             let details = try await client.deviceDetails(for: device)
             try Task.checkCancellation()
             deviceDetails = details
+            suggestedControlOrder = SuggestedControlDisplayOrder(
+                metadata: details.metadata
+            )
 
             let controlSubscription = try await client.subscribe(
                 to: device,
@@ -564,21 +960,11 @@ private final class DeviceAdvancedModel: ObservableObject {
         guard state == .live,
               let control = controlsByIdentifier[identifier.lowercased()],
               let stack = control.stack,
-              stack.externalOverride != nil else {
+              stack.externalOverride != nil
+                || stack.aggregateStack?.externalOverride != nil else {
             throw OverrideReleaseError.unavailable
         }
-        guard let activeHold = control.activeHold else {
-            throw OverrideReleaseError.noRetainedValue
-        }
-
-        // External-override writes matching the current retained intent are
-        // the protocol's release operation. The historical captured return
-        // value is deliberately not used because automation may have changed
-        // the retained stack since the override began.
-        try await client.setControl(
-            stack.control,
-            to: activeHold.value
-        )
+        try await client.clearControlOverride(stack.control)
     }
 
     private func install(
@@ -761,7 +1147,10 @@ private final class DeviceAdvancedModel: ObservableObject {
     }
 
     private func publishControls() {
-        controls = controlsByIdentifier.values.sorted { left, right in
+        controls = suggestedControlOrder.sorted(
+            Array(controlsByIdentifier.values),
+            identifier: { $0.descriptor.identifier }
+        ) { left, right in
             if left.isDerived != right.isDerived {
                 return !left.isDerived
             }

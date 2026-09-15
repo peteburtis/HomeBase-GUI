@@ -16,6 +16,11 @@ protocol SceneLiveEditingRemoteClient: Sendable {
         priority: Int?,
         lifetime: HBControlHoldLifetime?
     ) async throws -> HBControlHoldResult
+    func replaceControlHold(
+        token: String,
+        with value: HBJSONValue,
+        transitionSeconds: TimeInterval?
+    ) async throws -> HBControlHoldReplaceResult
     func releaseControlHold(token: String) async throws
         -> HBControlReleaseResult
 }

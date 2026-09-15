@@ -260,7 +260,7 @@ struct SceneControlPickerCatalog {
             excludedControlPaths.map(Self.normalizedIdentifier)
         )
         let editableDevices = source.devices.compactMap { device -> Device? in
-            let writableControls = device.controls.filter { descriptor in
+            let eligibleControls = device.controls.filter { descriptor in
                 let resolved = SceneResolvedControl(
                     device: device,
                     descriptor: descriptor
@@ -268,7 +268,14 @@ struct SceneControlPickerCatalog {
                 return !excluded.contains(
                     Self.normalizedIdentifier(resolved.path)
                 ) && resolved.schema.isWritable
-            }.sorted(by: Self.controlSort)
+            }
+            let writableControls = SuggestedControlDisplayOrder(
+                metadata: device.metadata
+            ).sorted(
+                eligibleControls,
+                identifier: { $0.identifier },
+                canonicalOrder: Self.controlSort
+            )
 
             let supportedControls = writableControls.filter { descriptor in
                 SceneResolvedControl(
