@@ -60,6 +60,79 @@ final class ControlValueTypeRegistryTests: XCTestCase {
         )
     }
 
+    func testSliderPresentationHintSelectsScalarSliderForUnknownKind() {
+        let schema = ControlValueSchema(
+            kind: "PTZ.Pan.Position",
+            metadata: [
+                "presentation": "slider",
+                "readable": true,
+                "writable": true,
+                "structured": false,
+                "minimum": -1,
+                "maximum": 1,
+            ]
+        )
+        let resolution = ControlValueTypeRegistry.standard.resolve(schema)
+        let context = ControlValuePresentationContext(
+            schema: schema,
+            snapshot: ControlValueSnapshot(
+                value: -0.25,
+                displayText: "-0.25"
+            ),
+            interaction: ControlValueInteraction(
+                isEnabled: true,
+                isUpdating: false,
+                commit: { _, _ in },
+                observations: {
+                    AsyncThrowingStream { continuation in
+                        continuation.finish()
+                    }
+                }
+            ),
+            accessibilityLabel: "Pan position",
+            controlPath: "Camera1:PTZ.Pan.Position"
+        )
+
+        XCTAssertEqual(resolution.plugin.identifier, "unit-interval")
+        XCTAssertEqual(
+            resolution.score,
+            ControlValueTypeMatchSpecificity.genericCapabilities
+        )
+        XCTAssertTrue(resolution.plugin.supportsEditing(context: context))
+    }
+
+    func testSliderPresentationHintStillRequiresUsableScalarBounds() {
+        let metadata: [String: HBJSONValue] = [
+            "presentation": "slider",
+            "readable": true,
+            "writable": true,
+            "structured": false,
+        ]
+
+        XCTAssertEqual(
+            ControlValueTypeRegistry.standard.resolve(
+                ControlValueSchema(
+                    kind: "PTZ.Pan.Position",
+                    metadata: metadata
+                )
+            ).plugin.identifier,
+            "fallback"
+        )
+        XCTAssertEqual(
+            ControlValueTypeRegistry.standard.resolve(
+                ControlValueSchema(
+                    kind: "PTZ.Position",
+                    metadata: metadata.merging([
+                        "structured": true,
+                        "minimum": -1,
+                        "maximum": 1,
+                    ]) { _, new in new }
+                )
+            ).plugin.identifier,
+            "fallback"
+        )
+    }
+
     func testUnknownAndUnsupportedSchemaVersionsUseFallback() {
         XCTAssertEqual(
             resolve("position-v1").plugin.identifier,

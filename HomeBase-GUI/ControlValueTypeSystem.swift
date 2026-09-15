@@ -41,6 +41,10 @@ struct ControlValueSchema: Equatable {
         metadata["structured"]?.boolValue == true
     }
 
+    var presentationHint: String? {
+        metadata["presentation"]?.stringValue?.lowercased()
+    }
+
     var scalarRange: ClosedRange<Double>? {
         guard !isStructured,
               let minimum = metadata["minimum"]?.numberValue,

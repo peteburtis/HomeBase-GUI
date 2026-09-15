@@ -14,7 +14,7 @@ extension ControlValueTypeRegistry {
                 standaloneEditing: ColorControlValuePlugin()
             ),
             AnyControlValueTypePlugin(BinarySwitchControlValuePlugin()),
-            AnyControlValueTypePlugin(UnitIntervalControlValuePlugin()),
+            AnyControlValueTypePlugin(ScalarSliderControlValuePlugin()),
         ],
         fallback: AnyControlValueTypePlugin(FallbackControlValuePlugin())
     )
@@ -114,13 +114,16 @@ private struct BinarySwitchControlValueBody: View {
     }
 }
 
-private struct UnitIntervalControlValuePlugin: ControlValueTypePlugin {
+private struct ScalarSliderControlValuePlugin: ControlValueTypePlugin {
     let identifier = "unit-interval"
 
     func matchScore(for schema: ControlValueSchema) -> Int? {
-        schema.normalizedKind == "unitinterval"
-            ? ControlValueTypeMatchSpecificity.exactSchema
-            : nil
+        if schema.normalizedKind == "unitinterval" {
+            return ControlValueTypeMatchSpecificity.exactSchema
+        }
+        guard schema.presentationHint == "slider",
+              schema.scalarRange != nil else { return nil }
+        return ControlValueTypeMatchSpecificity.genericCapabilities
     }
 
     func presentsStaleness(
@@ -132,15 +135,15 @@ private struct UnitIntervalControlValuePlugin: ControlValueTypePlugin {
     func supportsEditing(
         context: ControlValuePresentationContext
     ) -> Bool {
-        UnitIntervalControlValueBody.editor(for: context) != nil
+        ScalarSliderControlValueBody.editor(for: context) != nil
     }
 
     func makeBody(context: ControlValuePresentationContext) -> some View {
-        UnitIntervalControlValueBody(context: context)
+        ScalarSliderControlValueBody(context: context)
     }
 }
 
-private struct UnitIntervalControlValueBody: View {
+private struct ScalarSliderControlValueBody: View {
     let context: ControlValuePresentationContext
 
     var body: some View {
