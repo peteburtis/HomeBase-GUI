@@ -8,6 +8,11 @@ import HomeBaseProtocol
 import OSLog
 
 actor HomeBaseWebSocketClient {
+    struct CameraLiveLease: Sendable {
+        let mediaHost: String
+        let opened: HBCameraLiveOpenResult
+    }
+
     struct ControlSubscription: Sendable {
         let identifier: UUID
         let controls: [HBControlWatchStreamControl]
@@ -877,6 +882,53 @@ actor HomeBaseWebSocketClient {
             )
         }
         return details
+    }
+
+    func openCameraLiveStream(
+        deviceIdentifier: String,
+        quality: HBCameraLiveQuality
+    ) async throws -> CameraLiveLease {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.openCameraLiveStream,
+            payload: HBCameraLiveOpenRequest(
+                deviceIdentifier: deviceIdentifier,
+                quality: quality
+            )
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let opened = try body.decodedResult(
+            as: HBCameraLiveOpenResult.self
+        )
+        guard opened.requestedQuality == quality,
+              opened.mediaPort > 0,
+              !opened.deviceIdentifier.isEmpty,
+              !opened.ticket.isEmpty else {
+            throw ClientError.invalidMessage(
+                "the live-camera lease is incomplete"
+            )
+        }
+        return CameraLiveLease(
+            mediaHost: endpoint.host,
+            opened: opened
+        )
+    }
+
+    func closeCameraLiveStream(_ streamID: UUID) async throws {
+        let request = try sessionRequest(
+            operation: HBProtocolOperations.closeCameraLiveStream,
+            payload: HBCameraLiveCloseRequest(streamID: streamID)
+        )
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        let result = try body.decodedResult(
+            as: HBCameraLiveCloseResult.self
+        )
+        guard result.streamID == streamID else {
+            throw ClientError.invalidMessage(
+                "the closed live-camera stream identifier changed"
+            )
+        }
     }
 
     func listDevices(

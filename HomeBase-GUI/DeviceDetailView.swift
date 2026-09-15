@@ -14,6 +14,7 @@ struct DeviceDetailView: View {
     let device: HBTopologyDeviceDescriptor
     private let client: HomeBaseWebSocketClient
     @StateObject private var model: LiveDeviceControlsModel
+    @State private var isShowingFullScreenVideo = false
 
     init(
         device: HBTopologyDeviceDescriptor,
@@ -31,6 +32,34 @@ struct DeviceDetailView: View {
 
     var body: some View {
         List {
+            if let cameraCapability {
+                Section {
+                    CameraLiveVideoPlayer(
+                        deviceIdentifier: device.addressableName,
+                        quality: cameraCapability.previewQuality,
+                        client: client,
+                        allowsRetry: false
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .overlay(alignment: .bottomTrailing) {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(9)
+                            .background(.black.opacity(0.6), in: Circle())
+                            .padding(10)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        isShowingFullScreenVideo = true
+                    }
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityHint("Opens higher-quality live video")
+                }
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.black)
+            }
+
             LiveDeviceControlSections(
                 model: model,
                 subjectKind: "device"
@@ -64,6 +93,31 @@ struct DeviceDetailView: View {
             Task {
                 await model.stop()
             }
+        }
+#if os(iOS)
+        .fullScreenCover(isPresented: $isShowingFullScreenVideo) {
+            fullScreenVideo
+        }
+#else
+        .sheet(isPresented: $isShowingFullScreenVideo) {
+            fullScreenVideo
+        }
+#endif
+    }
+
+    private var cameraCapability: CameraLiveVideoCapability? {
+        CameraLiveVideoCapability(metadata: model.deviceMetadata)
+    }
+
+    @ViewBuilder
+    private var fullScreenVideo: some View {
+        if let cameraCapability {
+            CameraFullScreenLiveVideoView(
+                deviceIdentifier: device.addressableName,
+                displayName: device.displayName,
+                quality: cameraCapability.fullScreenQuality,
+                client: client
+            )
         }
     }
 }
@@ -252,6 +306,7 @@ final class LiveDeviceControlsModel: ObservableObject {
 
     @Published private(set) var state: State = .idle
     @Published private(set) var controls: [LiveDeviceControl] = []
+    @Published private(set) var deviceMetadata: [String: HBJSONValue]
 
     private let device: HBTopologyDeviceDescriptor?
     private let client: HomeBaseWebSocketClient
@@ -266,6 +321,7 @@ final class LiveDeviceControlsModel: ObservableObject {
     ) {
         self.device = device
         self.client = client
+        deviceMetadata = device?.metadata ?? [:]
     }
 
     func run(reactivating: Bool = false) async {
@@ -281,6 +337,7 @@ final class LiveDeviceControlsModel: ObservableObject {
             }
             let details = try await client.deviceDetails(for: device)
             try Task.checkCancellation()
+            deviceMetadata = details.metadata
             suggestedControlOrder = SuggestedControlDisplayOrder(
                 metadata: details.metadata
             )
