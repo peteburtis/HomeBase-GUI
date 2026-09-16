@@ -3,6 +3,7 @@
 //  HomeBase-GUITests
 //
 
+import CoreMedia
 import HomeBaseProtocol
 import XCTest
 @testable import HomeBase_GUI
@@ -270,6 +271,89 @@ final class CameraLiveVideoTests: XCTestCase {
         )
     }
 
+    func testRecordingArmsAfterDestinationPreparation() async throws {
+        let destination = CameraRecordingDestinationStub()
+        let controller = CameraLocalRecordingController(
+            destination: destination
+        )
+        let ownerID = UUID()
+
+        await controller.start()
+        XCTAssertEqual(controller.state, .idle)
+
+        let formatDescription = try makeH264FormatDescription()
+        await controller.configure(
+            ownerID: ownerID,
+            generation: 1,
+            formatDescription: formatDescription
+        )
+        await controller.start()
+
+        XCTAssertEqual(destination.prepareCount, 1)
+        XCTAssertEqual(controller.state, .waitingForKeyFrame)
+        XCTAssertTrue(controller.isRecording)
+        XCTAssertTrue(controller.locksStreamConfiguration)
+
+        await controller.stopAndSave()
+        XCTAssertEqual(controller.state, .idle)
+        XCTAssertFalse(controller.isRecording)
+        XCTAssertEqual(destination.savedURLs.count, 0)
+    }
+
+    func testRecordingPreparationFailureIsPresented() async throws {
+        let destination = CameraRecordingDestinationStub(
+            preparationError: CameraRecordingDestinationError.permissionDenied
+        )
+        let controller = CameraLocalRecordingController(
+            destination: destination
+        )
+        let ownerID = UUID()
+        let formatDescription = try makeH264FormatDescription()
+        await controller.configure(
+            ownerID: ownerID,
+            generation: 1,
+            formatDescription: formatDescription
+        )
+
+        await controller.start()
+
+        XCTAssertEqual(destination.prepareCount, 1)
+        XCTAssertEqual(
+            controller.errorMessage,
+            CameraRecordingDestinationError.permissionDenied
+                .localizedDescription
+        )
+        XCTAssertFalse(controller.isRecording)
+
+        controller.dismissError()
+        XCTAssertEqual(controller.state, .idle)
+    }
+
+    func testRecordingIgnoresEndFromSupersededPlayer() async throws {
+        let controller = CameraLocalRecordingController(
+            destination: CameraRecordingDestinationStub()
+        )
+        let firstOwnerID = UUID()
+        let currentOwnerID = UUID()
+        let formatDescription = try makeH264FormatDescription()
+        await controller.configure(
+            ownerID: firstOwnerID,
+            generation: 1,
+            formatDescription: formatDescription
+        )
+        await controller.configure(
+            ownerID: currentOwnerID,
+            generation: 1,
+            formatDescription: formatDescription
+        )
+
+        await controller.streamDidEnd(ownerID: firstOwnerID)
+        XCTAssertTrue(controller.isStreamAvailable)
+
+        await controller.streamDidEnd(ownerID: currentOwnerID)
+        XCTAssertFalse(controller.isStreamAvailable)
+    }
+
     func testVideoIsDisplayedOnlyWhileActivelyPlaying() {
         XCTAssertFalse(CameraLiveVideoModel.State.idle.displaysVideo)
         XCTAssertFalse(CameraLiveVideoModel.State.connecting.displaysVideo)
@@ -519,6 +603,24 @@ final class CameraLiveVideoTests: XCTestCase {
         ]
     }
 
+    private func makeH264FormatDescription() throws
+        -> CMVideoFormatDescription
+    {
+        var formatDescription: CMFormatDescription?
+        let status = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: kCMVideoCodecType_H264,
+            width: 1_280,
+            height: 720,
+            extensions: nil,
+            formatDescriptionOut: &formatDescription
+        )
+        guard status == noErr, let formatDescription else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+        }
+        return formatDescription
+    }
+
     private func panTiltControls(
         pan: Double,
         tilt: Double,
@@ -590,5 +692,27 @@ final class CameraLiveVideoTests: XCTestCase {
             value: value,
             valid: true
         )
+    }
+}
+
+@MainActor
+private final class CameraRecordingDestinationStub:
+    CameraRecordingDestination
+{
+    let preparationError: Error?
+    private(set) var prepareCount = 0
+    private(set) var savedURLs: [URL] = []
+
+    init(preparationError: Error? = nil) {
+        self.preparationError = preparationError
+    }
+
+    func prepare() async throws {
+        prepareCount += 1
+        if let preparationError { throw preparationError }
+    }
+
+    func saveVideo(at fileURL: URL, creationDate: Date) async throws {
+        savedURLs.append(fileURL)
     }
 }

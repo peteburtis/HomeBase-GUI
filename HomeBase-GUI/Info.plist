@@ -9,6 +9,8 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Connect to HomeBase servers on your local network.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Save camera recordings to your photo library.</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>

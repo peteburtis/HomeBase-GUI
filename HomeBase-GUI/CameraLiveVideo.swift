@@ -297,13 +297,16 @@ final class CameraH264Renderer: ObservableObject {
     private var generation: UInt32?
     private var timeScale: Int32 = 90_000
     private var firstTimestamp: UInt64?
+    private var sampleDuration: CMTime = .invalid
 
     init() {
         layer.videoGravity = .resizeAspect
         layer.backgroundColor = CGColor(gray: 0, alpha: 1)
     }
 
-    func configure(_ configuration: HBMediaStreamConfiguration) throws {
+    func configure(
+        _ configuration: HBMediaStreamConfiguration
+    ) throws -> CMVideoFormatDescription {
         guard configuration.codec.lowercased() == "h264" else {
             throw RendererError.unsupportedCodec(configuration.codec)
         }
@@ -352,13 +355,25 @@ final class CameraH264Renderer: ObservableObject {
         generation = configuration.generation
         timeScale = Int32(configuration.timeScale)
         firstTimestamp = nil
+        if let frameRate = configuration.frameRate,
+           frameRate.isFinite,
+           frameRate > 0 {
+            sampleDuration = CMTime(
+                seconds: 1 / frameRate,
+                preferredTimescale: timeScale
+            )
+        } else {
+            sampleDuration = .invalid
+        }
+        return description
     }
 
-    func enqueue(_ frame: HBMediaFrame) throws {
+    @discardableResult
+    func enqueue(_ frame: HBMediaFrame) throws -> CMSampleBuffer? {
         guard frame.type == .videoAccessUnit,
               frame.generation == generation,
               let formatDescription else {
-            return
+            return nil
         }
         guard Self.isValidAVCCAccessUnit(frame.payload) else {
             throw RendererError.invalidAccessUnit
@@ -407,7 +422,7 @@ final class CameraH264Renderer: ObservableObject {
             ? frame.presentationTimestamp - origin
             : 0
         var timing = CMSampleTimingInfo(
-            duration: .invalid,
+            duration: sampleDuration,
             presentationTimeStamp: CMTime(
                 value: Int64(clamping: relativeTimestamp),
                 timescale: timeScale
@@ -448,6 +463,7 @@ final class CameraH264Renderer: ObservableObject {
             layer.sampleBufferRenderer.flush()
         }
         layer.sampleBufferRenderer.enqueue(sampleBuffer)
+        return sampleBuffer
     }
 
     static func isValidAVCCAccessUnit(_ data: Data) -> Bool {
@@ -489,6 +505,8 @@ final class CameraLiveVideoModel: ObservableObject {
     private let deviceIdentifier: String
     private let quality: HBCameraLiveQuality
     private let client: HomeBaseWebSocketClient
+    private let recordingController: CameraLocalRecordingController?
+    private let recordingOwnerID = UUID()
     private var mediaConnection: HomeBaseMediaConnection?
     private var streamID: UUID?
     private var runToken: UUID?
@@ -496,11 +514,13 @@ final class CameraLiveVideoModel: ObservableObject {
     init(
         deviceIdentifier: String,
         quality: HBCameraLiveQuality,
-        client: HomeBaseWebSocketClient
+        client: HomeBaseWebSocketClient,
+        recordingController: CameraLocalRecordingController? = nil
     ) {
         self.deviceIdentifier = deviceIdentifier
         self.quality = quality
         self.client = client
+        self.recordingController = recordingController
     }
 
     func run() async {
@@ -531,7 +551,8 @@ final class CameraLiveVideoModel: ObservableObject {
             for try await frame in frames {
                 try Task.checkCancellation()
                 guard runToken == token else { break }
-                if try !consume(frame) { break }
+                let shouldContinue = try await consume(frame)
+                if !shouldContinue { break }
             }
             if !Task.isCancelled, runToken == token {
                 switch state {
@@ -553,6 +574,7 @@ final class CameraLiveVideoModel: ObservableObject {
             connection: ownedConnection,
             streamID: ownedStreamID
         )
+        await recordingController?.streamDidEnd(ownerID: recordingOwnerID)
         if runToken == token { runToken = nil }
     }
 
@@ -561,10 +583,11 @@ final class CameraLiveVideoModel: ObservableObject {
         let connection = mediaConnection
         let streamID = streamID
         await releaseLease(connection: connection, streamID: streamID)
+        await recordingController?.streamDidEnd(ownerID: recordingOwnerID)
         state = .idle
     }
 
-    private func consume(_ frame: HBMediaFrame) throws -> Bool {
+    private func consume(_ frame: HBMediaFrame) async throws -> Bool {
         switch frame.type {
         case .streamStatus:
             let status = try JSONDecoder().decode(
@@ -583,14 +606,26 @@ final class CameraLiveVideoModel: ObservableObject {
                         "the H.264 generation did not match its frame"
                     )
             }
-            try renderer.configure(configuration)
+            let formatDescription = try renderer.configure(configuration)
+            await recordingController?.configure(
+                ownerID: recordingOwnerID,
+                generation: configuration.generation,
+                formatDescription: formatDescription
+            )
             if configuration.width > 0, configuration.height > 0 {
                 aspectRatio = CGFloat(configuration.width)
                     / CGFloat(configuration.height)
             }
             state = .waiting("Waiting for video…")
         case .videoAccessUnit:
-            try renderer.enqueue(frame)
+            if let sampleBuffer = try renderer.enqueue(frame) {
+                recordingController?.append(
+                    sampleBuffer,
+                    ownerID: recordingOwnerID,
+                    generation: frame.generation,
+                    isKeyFrame: frame.flags.contains(.keyFrame)
+                )
+            }
             if state != .playing { state = .playing }
         case .streamEnd:
             let end = try JSONDecoder().decode(
@@ -650,12 +685,14 @@ struct CameraLiveVideoPlayer: View {
         quality: HBCameraLiveQuality,
         client: HomeBaseWebSocketClient,
         allowsRetry: Bool,
-        restartRequest: Int = 0
+        restartRequest: Int = 0,
+        recordingController: CameraLocalRecordingController? = nil
     ) {
         _model = StateObject(wrappedValue: CameraLiveVideoModel(
             deviceIdentifier: deviceIdentifier,
             quality: quality,
-            client: client
+            client: client,
+            recordingController: recordingController
         ))
         self.allowsRetry = allowsRetry
         self.restartRequest = restartRequest
@@ -1002,6 +1039,10 @@ struct CameraFullScreenLiveVideoView: View {
     @State private var videoRestartRequest = 0
     @State private var controlsVisible = true
     @State private var selectedQuality: HBCameraLiveQuality
+#if os(iOS)
+    @StateObject private var recordingController:
+        CameraLocalRecordingController
+#endif
 
     init(
         device: HBTopologyDeviceDescriptor,
@@ -1022,6 +1063,13 @@ struct CameraFullScreenLiveVideoView: View {
         _zoomGestureController = StateObject(wrappedValue:
             CameraZoomGestureController(model: controlsModel)
         )
+#if os(iOS)
+        _recordingController = StateObject(wrappedValue:
+            CameraLocalRecordingController(
+                destination: CameraPhotoLibraryRecordingDestination()
+            )
+        )
+#endif
     }
 
     var body: some View {
@@ -1069,6 +1117,18 @@ struct CameraFullScreenLiveVideoView: View {
                   let fallbackQuality = qualities.first else { return }
             selectedQuality = fallbackQuality
         }
+#if os(iOS)
+        .alert(
+            "Recording Unavailable",
+            isPresented: recordingErrorIsPresented
+        ) {
+            Button("OK") {
+                recordingController.dismissError()
+            }
+        } message: {
+            Text(recordingController.errorMessage ?? "Unknown error")
+        }
+#endif
     }
 
     private var liveVideo: some View {
@@ -1098,7 +1158,8 @@ struct CameraFullScreenLiveVideoView: View {
             quality: selectedQuality,
             client: client,
             allowsRetry: true,
-            restartRequest: videoRestartRequest
+            restartRequest: videoRestartRequest,
+            recordingController: videoRecordingController
         )
         .id(selectedQuality)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1121,6 +1182,10 @@ struct CameraFullScreenLiveVideoView: View {
         ToolbarItem(placement: .topBarLeading) {
             closeButton
         }
+        ToolbarItem(placement: .topBarTrailing) {
+            recordingControl
+        }
+        ToolbarSpacer(.fixed, placement: .topBarTrailing)
         ToolbarItem(placement: .topBarTrailing) {
             qualityControl
         }
@@ -1167,6 +1232,49 @@ struct CameraFullScreenLiveVideoView: View {
         .accessibilityLabel("Close live video")
     }
 
+#if os(iOS)
+    private var recordingControl: some View {
+        Button {
+            recordingController.toggle()
+        } label: {
+            Image(systemName: "record.circle")
+        }
+        .tint(recordingController.isRecording ? .red : .primary)
+        .disabled(
+            recordingController.state == .requestingAuthorization
+                || recordingController.state == .saving
+                || (!recordingController.isRecording
+                    && !recordingController.isStreamAvailable)
+        )
+        .accessibilityLabel(
+            recordingController.isRecording
+                ? "Stop recording"
+                : "Record video"
+        )
+        .accessibilityValue(recordingAccessibilityValue)
+    }
+
+    private var recordingAccessibilityValue: String {
+        switch recordingController.state {
+        case .idle: "Not recording"
+        case .requestingAuthorization: "Requesting Photos access"
+        case .waitingForKeyFrame: "Starting recording"
+        case .recording: "Recording"
+        case .saving: "Saving to Photos"
+        case .failed: "Recording unavailable"
+        }
+    }
+
+    private var recordingErrorIsPresented: Binding<Bool> {
+        Binding(
+            get: { recordingController.errorMessage != nil },
+            set: { isPresented in
+                if !isPresented { recordingController.dismissError() }
+            }
+        )
+    }
+#endif
+
     private var privacyControl: CameraPrivacyToolbarControl? {
         let controls = CameraDetailControlSet(
             controls: controlsModel.controls
@@ -1211,6 +1319,9 @@ struct CameraFullScreenLiveVideoView: View {
         .accessibilityValue(
             CameraLiveQualityPresentation.title(for: selectedQuality)
         )
+#if os(iOS)
+        .disabled(recordingController.locksStreamConfiguration)
+#endif
     }
 
     private var availableQualities: [HBCameraLiveQuality] {
@@ -1223,6 +1334,16 @@ struct CameraFullScreenLiveVideoView: View {
     private var privacyEnabled: Bool? {
         CameraDetailControlSet(controls: controlsModel.controls)
             .observedPrivacyEnabled
+    }
+
+    private var videoRecordingController:
+        CameraLocalRecordingController?
+    {
+#if os(iOS)
+        recordingController
+#else
+        nil
+#endif
     }
 
     private var panTiltGestureTarget: CameraPanTiltGestureTarget? {
