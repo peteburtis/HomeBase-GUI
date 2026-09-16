@@ -56,6 +56,9 @@ struct DeviceDetailView: View {
                     }
                     .contentShape(Rectangle())
                     .onTapGesture {
+#if os(iOS)
+                        CameraLandscapeOrientation.prepareForPresentation()
+#endif
                         isShowingFullScreenVideo = true
                     }
                     .accessibilityAddTraits(.isButton)
@@ -107,7 +110,10 @@ struct DeviceDetailView: View {
             videoRestartRequest &+= 1
         }
 #if os(iOS)
-        .fullScreenCover(isPresented: $isShowingFullScreenVideo) {
+        .fullScreenCover(
+            isPresented: $isShowingFullScreenVideo,
+            onDismiss: CameraLandscapeOrientation.restore
+        ) {
             fullScreenVideo
         }
 #else

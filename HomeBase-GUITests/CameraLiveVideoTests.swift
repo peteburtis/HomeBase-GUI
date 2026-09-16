@@ -7,6 +7,10 @@ import HomeBaseProtocol
 import XCTest
 @testable import HomeBase_GUI
 
+#if os(iOS)
+import UIKit
+#endif
+
 @MainActor
 final class CameraLiveVideoTests: XCTestCase {
     func testCapabilityRequiresAvailabilityFlag() {
@@ -292,6 +296,51 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertNil(CameraPanTiltGestureTarget(controls: controls))
         XCTAssertNil(CameraPanTiltGestureTarget(controls: [controls[0]]))
     }
+
+#if os(iOS)
+    func testCameraPresentationRestrictsSupportedOrientationsToLandscape()
+        async throws
+    {
+        defer { CameraLandscapeOrientation.restore() }
+
+        CameraLandscapeOrientation.restore()
+        XCTAssertEqual(
+            CameraLandscapeOrientation.supportedInterfaceOrientations(
+                for: nil
+            ),
+            .allButUpsideDown
+        )
+
+        CameraLandscapeOrientation.prepareForPresentation()
+        XCTAssertEqual(
+            CameraLandscapeOrientation.supportedInterfaceOrientations(
+                for: nil
+            ),
+            .landscape
+        )
+
+        CameraLandscapeOrientation.activate()
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive })
+        for _ in 0..<40 where
+            !scene.effectiveGeometry.interfaceOrientation.isLandscape
+        {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertTrue(
+            scene.effectiveGeometry.interfaceOrientation.isLandscape
+        )
+
+        scene.requestGeometryUpdate(.iOS(
+            interfaceOrientations: .portrait
+        ))
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertTrue(
+            scene.effectiveGeometry.interfaceOrientation.isLandscape
+        )
+    }
+#endif
 
     private func axisMetadata(
         component: String? = nil

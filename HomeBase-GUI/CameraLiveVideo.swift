@@ -963,7 +963,6 @@ struct CameraFullScreenLiveVideoView: View {
             captureInitialPanTiltPosition()
         }
         .onDisappear {
-            CameraLandscapeOrientation.restore()
             panTiltGestureController.stop()
             Task {
                 await controlsModel.stop()
@@ -1198,30 +1197,67 @@ private struct CameraSampleBufferView: NSViewRepresentable {
 }
 #endif
 
-private enum CameraLandscapeOrientation {
+@MainActor
+enum CameraLandscapeOrientation {
+#if os(iOS)
+    private static var isPreparedForCamera = false
+
+    static func supportedInterfaceOrientations(
+        for window: UIWindow?
+    ) -> UIInterfaceOrientationMask {
+        if isPreparedForCamera { return .landscape }
+        return window?.traitCollection.userInterfaceIdiom == .pad
+            ? .all
+            : .allButUpsideDown
+    }
+
+    static func prepareForPresentation() {
+        isPreparedForCamera = true
+        invalidateSupportedOrientations()
+    }
+#endif
+
     static func activate() {
 #if os(iOS)
-        guard let scene = UIApplication.shared.connectedScenes
-            .compactMap({ $0 as? UIWindowScene })
-            .first(where: { $0.activationState == .foregroundActive }) else {
-            return
-        }
-        scene.requestGeometryUpdate(
-            .iOS(interfaceOrientations: .landscape)
-        )
+        prepareForPresentation()
+        requestGeometryUpdate(interfaceOrientations: .landscape)
 #endif
     }
 
     static func restore() {
 #if os(iOS)
+        isPreparedForCamera = false
+        invalidateSupportedOrientations()
+        requestGeometryUpdate(interfaceOrientations: .allButUpsideDown)
+#endif
+    }
+
+#if os(iOS)
+    private static func invalidateSupportedOrientations() {
+        for scene in UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+        {
+            for window in scene.windows where !window.isHidden {
+                var controller = window.rootViewController
+                while let current = controller {
+                    current.setNeedsUpdateOfSupportedInterfaceOrientations()
+                    controller = current.presentedViewController
+                }
+            }
+        }
+    }
+
+    private static func requestGeometryUpdate(
+        interfaceOrientations: UIInterfaceOrientationMask
+    ) {
         guard let scene = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene })
             .first(where: { $0.activationState == .foregroundActive }) else {
             return
         }
-        scene.requestGeometryUpdate(
-            .iOS(interfaceOrientations: .allButUpsideDown)
-        )
-#endif
+        scene.requestGeometryUpdate(.iOS(
+            interfaceOrientations: interfaceOrientations
+        ))
     }
+#endif
 }
