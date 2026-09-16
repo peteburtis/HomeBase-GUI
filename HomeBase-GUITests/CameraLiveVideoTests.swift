@@ -5,6 +5,7 @@
 
 import CoreMedia
 import HomeBaseProtocol
+import SwiftUI
 import XCTest
 @testable import HomeBase_GUI
 
@@ -352,6 +353,31 @@ final class CameraLiveVideoTests: XCTestCase {
 
         await controller.streamDidEnd(ownerID: currentOwnerID)
         XCTAssertFalse(controller.isStreamAvailable)
+    }
+
+    func testPermissionDialogInactivityDoesNotRestartLiveVideoTask() {
+        XCTAssertFalse(CameraLiveVideoLifecycle.isSuspended(in: .active))
+        XCTAssertFalse(CameraLiveVideoLifecycle.isSuspended(in: .inactive))
+        XCTAssertTrue(CameraLiveVideoLifecycle.isSuspended(in: .background))
+
+        let activeIdentity = CameraLiveVideoLifecycle.taskIdentity(
+            retryID: 3,
+            scenePhase: .active
+        )
+        XCTAssertEqual(
+            activeIdentity,
+            CameraLiveVideoLifecycle.taskIdentity(
+                retryID: 3,
+                scenePhase: .inactive
+            )
+        )
+        XCTAssertNotEqual(
+            activeIdentity,
+            CameraLiveVideoLifecycle.taskIdentity(
+                retryID: 3,
+                scenePhase: .background
+            )
+        )
     }
 
     func testVideoIsDisplayedOnlyWhileActivelyPlaying() {

@@ -673,6 +673,27 @@ extension CameraLiveVideoModel.State {
     }
 }
 
+enum CameraLiveVideoLifecycle {
+    struct TaskIdentity: Hashable {
+        let retryID: Int
+        let isSuspended: Bool
+    }
+
+    static func isSuspended(in scenePhase: ScenePhase) -> Bool {
+        scenePhase == .background
+    }
+
+    static func taskIdentity(
+        retryID: Int,
+        scenePhase: ScenePhase
+    ) -> TaskIdentity {
+        TaskIdentity(
+            retryID: retryID,
+            isSuspended: isSuspended(in: scenePhase)
+        )
+    }
+}
+
 struct CameraLiveVideoPlayer: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model: CameraLiveVideoModel
@@ -738,11 +759,14 @@ struct CameraLiveVideoPlayer: View {
         }
         .aspectRatio(model.aspectRatio, contentMode: .fit)
         .accessibilityLabel("Live camera video")
-        .task(id: "\(retryID)-\(String(describing: scenePhase))") {
-            if scenePhase == .active {
-                await model.run()
-            } else {
+        .task(id: CameraLiveVideoLifecycle.taskIdentity(
+            retryID: retryID,
+            scenePhase: scenePhase
+        )) {
+            if CameraLiveVideoLifecycle.isSuspended(in: scenePhase) {
                 await model.stop()
+            } else {
+                await model.run()
             }
         }
         .onChange(of: restartRequest) { _, _ in
@@ -1094,11 +1118,11 @@ struct CameraFullScreenLiveVideoView: View {
                 await controlsModel.stop()
             }
         }
-        .task(id: scenePhase) {
-            if scenePhase == .active {
-                await controlsModel.run(reactivating: true)
-            } else {
+        .task(id: CameraLiveVideoLifecycle.isSuspended(in: scenePhase)) {
+            if CameraLiveVideoLifecycle.isSuspended(in: scenePhase) {
                 await controlsModel.stop()
+            } else {
+                await controlsModel.run(reactivating: true)
             }
         }
         .onChange(of: privacyEnabled) { previousValue, currentValue in
