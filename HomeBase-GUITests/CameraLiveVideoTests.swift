@@ -269,11 +269,11 @@ final class CameraLiveVideoTests: XCTestCase {
 
         XCTAssertEqual(target.canonicalControlPath, "Camera:PTZ.Position")
         XCTAssertEqual(position.pan, 0.75, accuracy: 0.000_001)
-        XCTAssertEqual(position.tilt, -1, accuracy: 0.000_001)
+        XCTAssertEqual(position.tilt, 0.75, accuracy: 0.000_001)
         XCTAssertEqual(target.payload(for: position), .object([
             "PanTilt": .array([
                 .number(0.75),
-                .number(-1),
+                .number(0.75),
             ]),
             "Zoom": .array([.number(0.5)]),
         ]))
@@ -290,7 +290,7 @@ final class CameraLiveVideoTests: XCTestCase {
         )
 
         XCTAssertEqual(position.pan, -1)
-        XCTAssertEqual(position.tilt, 1)
+        XCTAssertEqual(position.tilt, -1)
     }
 
     func testCameraOverlaySliderCanInvertOnlyItsPresentation() {

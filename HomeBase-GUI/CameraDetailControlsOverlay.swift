@@ -180,7 +180,7 @@ struct CameraPanTiltGestureTarget {
         return CameraPanTiltPosition(
             pan: (position.pan + Double(translation.width / width) * panSpan)
                 .clamped(to: panRange),
-            tilt: (position.tilt - Double(translation.height / height) * tiltSpan)
+            tilt: (position.tilt + Double(translation.height / height) * tiltSpan)
                 .clamped(to: tiltRange)
         )
     }
