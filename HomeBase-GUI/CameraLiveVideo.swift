@@ -734,6 +734,19 @@ struct CameraLiveVideoPlayer: View {
     }
 }
 
+private struct CameraTransparentToolbar: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+#if os(iOS)
+        content.toolbarBackgroundVisibility(.hidden, for: .navigationBar)
+#elseif os(macOS)
+        content.toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+#else
+        content
+#endif
+    }
+}
+
 struct CameraFullScreenLiveVideoView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
@@ -759,36 +772,13 @@ struct CameraFullScreenLiveVideoView: View {
     }
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            CameraLiveVideoPlayer(
-                deviceIdentifier: device.addressableName,
-                quality: quality,
-                client: client,
-                allowsRetry: true,
-                restartRequest: videoRestartRequest
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            CameraDetailControlsOverlay(model: controlsModel)
-
-            VStack {
-                HStack {
-                    Spacer()
-                    Button {
-                        dismiss()
-                    } label: {
-                        Label("Close Live Video", systemImage: "xmark")
-                            .labelStyle(.iconOnly)
-                            .frame(width: 28, height: 28)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.black.opacity(0.6))
-                    .accessibilityLabel("Close live video")
+        NavigationStack {
+            liveVideo
+                .ignoresSafeArea(.container, edges: .top)
+                .toolbar {
+                    cameraToolbar
                 }
-                .padding()
-                Spacer()
-            }
+                .modifier(CameraTransparentToolbar())
         }
         .onAppear {
             CameraLandscapeOrientation.activate()
@@ -813,6 +803,70 @@ struct CameraFullScreenLiveVideoView: View {
             ) else { return }
             videoRestartRequest &+= 1
         }
+    }
+
+    private var liveVideo: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            CameraLiveVideoPlayer(
+                deviceIdentifier: device.addressableName,
+                quality: quality,
+                client: client,
+                allowsRetry: true,
+                restartRequest: videoRestartRequest
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            CameraDetailControlsOverlay(model: controlsModel)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+#if os(iOS)
+    @ToolbarContentBuilder
+    private var cameraToolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            closeButton
+        }
+        if let privacyControl {
+            ToolbarItem(placement: .topBarTrailing) {
+                privacyControl
+            }
+        }
+    }
+#else
+    @ToolbarContentBuilder
+    private var cameraToolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            closeButton
+        }
+        if let privacyControl {
+            ToolbarItem(placement: .primaryAction) {
+                privacyControl
+            }
+        }
+    }
+#endif
+
+    private var closeButton: some View {
+        Button {
+            dismiss()
+        } label: {
+            Label("Close Live Video", systemImage: "xmark")
+                .labelStyle(.iconOnly)
+        }
+        .accessibilityLabel("Close live video")
+    }
+
+    private var privacyControl: CameraPrivacyToolbarControl? {
+        let controls = CameraDetailControlSet(
+            controls: controlsModel.controls
+        )
+        guard let privacy = controls.privacy else { return nil }
+        return CameraPrivacyToolbarControl(
+            control: privacy,
+            model: controlsModel
+        )
     }
 
     private var privacyEnabled: Bool? {

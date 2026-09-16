@@ -48,7 +48,10 @@ struct DeviceDetailView: View {
                             .font(.callout.weight(.semibold))
                             .foregroundStyle(.white)
                             .padding(9)
-                            .background(.black.opacity(0.6), in: Circle())
+                            .cameraGlassBacker(
+                                in: Circle(),
+                                interactive: true
+                            )
                             .padding(10)
                     }
                     .contentShape(Rectangle())

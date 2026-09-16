@@ -96,57 +96,42 @@ enum CameraPrivacyStreamRecovery {
     }
 }
 
-struct CameraDetailControlsOverlay: View {
+private struct CameraGlassBacker<BackerShape: Shape>: ViewModifier {
+    let shape: BackerShape
+    let isInteractive: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+#if os(visionOS)
+        content.background(.ultraThinMaterial, in: shape)
+#else
+        content.glassEffect(
+            isInteractive ? .regular.interactive() : .regular,
+            in: shape
+        )
+#endif
+    }
+}
+
+extension View {
+    func cameraGlassBacker<BackerShape: Shape>(
+        in shape: BackerShape,
+        interactive: Bool = false
+    ) -> some View {
+        modifier(CameraGlassBacker(
+            shape: shape,
+            isInteractive: interactive
+        ))
+    }
+}
+
+struct CameraPrivacyToolbarControl: View {
+    let control: LiveDeviceControl
     @ObservedObject var model: LiveDeviceControlsModel
 
     var body: some View {
-        GeometryReader { geometry in
-            let controls = CameraDetailControlSet(controls: model.controls)
-            let axisLength = Self.axisLength(for: geometry.size)
-
-            ZStack {
-                if let privacy = controls.privacy {
-                    VStack {
-                        privacyControl(privacy)
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.top, max(12, geometry.safeAreaInsets.top + 8))
-                }
-
-                VStack {
-                    Spacer(minLength: 0)
-
-                    HStack(alignment: .bottom) {
-                        if let zoom = controls.zoom {
-                            zoomCluster(zoom, length: axisLength)
-                        }
-
-                        Spacer(minLength: 24)
-
-                        if controls.hasPanTilt {
-                            panTiltCluster(
-                                pan: controls.pan,
-                                tilt: controls.tilt,
-                                length: axisLength
-                            )
-                        }
-                    }
-                    .padding(.leading, max(18, geometry.safeAreaInsets.leading + 12))
-                    .padding(.trailing, max(18, geometry.safeAreaInsets.trailing + 12))
-                    .padding(.bottom, max(18, geometry.safeAreaInsets.bottom + 12))
-                }
-            }
-        }
-    }
-
-    private func privacyControl(_ control: LiveDeviceControl) -> some View {
-        let isOn = control.cameraOverlayBooleanValue ?? false
-        let isEnabled = interactionEnabled(for: control)
-            && control.cameraOverlayBooleanValue != nil
-
-        return HStack(spacing: 10) {
+        HStack(spacing: 8) {
             Image(systemName: "eye.slash")
-                .font(.headline)
                 .accessibilityHidden(true)
 
             Toggle(
@@ -171,11 +156,53 @@ struct CameraDetailControlsOverlay: View {
             .accessibilityLabel("Privacy mode")
             .accessibilityValue(isOn ? "On" : "Off")
         }
-        .foregroundStyle(.primary)
-        .padding(.leading, 14)
-        .padding(.trailing, 10)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial, in: Capsule())
+        .fixedSize()
+    }
+
+    private var isOn: Bool {
+        control.cameraOverlayBooleanValue ?? false
+    }
+
+    private var isEnabled: Bool {
+        model.state == .live
+            && control.valid != false
+            && control.cameraOverlayBooleanValue != nil
+    }
+}
+
+struct CameraDetailControlsOverlay: View {
+    @ObservedObject var model: LiveDeviceControlsModel
+
+    var body: some View {
+        GeometryReader { geometry in
+            let controls = CameraDetailControlSet(controls: model.controls)
+            let axisLength = Self.axisLength(for: geometry.size)
+
+            ZStack {
+                VStack {
+                    Spacer(minLength: 0)
+
+                    HStack(alignment: .bottom) {
+                        if let zoom = controls.zoom {
+                            zoomCluster(zoom, length: axisLength)
+                        }
+
+                        Spacer(minLength: 24)
+
+                        if controls.hasPanTilt {
+                            panTiltCluster(
+                                pan: controls.pan,
+                                tilt: controls.tilt,
+                                length: axisLength
+                            )
+                        }
+                    }
+                    .padding(.leading, max(18, geometry.safeAreaInsets.leading + 12))
+                    .padding(.trailing, max(18, geometry.safeAreaInsets.trailing + 12))
+                    .padding(.bottom, max(18, geometry.safeAreaInsets.bottom + 12))
+                }
+            }
+        }
     }
 
     private func zoomCluster(
@@ -308,7 +335,7 @@ private struct CameraOverlaySlider: View {
             }
         }
         .padding(5)
-        .background(.black.opacity(0.42), in: Capsule())
+        .cameraGlassBacker(in: Capsule(), interactive: true)
         .onChange(of: sourceValue) { _, updatedValue in
             guard let updatedValue else { return }
             let clampedValue = updatedValue.clamped(to: range)
@@ -445,7 +472,7 @@ private struct CameraOverlayIcon: View {
             .font(.title3.weight(.semibold))
             .foregroundStyle(.white)
             .frame(width: 44, height: 44)
-            .background(.black.opacity(0.55), in: Circle())
+            .cameraGlassBacker(in: Circle())
             .accessibilityLabel(accessibilityLabel)
     }
 }
