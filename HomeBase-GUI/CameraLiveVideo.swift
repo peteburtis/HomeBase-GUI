@@ -965,7 +965,6 @@ struct CameraFullScreenLiveVideoView: View {
     var body: some View {
         NavigationStack {
             liveVideo
-                .ignoresSafeArea(.container, edges: .top)
                 .toolbar {
                     cameraToolbar
                 }
@@ -1010,6 +1009,27 @@ struct CameraFullScreenLiveVideoView: View {
     }
 
     private var liveVideo: some View {
+        ZStack {
+            videoPresentation
+                .ignoresSafeArea(.container)
+
+            if controlsVisible {
+                CameraDetailControlsOverlay(model: controlsModel)
+                    .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.ignoresSafeArea())
+        .animation(.snappy, value: controlsVisible)
+        .accessibilityAction(named: "Toggle camera controls") {
+            toggleControls()
+        }
+        .accessibilityAction(named: "Recenter camera") {
+            recenterCamera()
+        }
+    }
+
+    private var videoPresentation: some View {
         CameraLiveVideoPlayer(
             deviceIdentifier: device.addressableName,
             quality: selectedQuality,
@@ -1028,19 +1048,6 @@ struct CameraFullScreenLiveVideoView: View {
                     onTwoFingerTap: recenterCamera
                 )
             }
-        }
-        .overlay {
-            if controlsVisible {
-                CameraDetailControlsOverlay(model: controlsModel)
-                    .transition(.opacity)
-            }
-        }
-        .animation(.snappy, value: controlsVisible)
-        .accessibilityAction(named: "Toggle camera controls") {
-            toggleControls()
-        }
-        .accessibilityAction(named: "Recenter camera") {
-            recenterCamera()
         }
     }
 
