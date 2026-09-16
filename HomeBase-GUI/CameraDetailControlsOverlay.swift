@@ -773,7 +773,7 @@ struct CameraDayNightModeToolbarControl: View {
 
 struct CameraDetailControlsOverlay: View {
     @ObservedObject var model: LiveDeviceControlsModel
-    @State private var isPanTiltExpanded = true
+    @State private var isPanTiltExpanded = false
     @State private var isZoomExpanded = true
 
     var body: some View {
