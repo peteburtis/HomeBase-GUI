@@ -3,6 +3,7 @@
 //  HomeBase-GUI
 //
 
+import Combine
 import Foundation
 import HomeBaseProtocol
 import SwiftUI
@@ -93,6 +94,256 @@ enum CameraPrivacyStreamRecovery {
         to currentValue: Bool?
     ) -> Bool {
         previousValue == true && currentValue == false
+    }
+}
+
+struct CameraPanTiltPosition: Equatable {
+    let pan: Double
+    let tilt: Double
+}
+
+struct CameraPanTiltGestureTarget {
+    let canonicalControlPath: String
+    let panRange: ClosedRange<Double>
+    let tiltRange: ClosedRange<Double>
+    let position: CameraPanTiltPosition
+    let observedPosition: CameraPanTiltPosition
+    let zoom: Double?
+
+    init?(controls: [LiveDeviceControl]) {
+        let controlSet = CameraDetailControlSet(controls: controls)
+        guard let pan = controlSet.pan,
+              let tilt = controlSet.tilt,
+              pan.valid != false,
+              tilt.valid != false,
+              let panRange = pan.cameraOverlayScalarRange,
+              let tiltRange = tilt.cameraOverlayScalarRange,
+              let panValue = pan.cameraOverlayNumericValue,
+              let tiltValue = tilt.cameraOverlayNumericValue,
+              let observedPan = pan.cameraOverlayObservedNumericValue,
+              let observedTilt = tilt.cameraOverlayObservedNumericValue,
+              let canonicalIdentifier = pan.cameraOverlayMetadata[
+                "canonicalControl"
+              ]?.stringValue,
+              let tiltCanonicalIdentifier = tilt.cameraOverlayMetadata[
+                "canonicalControl"
+              ]?.stringValue,
+              tiltCanonicalIdentifier.caseInsensitiveCompare(
+                canonicalIdentifier
+              )
+                == .orderedSame else {
+            return nil
+        }
+
+        self.panRange = panRange
+        self.tiltRange = tiltRange
+        position = CameraPanTiltPosition(
+            pan: panValue.clamped(to: panRange),
+            tilt: tiltValue.clamped(to: tiltRange)
+        )
+        observedPosition = CameraPanTiltPosition(
+            pan: observedPan.clamped(to: panRange),
+            tilt: observedTilt.clamped(to: tiltRange)
+        )
+        canonicalControlPath = Self.canonicalPath(
+            derivedControlPath: pan.descriptor.control,
+            deviceIdentifier: pan.descriptor.deviceIdentifier,
+            canonicalIdentifier: canonicalIdentifier
+        )
+
+        let zoomControl = controls.first { control in
+            control.cameraOverlayMetadata["canonicalComponent"]?
+                .stringValue?.caseInsensitiveCompare("Zoom[0]")
+                == .orderedSame
+        }
+        if let zoomControl {
+            guard zoomControl.cameraOverlayMetadata["canonicalControl"]?
+                    .stringValue?.caseInsensitiveCompare(canonicalIdentifier)
+                    == .orderedSame,
+                  let zoomValue = zoomControl.cameraOverlayNumericValue else {
+                return nil
+            }
+            zoom = zoomValue
+        } else {
+            zoom = nil
+        }
+    }
+
+    func position(
+        afterScrollingBy translation: CGSize,
+        in viewport: CGSize
+    ) -> CameraPanTiltPosition {
+        let width = max(viewport.width, 1)
+        let height = max(viewport.height, 1)
+        let panSpan = panRange.upperBound - panRange.lowerBound
+        let tiltSpan = tiltRange.upperBound - tiltRange.lowerBound
+        return CameraPanTiltPosition(
+            pan: (position.pan - Double(translation.width / width) * panSpan)
+                .clamped(to: panRange),
+            tilt: (position.tilt + Double(translation.height / height) * tiltSpan)
+                .clamped(to: tiltRange)
+        )
+    }
+
+    func payload(for position: CameraPanTiltPosition) -> HBJSONValue {
+        var object: [String: HBJSONValue] = [
+            "PanTilt": .array([
+                .number(position.pan.clamped(to: panRange)),
+                .number(position.tilt.clamped(to: tiltRange)),
+            ]),
+        ]
+        if let zoom {
+            object["Zoom"] = .array([.number(zoom)])
+        }
+        return .object(object)
+    }
+
+    private static func canonicalPath(
+        derivedControlPath: String,
+        deviceIdentifier: String,
+        canonicalIdentifier: String
+    ) -> String {
+        guard let separator = derivedControlPath.lastIndex(of: ":") else {
+            return "\(deviceIdentifier):\(canonicalIdentifier)"
+        }
+        return String(derivedControlPath[...separator]) + canonicalIdentifier
+    }
+}
+
+@MainActor
+final class CameraPanTiltGestureController: ObservableObject {
+    private struct WriteRequest {
+        let target: CameraPanTiltGestureTarget
+        let position: CameraPanTiltPosition
+    }
+
+    private static let interactiveWriteInterval = Duration.milliseconds(125)
+
+    private let model: LiveDeviceControlsModel
+    private var initialPosition: CameraPanTiltPosition?
+    private var dragTarget: CameraPanTiltGestureTarget?
+    private var pendingInteractiveWrite: WriteRequest?
+    private var interactiveWriteTask: Task<Void, Never>?
+    private var interactiveWriteGeneration: UUID?
+    private var pendingWrite: WriteRequest?
+    private var writerTask: Task<Void, Never>?
+    private var writerGeneration: UUID?
+
+    init(model: LiveDeviceControlsModel) {
+        self.model = model
+    }
+
+    func captureInitialPosition(from target: CameraPanTiltGestureTarget) {
+        guard initialPosition == nil else { return }
+        initialPosition = target.observedPosition
+    }
+
+    func beginDrag(using target: CameraPanTiltGestureTarget) {
+        dragTarget = target
+        pendingInteractiveWrite = nil
+    }
+
+    func updateDrag(translation: CGSize, viewport: CGSize) {
+        guard let dragTarget else { return }
+        scheduleInteractiveWrite(WriteRequest(
+            target: dragTarget,
+            position: dragTarget.position(
+                afterScrollingBy: translation,
+                in: viewport
+            )
+        ))
+    }
+
+    func endDrag(translation: CGSize, viewport: CGSize) {
+        guard let dragTarget else { return }
+        let request = WriteRequest(
+            target: dragTarget,
+            position: dragTarget.position(
+                afterScrollingBy: translation,
+                in: viewport
+            )
+        )
+        cancelInteractiveThrottle()
+        self.dragTarget = nil
+        enqueue(request)
+    }
+
+    func cancelDrag() {
+        dragTarget = nil
+        cancelInteractiveThrottle()
+    }
+
+    func recenter(using target: CameraPanTiltGestureTarget) {
+        guard let initialPosition else { return }
+        cancelDrag()
+        enqueue(WriteRequest(target: target, position: initialPosition))
+    }
+
+    func stop() {
+        cancelDrag()
+        pendingWrite = nil
+        writerTask?.cancel()
+        writerTask = nil
+        writerGeneration = nil
+    }
+
+    private func scheduleInteractiveWrite(_ request: WriteRequest) {
+        pendingInteractiveWrite = request
+        guard interactiveWriteTask == nil else { return }
+
+        pendingInteractiveWrite = nil
+        enqueue(request)
+
+        let generation = UUID()
+        interactiveWriteGeneration = generation
+        interactiveWriteTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(
+                        for: Self.interactiveWriteInterval
+                    )
+                } catch {
+                    break
+                }
+                guard let request = pendingInteractiveWrite else { break }
+                pendingInteractiveWrite = nil
+                enqueue(request)
+            }
+            if interactiveWriteGeneration == generation {
+                interactiveWriteTask = nil
+                interactiveWriteGeneration = nil
+            }
+        }
+    }
+
+    private func cancelInteractiveThrottle() {
+        pendingInteractiveWrite = nil
+        interactiveWriteTask?.cancel()
+        interactiveWriteTask = nil
+        interactiveWriteGeneration = nil
+    }
+
+    private func enqueue(_ request: WriteRequest) {
+        pendingWrite = request
+        guard writerTask == nil else { return }
+
+        let generation = UUID()
+        writerGeneration = generation
+        writerTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while let request = pendingWrite {
+                pendingWrite = nil
+                try? await model.setCanonicalPresentedValue(
+                    request.target.payload(for: request.position),
+                    controlPath: request.target.canonicalControlPath
+                )
+            }
+            if writerGeneration == generation {
+                writerTask = nil
+                writerGeneration = nil
+            }
+        }
     }
 }
 
@@ -542,6 +793,10 @@ extension LiveDeviceControl {
 
     var cameraOverlayNumericValue: Double? {
         (pendingValue ?? value)?.numberValue
+    }
+
+    var cameraOverlayObservedNumericValue: Double? {
+        value?.numberValue
     }
 
     var cameraOverlayBooleanValue: Bool? {

@@ -648,8 +648,10 @@ struct CameraLiveVideoPlayer: View {
     var body: some View {
         ZStack {
             Color.black
+                .allowsHitTesting(false)
             if model.state.displaysVideo {
                 CameraSampleBufferView(renderer: model.renderer)
+                    .allowsHitTesting(false)
             }
 
             if let message = statusMessage {
@@ -657,13 +659,16 @@ struct CameraLiveVideoPlayer: View {
                     if isPending {
                         ProgressView()
                             .tint(.white)
+                            .allowsHitTesting(false)
                     } else {
                         Image(systemName: "video.slash.fill")
                             .font(.title2)
+                            .allowsHitTesting(false)
                     }
                     Text(message)
                         .font(.callout)
                         .multilineTextAlignment(.center)
+                        .allowsHitTesting(false)
                     if allowsRetry, canRetry {
                         Button("Try Again", systemImage: "arrow.clockwise") {
                             Task {
@@ -747,6 +752,169 @@ private struct CameraTransparentToolbar: ViewModifier {
     }
 }
 
+private struct CameraToolbarVisibility: ViewModifier {
+    let isVisible: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+#if os(iOS)
+        content.toolbarVisibility(
+            isVisible ? .visible : .hidden,
+            for: .navigationBar
+        )
+#elseif os(macOS)
+        content.toolbarVisibility(
+            isVisible ? .visible : .hidden,
+            for: .windowToolbar
+        )
+#else
+        content
+#endif
+    }
+}
+
+private enum CameraPanGesturePhase {
+    case began
+    case changed
+    case ended
+    case cancelled
+}
+
+#if canImport(UIKit)
+private final class CameraLiveGestureUIView: UIView {
+    var onPan: ((CameraPanGesturePhase, CGSize, CGSize) -> Void)?
+    var onSingleTap: (() -> Void)?
+    var onTwoFingerTap: (() -> Void)?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isMultipleTouchEnabled = true
+
+        let pan = UIPanGestureRecognizer(
+            target: self,
+            action: #selector(panned(_:))
+        )
+        pan.minimumNumberOfTouches = 1
+        pan.maximumNumberOfTouches = 1
+        addGestureRecognizer(pan)
+
+        let singleTap = UITapGestureRecognizer(
+            target: self,
+            action: #selector(singleTapped)
+        )
+        singleTap.numberOfTouchesRequired = 1
+        addGestureRecognizer(singleTap)
+
+        let twoFingerTap = UITapGestureRecognizer(
+            target: self,
+            action: #selector(twoFingerTapped)
+        )
+        twoFingerTap.numberOfTouchesRequired = 2
+        addGestureRecognizer(twoFingerTap)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func panned(_ recognizer: UIPanGestureRecognizer) {
+        let phase: CameraPanGesturePhase
+        switch recognizer.state {
+        case .began:
+            phase = .began
+        case .changed:
+            phase = .changed
+        case .ended:
+            phase = .ended
+        case .cancelled, .failed:
+            phase = .cancelled
+        default:
+            return
+        }
+        let translation = recognizer.translation(in: self)
+        onPan?(
+            phase,
+            CGSize(width: translation.x, height: translation.y),
+            bounds.size
+        )
+    }
+
+    @objc private func singleTapped() {
+        onSingleTap?()
+    }
+
+    @objc private func twoFingerTapped() {
+        onTwoFingerTap?()
+    }
+}
+
+private struct CameraLiveGestureSurface: UIViewRepresentable {
+    let onPan: (CameraPanGesturePhase, CGSize, CGSize) -> Void
+    let onSingleTap: () -> Void
+    let onTwoFingerTap: () -> Void
+
+    func makeUIView(context: Context) -> CameraLiveGestureUIView {
+        let view = CameraLiveGestureUIView()
+        update(view)
+        return view
+    }
+
+    func updateUIView(
+        _ uiView: CameraLiveGestureUIView,
+        context: Context
+    ) {
+        update(uiView)
+    }
+
+    private func update(_ view: CameraLiveGestureUIView) {
+        view.onPan = onPan
+        view.onSingleTap = onSingleTap
+        view.onTwoFingerTap = onTwoFingerTap
+    }
+}
+#else
+private struct CameraLiveGestureSurface: View {
+    let onPan: (CameraPanGesturePhase, CGSize, CGSize) -> Void
+    let onSingleTap: () -> Void
+    let onTwoFingerTap: () -> Void
+    @State private var isDragging = false
+
+    var body: some View {
+        GeometryReader { geometry in
+            Color.clear
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 8)
+                        .onChanged { value in
+                            if !isDragging {
+                                isDragging = true
+                                onPan(.began, .zero, geometry.size)
+                            }
+                            onPan(
+                                .changed,
+                                value.translation,
+                                geometry.size
+                            )
+                        }
+                        .onEnded { value in
+                            isDragging = false
+                            onPan(
+                                .ended,
+                                value.translation,
+                                geometry.size
+                            )
+                        }
+                )
+                .simultaneousGesture(
+                    TapGesture().onEnded(onSingleTap)
+                )
+        }
+    }
+}
+#endif
+
 struct CameraFullScreenLiveVideoView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
@@ -755,7 +923,10 @@ struct CameraFullScreenLiveVideoView: View {
     let quality: HBCameraLiveQuality
     let client: HomeBaseWebSocketClient
     @StateObject private var controlsModel: LiveDeviceControlsModel
+    @StateObject private var panTiltGestureController:
+        CameraPanTiltGestureController
     @State private var videoRestartRequest = 0
+    @State private var controlsVisible = true
 
     init(
         device: HBTopologyDeviceDescriptor,
@@ -765,10 +936,14 @@ struct CameraFullScreenLiveVideoView: View {
         self.device = device
         self.quality = quality
         self.client = client
-        _controlsModel = StateObject(wrappedValue: LiveDeviceControlsModel(
+        let controlsModel = LiveDeviceControlsModel(
             device: device,
             client: client
-        ))
+        )
+        _controlsModel = StateObject(wrappedValue: controlsModel)
+        _panTiltGestureController = StateObject(wrappedValue:
+            CameraPanTiltGestureController(model: controlsModel)
+        )
     }
 
     var body: some View {
@@ -779,12 +954,17 @@ struct CameraFullScreenLiveVideoView: View {
                     cameraToolbar
                 }
                 .modifier(CameraTransparentToolbar())
+                .modifier(CameraToolbarVisibility(
+                    isVisible: controlsVisible
+                ))
         }
         .onAppear {
             CameraLandscapeOrientation.activate()
+            captureInitialPanTiltPosition()
         }
         .onDisappear {
             CameraLandscapeOrientation.restore()
+            panTiltGestureController.stop()
             Task {
                 await controlsModel.stop()
             }
@@ -803,11 +983,22 @@ struct CameraFullScreenLiveVideoView: View {
             ) else { return }
             videoRestartRequest &+= 1
         }
+        .onChange(of: panTiltGestureTarget?.observedPosition) {
+            _, _ in
+            captureInitialPanTiltPosition()
+        }
     }
 
     private var liveVideo: some View {
         ZStack {
             Color.black.ignoresSafeArea()
+
+            CameraLiveGestureSurface(
+                onPan: handlePanGesture,
+                onSingleTap: toggleControls,
+                onTwoFingerTap: recenterCamera
+            )
+
             CameraLiveVideoPlayer(
                 deviceIdentifier: device.addressableName,
                 quality: quality,
@@ -817,9 +1008,19 @@ struct CameraFullScreenLiveVideoView: View {
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            CameraDetailControlsOverlay(model: controlsModel)
+            if controlsVisible {
+                CameraDetailControlsOverlay(model: controlsModel)
+                    .transition(.opacity)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(.snappy, value: controlsVisible)
+        .accessibilityAction(named: "Toggle camera controls") {
+            toggleControls()
+        }
+        .accessibilityAction(named: "Recenter camera") {
+            recenterCamera()
+        }
     }
 
 #if os(iOS)
@@ -872,6 +1073,53 @@ struct CameraFullScreenLiveVideoView: View {
     private var privacyEnabled: Bool? {
         CameraDetailControlSet(controls: controlsModel.controls)
             .observedPrivacyEnabled
+    }
+
+    private var panTiltGestureTarget: CameraPanTiltGestureTarget? {
+        guard controlsModel.state == .live else { return nil }
+        return CameraPanTiltGestureTarget(controls: controlsModel.controls)
+    }
+
+    private func captureInitialPanTiltPosition() {
+        guard let panTiltGestureTarget else { return }
+        panTiltGestureController.captureInitialPosition(
+            from: panTiltGestureTarget
+        )
+    }
+
+    private func handlePanGesture(
+        phase: CameraPanGesturePhase,
+        translation: CGSize,
+        viewport: CGSize
+    ) {
+        switch phase {
+        case .began:
+            guard let panTiltGestureTarget else { return }
+            panTiltGestureController.beginDrag(using: panTiltGestureTarget)
+        case .changed:
+            panTiltGestureController.updateDrag(
+                translation: translation,
+                viewport: viewport
+            )
+        case .ended:
+            panTiltGestureController.endDrag(
+                translation: translation,
+                viewport: viewport
+            )
+        case .cancelled:
+            panTiltGestureController.cancelDrag()
+        }
+    }
+
+    private func toggleControls() {
+        withAnimation(.snappy) {
+            controlsVisible.toggle()
+        }
+    }
+
+    private func recenterCamera() {
+        guard let panTiltGestureTarget else { return }
+        panTiltGestureController.recenter(using: panTiltGestureTarget)
     }
 }
 

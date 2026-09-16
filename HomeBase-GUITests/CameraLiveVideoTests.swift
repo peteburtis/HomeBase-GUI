@@ -214,6 +214,85 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertEqual(controls.observedPrivacyEnabled, true)
     }
 
+    func testPanTiltGestureMapsScrollingToCanonicalPosition() throws {
+        let controls = panTiltControls(
+            pan: 0.25,
+            tilt: -0.25,
+            zoom: 0.5
+        )
+        let target = try XCTUnwrap(
+            CameraPanTiltGestureTarget(controls: controls)
+        )
+
+        let position = target.position(
+            afterScrollingBy: CGSize(width: 100, height: 50),
+            in: CGSize(width: 200, height: 100)
+        )
+
+        XCTAssertEqual(target.canonicalControlPath, "Camera:PTZ.Position")
+        XCTAssertEqual(position.pan, -0.75, accuracy: 0.000_001)
+        XCTAssertEqual(position.tilt, 0.75, accuracy: 0.000_001)
+        XCTAssertEqual(target.payload(for: position), .object([
+            "PanTilt": .array([
+                .number(-0.75),
+                .number(0.75),
+            ]),
+            "Zoom": .array([.number(0.5)]),
+        ]))
+    }
+
+    func testPanTiltGestureClampsToDiscoveredRanges() throws {
+        let target = try XCTUnwrap(CameraPanTiltGestureTarget(
+            controls: panTiltControls(pan: 0, tilt: 0)
+        ))
+
+        let position = target.position(
+            afterScrollingBy: CGSize(width: -10_000, height: -10_000),
+            in: CGSize(width: 100, height: 100)
+        )
+
+        XCTAssertEqual(position.pan, 1)
+        XCTAssertEqual(position.tilt, -1)
+    }
+
+    func testPanTiltGestureOpeningPositionIgnoresOptimisticValues() throws {
+        var controls = panTiltControls(pan: 0.1, tilt: -0.2)
+        controls[0].pendingValue = .number(0.8)
+        controls[1].pendingValue = .number(0.7)
+
+        let target = try XCTUnwrap(
+            CameraPanTiltGestureTarget(controls: controls)
+        )
+
+        XCTAssertEqual(target.position.pan, 0.8)
+        XCTAssertEqual(target.position.tilt, 0.7)
+        XCTAssertEqual(target.observedPosition.pan, 0.1)
+        XCTAssertEqual(target.observedPosition.tilt, -0.2)
+    }
+
+    func testPanTiltGestureRequiresMatchingCanonicalAxes() {
+        let controls = [
+            liveControl(
+                identifier: "PTZ.Pan.Position",
+                value: .number(0),
+                metadata: canonicalAxisMetadata(
+                    component: "PanTilt[0]"
+                )
+            ),
+            liveControl(
+                identifier: "PTZ.Tilt.Position",
+                value: .number(0),
+                metadata: axisMetadata(component: "PanTilt[1]")
+                    .merging([
+                        "canonicalControl": .string("Other.Position"),
+                    ]) { existing, _ in existing }
+            ),
+        ]
+
+        XCTAssertNil(CameraPanTiltGestureTarget(controls: controls))
+        XCTAssertNil(CameraPanTiltGestureTarget(controls: [controls[0]]))
+    }
+
     private func axisMetadata(
         component: String? = nil
     ) -> [String: HBJSONValue] {
@@ -225,6 +304,45 @@ final class CameraLiveVideoTests: XCTestCase {
             metadata["canonicalComponent"] = .string(component)
         }
         return metadata
+    }
+
+    private func panTiltControls(
+        pan: Double,
+        tilt: Double,
+        zoom: Double? = nil
+    ) -> [LiveDeviceControl] {
+        var controls = [
+            liveControl(
+                identifier: "PTZ.Pan.Position",
+                value: .number(pan),
+                metadata: canonicalAxisMetadata(
+                    component: "PanTilt[0]"
+                )
+            ),
+            liveControl(
+                identifier: "PTZ.Tilt.Position",
+                value: .number(tilt),
+                metadata: canonicalAxisMetadata(
+                    component: "PanTilt[1]"
+                )
+            ),
+        ]
+        if let zoom {
+            controls.append(liveControl(
+                identifier: "PTZ.Zoom.Position",
+                value: .number(zoom),
+                metadata: canonicalAxisMetadata(component: "Zoom[0]")
+            ))
+        }
+        return controls
+    }
+
+    private func canonicalAxisMetadata(
+        component: String
+    ) -> [String: HBJSONValue] {
+        axisMetadata(component: component).merging([
+            "canonicalControl": .string("PTZ.Position"),
+        ]) { existing, _ in existing }
     }
 
     private func liveControl(

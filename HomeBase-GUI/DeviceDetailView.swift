@@ -514,6 +514,14 @@ final class LiveDeviceControlsModel: ObservableObject {
         }
     }
 
+    func setCanonicalPresentedValue(
+        _ value: HBJSONValue,
+        controlPath: String
+    ) async throws {
+        guard state == .live else { throw UpdateError.unavailable }
+        try await client.setControl(controlPath, to: value)
+    }
+
     func valueStream(
         for control: LiveDeviceControl
     ) -> AsyncThrowingStream<ControlValueObservation, Error> {
