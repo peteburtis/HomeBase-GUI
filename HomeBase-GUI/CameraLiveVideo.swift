@@ -1066,6 +1066,7 @@ struct CameraFullScreenLiveVideoView: View {
 #if os(iOS)
     @StateObject private var recordingController:
         CameraLocalRecordingController
+    @State private var savedConfirmationVisible = false
 #endif
 
     init(
@@ -1142,6 +1143,24 @@ struct CameraFullScreenLiveVideoView: View {
             selectedQuality = fallbackQuality
         }
 #if os(iOS)
+        .task(id: recordingController.successfulSaveCount) {
+            guard recordingController.successfulSaveCount > 0 else { return }
+            withAnimation(.snappy) {
+                savedConfirmationVisible = true
+            }
+            do {
+                try await Task.sleep(for: .seconds(2.5))
+            } catch {
+                return
+            }
+            withAnimation(.easeOut(duration: 0.2)) {
+                savedConfirmationVisible = false
+            }
+        }
+        .sensoryFeedback(
+            .success,
+            trigger: recordingController.successfulSaveCount
+        )
         .alert(
             "Recording Unavailable",
             isPresented: recordingErrorIsPresented
@@ -1206,6 +1225,11 @@ struct CameraFullScreenLiveVideoView: View {
         ToolbarItem(placement: .topBarLeading) {
             closeButton
         }
+        if savedConfirmationVisible {
+            ToolbarItem(placement: .principal) {
+                savedConfirmation
+            }
+        }
         ToolbarItem(placement: .topBarTrailing) {
             recordingControl
         }
@@ -1257,6 +1281,15 @@ struct CameraFullScreenLiveVideoView: View {
     }
 
 #if os(iOS)
+    private var savedConfirmation: some View {
+        Text("Saved to Photos")
+            .font(.callout.weight(.medium))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .glassEffect(.regular, in: Capsule(style: .continuous))
+            .accessibilityAddTraits(.isStaticText)
+    }
+
     private var recordingControl: some View {
         Button {
             recordingController.toggle()

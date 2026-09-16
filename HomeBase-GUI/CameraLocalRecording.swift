@@ -80,6 +80,7 @@ final class CameraLocalRecordingController: ObservableObject {
 
     @Published private(set) var state: State = .idle
     @Published private(set) var isStreamAvailable = false
+    @Published private(set) var successfulSaveCount = 0
 
     private let destination: any CameraRecordingDestination
     private var streamOwnerID: UUID?
@@ -254,6 +255,7 @@ final class CameraLocalRecordingController: ObservableObject {
             )
             try? FileManager.default.removeItem(at: outputURL)
             state = .idle
+            successfulSaveCount &+= 1
         } catch {
             try? FileManager.default.removeItem(at: outputURL)
             fail(error)
