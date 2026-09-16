@@ -450,9 +450,8 @@ struct CameraDetailControlsOverlay: View {
                             )
                         }
                     }
-                    .padding(.leading, max(18, geometry.safeAreaInsets.leading + 12))
-                    .padding(.trailing, max(18, geometry.safeAreaInsets.trailing + 12))
-                    .padding(.bottom, max(18, geometry.safeAreaInsets.bottom + 12))
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 12)
                 }
             }
         }
