@@ -259,6 +259,32 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertEqual(position.tilt, 1)
     }
 
+    func testCameraOverlaySliderCanInvertOnlyItsPresentation() {
+        let range = -2.0 ... 6.0
+
+        XCTAssertEqual(
+            CameraOverlaySliderDirection.normal.displayedValue(
+                for: 1,
+                in: range
+            ),
+            1
+        )
+        XCTAssertEqual(
+            CameraOverlaySliderDirection.inverted.displayedValue(
+                for: 1,
+                in: range
+            ),
+            3
+        )
+        XCTAssertEqual(
+            CameraOverlaySliderDirection.inverted.controlValue(
+                for: 5,
+                in: range
+            ),
+            -1
+        )
+    }
+
     func testPanTiltGestureOpeningPositionIgnoresOptimisticValues() throws {
         var controls = panTiltControls(pan: 0.1, tilt: -0.2)
         controls[0].pendingValue = .number(0.8)

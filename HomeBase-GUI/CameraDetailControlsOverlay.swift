@@ -470,6 +470,7 @@ struct CameraDetailControlsOverlay: View {
                     control: control,
                     model: model,
                     orientation: .vertical,
+                    direction: .normal,
                     length: length,
                     interactionEnabled: interactionEnabled(for: control)
                 )
@@ -506,6 +507,7 @@ struct CameraDetailControlsOverlay: View {
                         control: pan,
                         model: model,
                         orientation: .horizontal,
+                        direction: .inverted,
                         length: length,
                         interactionEnabled: interactionEnabled(for: pan)
                     )
@@ -518,6 +520,7 @@ struct CameraDetailControlsOverlay: View {
                         control: tilt,
                         model: model,
                         orientation: .vertical,
+                        direction: .normal,
                         length: length,
                         interactionEnabled: interactionEnabled(for: tilt)
                     )
@@ -564,12 +567,38 @@ private enum CameraSliderOrientation {
     case vertical
 }
 
+enum CameraOverlaySliderDirection {
+    case normal
+    case inverted
+
+    func displayedValue(
+        for controlValue: Double,
+        in range: ClosedRange<Double>
+    ) -> Double {
+        switch self {
+        case .normal:
+            controlValue.clamped(to: range)
+        case .inverted:
+            (range.lowerBound + range.upperBound - controlValue)
+                .clamped(to: range)
+        }
+    }
+
+    func controlValue(
+        for displayedValue: Double,
+        in range: ClosedRange<Double>
+    ) -> Double {
+        self.displayedValue(for: displayedValue, in: range)
+    }
+}
+
 private struct CameraOverlaySlider: View {
     private static let interactiveWriteInterval = Duration.milliseconds(175)
 
     let control: LiveDeviceControl
     @ObservedObject var model: LiveDeviceControlsModel
     let orientation: CameraSliderOrientation
+    let direction: CameraOverlaySliderDirection
     let length: CGFloat
     let interactionEnabled: Bool
 
@@ -586,12 +615,14 @@ private struct CameraOverlaySlider: View {
         control: LiveDeviceControl,
         model: LiveDeviceControlsModel,
         orientation: CameraSliderOrientation,
+        direction: CameraOverlaySliderDirection,
         length: CGFloat,
         interactionEnabled: Bool
     ) {
         self.control = control
         self.model = model
         self.orientation = orientation
+        self.direction = direction
         self.length = length
         self.interactionEnabled = interactionEnabled
         let range = control.cameraOverlayScalarRange ?? 0 ... 1
@@ -637,9 +668,17 @@ private struct CameraOverlaySlider: View {
     private var slider: some View {
         Slider(
             value: Binding(
-                get: { draftValue },
-                set: { requestedValue in
-                    let requestedValue = requestedValue.clamped(to: range)
+                get: {
+                    direction.displayedValue(
+                        for: draftValue,
+                        in: range
+                    )
+                },
+                set: { displayedValue in
+                    let requestedValue = direction.controlValue(
+                        for: displayedValue,
+                        in: range
+                    )
                     draftValue = requestedValue
                     guard isEditing, canInteract else { return }
                     scheduleInteractiveWrite(requestedValue)
