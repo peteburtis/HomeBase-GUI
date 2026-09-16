@@ -54,6 +54,22 @@ struct CameraLiveVideoCapability: Equatable, Sendable {
     }
 }
 
+enum CameraLiveQualityPresentation {
+    static func options(
+        in qualities: Set<HBCameraLiveQuality>
+    ) -> [HBCameraLiveQuality] {
+        qualities.sorted(by: >)
+    }
+
+    static func title(for quality: HBCameraLiveQuality) -> String {
+        switch quality {
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High"
+        }
+    }
+}
+
 private nonisolated final class HomeBaseMediaConnection: @unchecked Sendable {
     enum ConnectionError: Error, LocalizedError {
         case invalidPort
@@ -920,13 +936,13 @@ struct CameraFullScreenLiveVideoView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     let device: HBTopologyDeviceDescriptor
-    let quality: HBCameraLiveQuality
     let client: HomeBaseWebSocketClient
     @StateObject private var controlsModel: LiveDeviceControlsModel
     @StateObject private var panTiltGestureController:
         CameraPanTiltGestureController
     @State private var videoRestartRequest = 0
     @State private var controlsVisible = true
+    @State private var selectedQuality: HBCameraLiveQuality
 
     init(
         device: HBTopologyDeviceDescriptor,
@@ -934,8 +950,8 @@ struct CameraFullScreenLiveVideoView: View {
         client: HomeBaseWebSocketClient
     ) {
         self.device = device
-        self.quality = quality
         self.client = client
+        _selectedQuality = State(initialValue: quality)
         let controlsModel = LiveDeviceControlsModel(
             device: device,
             client: client
@@ -986,16 +1002,22 @@ struct CameraFullScreenLiveVideoView: View {
             _, _ in
             captureInitialPanTiltPosition()
         }
+        .onChange(of: availableQualities) { _, qualities in
+            guard !qualities.contains(selectedQuality),
+                  let fallbackQuality = qualities.first else { return }
+            selectedQuality = fallbackQuality
+        }
     }
 
     private var liveVideo: some View {
         CameraLiveVideoPlayer(
             deviceIdentifier: device.addressableName,
-            quality: quality,
+            quality: selectedQuality,
             client: client,
             allowsRetry: true,
             restartRequest: videoRestartRequest
         )
+        .id(selectedQuality)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
             ZStack {
@@ -1033,6 +1055,9 @@ struct CameraFullScreenLiveVideoView: View {
                 privacyControl
             }
         }
+        ToolbarItem(placement: .topBarTrailing) {
+            qualityControl
+        }
     }
 #else
     @ToolbarContentBuilder
@@ -1044,6 +1069,9 @@ struct CameraFullScreenLiveVideoView: View {
             ToolbarItem(placement: .primaryAction) {
                 privacyControl
             }
+        }
+        ToolbarItem(placement: .primaryAction) {
+            qualityControl
         }
     }
 #endif
@@ -1067,6 +1095,38 @@ struct CameraFullScreenLiveVideoView: View {
             control: privacy,
             model: controlsModel
         )
+    }
+
+    private var qualityControl: some View {
+        Menu {
+            ForEach(availableQualities, id: \.self) { quality in
+                Button {
+                    selectedQuality = quality
+                } label: {
+                    if quality == selectedQuality {
+                        Label(
+                            CameraLiveQualityPresentation.title(for: quality),
+                            systemImage: "checkmark"
+                        )
+                    } else {
+                        Text(CameraLiveQualityPresentation.title(for: quality))
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+        }
+        .accessibilityLabel("Video quality")
+        .accessibilityValue(
+            CameraLiveQualityPresentation.title(for: selectedQuality)
+        )
+    }
+
+    private var availableQualities: [HBCameraLiveQuality] {
+        let qualities = CameraLiveVideoCapability(
+            metadata: controlsModel.deviceMetadata
+        )?.qualities ?? [selectedQuality]
+        return CameraLiveQualityPresentation.options(in: qualities)
     }
 
     private var privacyEnabled: Bool? {

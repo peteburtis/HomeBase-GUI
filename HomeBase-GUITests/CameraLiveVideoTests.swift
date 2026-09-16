@@ -56,6 +56,25 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertEqual(capability?.fullScreenQuality, .high)
     }
 
+    func testQualityMenuShowsOnlyAvailableTiersFromHighestToLowest() {
+        XCTAssertEqual(
+            CameraLiveQualityPresentation.options(in: [.low, .high]),
+            [.high, .low]
+        )
+        XCTAssertEqual(
+            CameraLiveQualityPresentation.title(for: .low),
+            "Low"
+        )
+        XCTAssertEqual(
+            CameraLiveQualityPresentation.title(for: .medium),
+            "Medium"
+        )
+        XCTAssertEqual(
+            CameraLiveQualityPresentation.title(for: .high),
+            "High"
+        )
+    }
+
     func testAVCCValidationAcceptsRepeatedLengthPrefixedNALUnits() {
         let accessUnit = Data([
             0, 0, 0, 2, 0x65, 0x01,
