@@ -26,6 +26,10 @@ struct ServerDetailView: View {
     }
 
     var body: some View {
+        let cameras = CameraVideoCatalog.cameras(
+            in: connection.topology.devices
+        )
+
         TabView {
             NavigationStack {
                 homeView
@@ -40,6 +44,18 @@ struct ServerDetailView: View {
                 .tabItem {
                     Label("Home", systemImage: "house")
                 }
+
+            if !cameras.isEmpty {
+                NavigationStack {
+                    VideoView(
+                        cameras: cameras,
+                        client: connection.client
+                    )
+                }
+                    .tabItem {
+                        Label("Video", systemImage: "video")
+                    }
+            }
 
             NavigationStack {
                 ScenesView(

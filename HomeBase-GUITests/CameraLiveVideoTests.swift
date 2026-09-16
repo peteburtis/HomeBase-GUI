@@ -58,6 +58,58 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertEqual(capability?.fullScreenQuality, .high)
     }
 
+    func testVideoCatalogIncludesOnlyLiveH264CamerasInTopologyOrder() {
+        let devices = [
+            HBTopologyDeviceDescriptor(
+                identifier: "light-1",
+                addressableName: "Light1",
+                displayName: "Light"
+            ),
+            HBTopologyDeviceDescriptor(
+                identifier: "camera-2",
+                addressableName: "Camera2",
+                displayName: "Back Camera",
+                metadata: [
+                    CameraLiveVideoCapability.availableMetadataKey: true,
+                    CameraLiveVideoCapability.codecsMetadataKey: ["h264"],
+                    CameraLiveVideoCapability.qualitiesMetadataKey: [
+                        "medium", "high",
+                    ],
+                ]
+            ),
+            HBTopologyDeviceDescriptor(
+                identifier: "camera-1",
+                addressableName: "Camera1",
+                displayName: "Front Camera",
+                metadata: [
+                    CameraLiveVideoCapability.availableMetadataKey: true,
+                    CameraLiveVideoCapability.codecsMetadataKey: ["h264"],
+                ]
+            ),
+            HBTopologyDeviceDescriptor(
+                identifier: "unsupported-camera",
+                addressableName: "FutureCamera",
+                displayName: "Future Camera",
+                metadata: [
+                    CameraLiveVideoCapability.availableMetadataKey: true,
+                    CameraLiveVideoCapability.codecsMetadataKey: ["h265"],
+                ]
+            ),
+        ]
+
+        let cameras = CameraVideoCatalog.cameras(in: devices)
+
+        XCTAssertEqual(cameras.map(\.id), ["camera-2", "camera-1"])
+        XCTAssertEqual(
+            cameras.map(\.capability.previewQuality),
+            [.medium, .low]
+        )
+        XCTAssertEqual(
+            cameras.map(\.capability.fullScreenQuality),
+            [.high, .high]
+        )
+    }
+
     func testQualityMenuShowsOnlyAvailableTiersFromHighestToLowest() {
         XCTAssertEqual(
             CameraLiveQualityPresentation.options(in: [.low, .high]),

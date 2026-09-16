@@ -54,6 +54,29 @@ struct CameraLiveVideoCapability: Equatable, Sendable {
     }
 }
 
+struct CameraVideoDevice: Identifiable, Equatable, Sendable {
+    let device: HBTopologyDeviceDescriptor
+    let capability: CameraLiveVideoCapability
+
+    var id: String { device.identifier }
+}
+
+enum CameraVideoCatalog {
+    static func cameras(
+        in devices: [HBTopologyDeviceDescriptor]
+    ) -> [CameraVideoDevice] {
+        devices.compactMap { device in
+            guard let capability = CameraLiveVideoCapability(
+                metadata: device.metadata
+            ) else { return nil }
+            return CameraVideoDevice(
+                device: device,
+                capability: capability
+            )
+        }
+    }
+}
+
 enum CameraLiveQualityPresentation {
     static func options(
         in qualities: Set<HBCameraLiveQuality>
