@@ -168,6 +168,21 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertEqual(integer.cameraOverlayBooleanWireValue(true), .integer(1))
     }
 
+    func testPrivacyButtonIconReflectsPrivacyState() {
+        XCTAssertEqual(
+            CameraPrivacyButtonPresentation.systemImageName(
+                privacyEnabled: false
+            ),
+            "eye"
+        )
+        XCTAssertEqual(
+            CameraPrivacyButtonPresentation.systemImageName(
+                privacyEnabled: true
+            ),
+            "eye.slash"
+        )
+    }
+
     func testVideoIsDisplayedOnlyWhileActivelyPlaying() {
         XCTAssertFalse(CameraLiveVideoModel.State.idle.displaysVideo)
         XCTAssertFalse(CameraLiveVideoModel.State.connecting.displaysVideo)

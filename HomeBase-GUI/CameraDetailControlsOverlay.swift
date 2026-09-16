@@ -376,40 +376,38 @@ extension View {
     }
 }
 
+enum CameraPrivacyButtonPresentation {
+    static func systemImageName(privacyEnabled: Bool) -> String {
+        privacyEnabled ? "eye.slash" : "eye"
+    }
+}
+
 struct CameraPrivacyToolbarControl: View {
     let control: LiveDeviceControl
     @ObservedObject var model: LiveDeviceControlsModel
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "eye.slash")
-                .accessibilityHidden(true)
-
-            Toggle(
-                isOn: Binding(
-                    get: { isOn },
-                    set: { requestedValue in
-                        Task {
-                            try? await model.setPresentedValue(
-                                control.cameraOverlayBooleanWireValue(
-                                    requestedValue
-                                ),
-                                for: control,
-                                origin: .inline
-                            )
-                        }
-                    }
+        Button {
+            let requestedValue = !isOn
+            Task {
+                try? await model.setPresentedValue(
+                    control.cameraOverlayBooleanWireValue(requestedValue),
+                    for: control,
+                    origin: .inline
                 )
-            ) {
-                EmptyView()
             }
-            .toggleStyle(.switch)
-            .labelsHidden()
-            .disabled(!isEnabled || control.isUpdating)
-            .accessibilityLabel("Privacy mode")
-            .accessibilityValue(isOn ? "On" : "Off")
+        } label: {
+            Image(systemName:
+                CameraPrivacyButtonPresentation.systemImageName(
+                    privacyEnabled: isOn
+                ))
         }
-        .fixedSize()
+        .disabled(!isEnabled || control.isUpdating)
+        .accessibilityLabel("Privacy mode")
+        .accessibilityValue(isOn ? "On" : "Off")
+        .accessibilityHint(
+            isOn ? "Turns privacy mode off" : "Turns privacy mode on"
+        )
     }
 
     private var isOn: Bool {
