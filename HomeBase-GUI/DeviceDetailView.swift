@@ -15,6 +15,7 @@ struct DeviceDetailView: View {
     private let client: HomeBaseWebSocketClient
     @StateObject private var model: LiveDeviceControlsModel
     @State private var isShowingFullScreenVideo = false
+    @State private var videoRestartRequest = 0
 
     init(
         device: HBTopologyDeviceDescriptor,
@@ -38,7 +39,8 @@ struct DeviceDetailView: View {
                         deviceIdentifier: device.addressableName,
                         quality: cameraCapability.previewQuality,
                         client: client,
-                        allowsRetry: false
+                        allowsRetry: false,
+                        restartRequest: videoRestartRequest
                     )
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .overlay(alignment: .bottomTrailing) {
@@ -94,6 +96,13 @@ struct DeviceDetailView: View {
                 await model.stop()
             }
         }
+        .onChange(of: privacyEnabled) { previousValue, currentValue in
+            guard CameraPrivacyStreamRecovery.shouldRequestRestart(
+                from: previousValue,
+                to: currentValue
+            ) else { return }
+            videoRestartRequest &+= 1
+        }
 #if os(iOS)
         .fullScreenCover(isPresented: $isShowingFullScreenVideo) {
             fullScreenVideo
@@ -107,6 +116,11 @@ struct DeviceDetailView: View {
 
     private var cameraCapability: CameraLiveVideoCapability? {
         CameraLiveVideoCapability(metadata: model.deviceMetadata)
+    }
+
+    private var privacyEnabled: Bool? {
+        CameraDetailControlSet(controls: model.controls)
+            .observedPrivacyEnabled
     }
 
     @ViewBuilder

@@ -616,17 +616,25 @@ final class CameraLiveVideoModel: ObservableObject {
     }
 }
 
+extension CameraLiveVideoModel.State {
+    var displaysVideo: Bool {
+        self == .playing
+    }
+}
+
 struct CameraLiveVideoPlayer: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model: CameraLiveVideoModel
     @State private var retryID = 0
     private let allowsRetry: Bool
+    private let restartRequest: Int
 
     init(
         deviceIdentifier: String,
         quality: HBCameraLiveQuality,
         client: HomeBaseWebSocketClient,
-        allowsRetry: Bool
+        allowsRetry: Bool,
+        restartRequest: Int = 0
     ) {
         _model = StateObject(wrappedValue: CameraLiveVideoModel(
             deviceIdentifier: deviceIdentifier,
@@ -634,12 +642,15 @@ struct CameraLiveVideoPlayer: View {
             client: client
         ))
         self.allowsRetry = allowsRetry
+        self.restartRequest = restartRequest
     }
 
     var body: some View {
         ZStack {
             Color.black
-            CameraSampleBufferView(renderer: model.renderer)
+            if model.state.displaysVideo {
+                CameraSampleBufferView(renderer: model.renderer)
+            }
 
             if let message = statusMessage {
                 VStack(spacing: 12) {
@@ -674,6 +685,14 @@ struct CameraLiveVideoPlayer: View {
                 await model.run()
             } else {
                 await model.stop()
+            }
+        }
+        .onChange(of: restartRequest) { _, _ in
+            guard scenePhase == .active,
+                  !model.state.displaysVideo else { return }
+            Task {
+                await model.stop()
+                retryID &+= 1
             }
         }
         .onDisappear {
@@ -723,6 +742,7 @@ struct CameraFullScreenLiveVideoView: View {
     let quality: HBCameraLiveQuality
     let client: HomeBaseWebSocketClient
     @StateObject private var controlsModel: LiveDeviceControlsModel
+    @State private var videoRestartRequest = 0
 
     init(
         device: HBTopologyDeviceDescriptor,
@@ -745,7 +765,8 @@ struct CameraFullScreenLiveVideoView: View {
                 deviceIdentifier: device.addressableName,
                 quality: quality,
                 client: client,
-                allowsRetry: true
+                allowsRetry: true,
+                restartRequest: videoRestartRequest
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -785,6 +806,18 @@ struct CameraFullScreenLiveVideoView: View {
                 await controlsModel.stop()
             }
         }
+        .onChange(of: privacyEnabled) { previousValue, currentValue in
+            guard CameraPrivacyStreamRecovery.shouldRequestRestart(
+                from: previousValue,
+                to: currentValue
+            ) else { return }
+            videoRestartRequest &+= 1
+        }
+    }
+
+    private var privacyEnabled: Bool? {
+        CameraDetailControlSet(controls: controlsModel.controls)
+            .observedPrivacyEnabled
     }
 }
 

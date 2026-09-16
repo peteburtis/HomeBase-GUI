@@ -28,6 +28,10 @@ struct CameraDetailControlSet {
         privacy != nil || hasPanTilt || zoom != nil
     }
 
+    var observedPrivacyEnabled: Bool? {
+        privacy?.cameraOverlayObservedBooleanValue
+    }
+
     private enum Role {
         case privacy
         case pan
@@ -80,6 +84,15 @@ struct CameraDetailControlSet {
             if canonicalComponent == "zoom[0]" { return 100 }
             return semanticNames.contains("ptz.zoom.position") ? 50 : 0
         }
+    }
+}
+
+enum CameraPrivacyStreamRecovery {
+    static func shouldRequestRestart(
+        from previousValue: Bool?,
+        to currentValue: Bool?
+    ) -> Bool {
+        previousValue == true && currentValue == false
     }
 }
 
@@ -471,6 +484,16 @@ extension LiveDeviceControl {
 
     var cameraOverlayBooleanValue: Bool? {
         let value = pendingValue ?? value
+        return Self.cameraOverlayBoolean(from: value)
+    }
+
+    var cameraOverlayObservedBooleanValue: Bool? {
+        Self.cameraOverlayBoolean(from: value)
+    }
+
+    private static func cameraOverlayBoolean(
+        from value: HBJSONValue?
+    ) -> Bool? {
         if let boolean = value?.boolValue { return boolean }
         if let number = value?.numberValue { return number > 0 }
         return nil

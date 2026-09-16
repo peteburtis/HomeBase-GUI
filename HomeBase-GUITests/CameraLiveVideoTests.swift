@@ -164,6 +164,56 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertEqual(integer.cameraOverlayBooleanWireValue(true), .integer(1))
     }
 
+    func testVideoIsDisplayedOnlyWhileActivelyPlaying() {
+        XCTAssertFalse(CameraLiveVideoModel.State.idle.displaysVideo)
+        XCTAssertFalse(CameraLiveVideoModel.State.connecting.displaysVideo)
+        XCTAssertFalse(
+            CameraLiveVideoModel.State.waiting("Reconnecting").displaysVideo
+        )
+        XCTAssertTrue(CameraLiveVideoModel.State.playing.displaysVideo)
+        XCTAssertFalse(
+            CameraLiveVideoModel.State.ended(
+                "Privacy enabled",
+                retryable: true
+            ).displaysVideo
+        )
+        XCTAssertFalse(
+            CameraLiveVideoModel.State.failed("Disconnected").displaysVideo
+        )
+    }
+
+    func testPrivacyRecoveryRequiresConfirmedOnToOffTransition() {
+        XCTAssertTrue(CameraPrivacyStreamRecovery.shouldRequestRestart(
+            from: true,
+            to: false
+        ))
+        XCTAssertFalse(CameraPrivacyStreamRecovery.shouldRequestRestart(
+            from: nil,
+            to: false
+        ))
+        XCTAssertFalse(CameraPrivacyStreamRecovery.shouldRequestRestart(
+            from: false,
+            to: false
+        ))
+        XCTAssertFalse(CameraPrivacyStreamRecovery.shouldRequestRestart(
+            from: true,
+            to: true
+        ))
+    }
+
+    func testPrivacyRecoveryIgnoresOptimisticPendingValue() {
+        var privacy = liveControl(
+            identifier: "Privacy.Enabled",
+            kind: "BinarySwitch",
+            value: .bool(true)
+        )
+        privacy.pendingValue = .bool(false)
+        let controls = CameraDetailControlSet(controls: [privacy])
+
+        XCTAssertEqual(privacy.cameraOverlayBooleanValue, false)
+        XCTAssertEqual(controls.observedPrivacyEnabled, true)
+    }
+
     private func axisMetadata(
         component: String? = nil
     ) -> [String: HBJSONValue] {
