@@ -536,6 +536,148 @@ enum CameraPrivacyButtonPresentation {
     }
 }
 
+enum CameraDayNightMode: String, CaseIterable, Hashable {
+    case day
+    case night
+    case automatic = "auto"
+
+    init?(choiceLabel: String) {
+        switch choiceLabel
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() {
+        case "day": self = .day
+        case "night": self = .night
+        case "auto", "automatic": self = .automatic
+        default: return nil
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .day: "Day"
+        case .night: "Night"
+        case .automatic: "Auto"
+        }
+    }
+
+    var systemImageName: String {
+        switch self {
+        case .day: "sun.max"
+        case .night: "moon"
+        case .automatic: "sun.max.fill"
+        }
+    }
+}
+
+struct CameraDayNightModeChoice: Equatable, Identifiable {
+    let mode: CameraDayNightMode
+    let wireValue: HBJSONValue
+
+    var id: CameraDayNightMode { mode }
+}
+
+/// Resolves vendor controls into the camera UI's semantic day/night role.
+///
+/// Explicit metadata is preferred for future camera modules. The identifier
+/// catalog keeps today's vendor-specific controls out of the view itself and
+/// can be extended without changing the presentation or wire-value handling.
+struct CameraDayNightModeTarget {
+    static let semanticMetadataKey = "cameraDayNightMode"
+    static let supportedControlIdentifiers = [
+        "Camera.Image.DayNightMode",
+        "Camera.DayNightMode",
+        "Image.DayNightMode",
+        "Tapo.Image.DayNightMode",
+    ]
+
+    let control: LiveDeviceControl
+    let choices: [CameraDayNightModeChoice]
+    let selectedMode: CameraDayNightMode?
+
+    init?(controls: [LiveDeviceControl]) {
+        let candidates = controls.compactMap {
+            control -> (
+                score: Int,
+                control: LiveDeviceControl,
+                choices: [CameraDayNightModeChoice]
+            )? in
+            guard control.cameraOverlayIsReadableAndWritable,
+                  let score = Self.matchScore(for: control),
+                  let choices = Self.choices(for: control) else {
+                return nil
+            }
+            return (score, control, choices)
+        }
+        guard let candidate = candidates.max(by: {
+            $0.score < $1.score
+        }) else {
+            return nil
+        }
+
+        control = candidate.control
+        choices = candidate.choices
+        let presentedValue = candidate.control.pendingValue
+            ?? candidate.control.value
+        selectedMode = presentedValue.flatMap { value in
+            candidate.choices.first(where: {
+                $0.wireValue.isEquivalentControlValue(to: value)
+            })?.mode
+        }
+    }
+
+    func wireValue(for mode: CameraDayNightMode) -> HBJSONValue? {
+        choices.first(where: { $0.mode == mode })?.wireValue
+    }
+
+    private static func choices(
+        for control: LiveDeviceControl
+    ) -> [CameraDayNightModeChoice]? {
+        let schema = ControlValueSchema(
+            kind: control.descriptor.kind,
+            metadata: control.cameraOverlayMetadata
+        )
+        guard let advertisedChoices = schema.selectionChoices else {
+            return nil
+        }
+
+        var choices: [CameraDayNightModeChoice] = []
+        for advertisedChoice in advertisedChoices {
+            guard let mode = CameraDayNightMode(
+                choiceLabel: advertisedChoice.label
+            ), !choices.contains(where: { $0.mode == mode }) else {
+                continue
+            }
+            choices.append(CameraDayNightModeChoice(
+                mode: mode,
+                wireValue: advertisedChoice.value
+            ))
+        }
+        guard choices.count >= 2 else { return nil }
+        return choices
+    }
+
+    private static func matchScore(
+        for control: LiveDeviceControl
+    ) -> Int? {
+        let metadata = control.cameraOverlayMetadata
+        if metadata[semanticMetadataKey]?.boolValue == true {
+            return 10_000
+        }
+
+        let semanticNames = [
+            control.descriptor.controlIdentifier,
+            control.descriptor.kind,
+        ]
+        for (index, identifier) in supportedControlIdentifiers.enumerated()
+        where semanticNames.contains(where: {
+            $0.caseInsensitiveCompare(identifier) == .orderedSame
+        }) {
+            return 5_000 - index
+        }
+        return nil
+    }
+}
+
 struct CameraPrivacyToolbarControl: View {
     let control: LiveDeviceControl
     @ObservedObject var model: LiveDeviceControlsModel
@@ -572,6 +714,60 @@ struct CameraPrivacyToolbarControl: View {
         model.state == .live
             && control.valid != false
             && control.cameraOverlayBooleanValue != nil
+    }
+}
+
+struct CameraDayNightModeToolbarControl: View {
+    let target: CameraDayNightModeTarget
+    @ObservedObject var model: LiveDeviceControlsModel
+
+    var body: some View {
+        Menu {
+            Picker("Day and night mode", selection: selection) {
+                ForEach(target.choices) { choice in
+                    Label(
+                        choice.mode.title,
+                        systemImage: choice.mode.systemImageName
+                    )
+                    .tag(Optional(choice.mode))
+                }
+            }
+        } label: {
+            Image(systemName: displayedMode.systemImageName)
+        }
+        .disabled(!isEnabled || target.control.isUpdating)
+        .accessibilityLabel("Day and night mode")
+        .accessibilityValue(target.selectedMode?.title ?? "Unavailable")
+    }
+
+    private var displayedMode: CameraDayNightMode {
+        target.selectedMode ?? target.choices[0].mode
+    }
+
+    private var isEnabled: Bool {
+        model.state == .live
+            && target.control.valid != false
+            && target.selectedMode != nil
+    }
+
+    private var selection: Binding<CameraDayNightMode?> {
+        Binding(
+            get: { target.selectedMode },
+            set: { mode in
+                guard let mode,
+                      mode != target.selectedMode,
+                      let wireValue = target.wireValue(for: mode) else {
+                    return
+                }
+                Task {
+                    try? await model.setPresentedValue(
+                        wireValue,
+                        for: target.control,
+                        origin: .inline
+                    )
+                }
+            }
+        )
     }
 }
 

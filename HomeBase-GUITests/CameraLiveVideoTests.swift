@@ -202,6 +202,74 @@ final class CameraLiveVideoTests: XCTestCase {
         )
     }
 
+    func testDayNightModeUsesAdvertisedTapoChoicesAndWireValues() throws {
+        let control = liveControl(
+            identifier: "Tapo.Image.DayNightMode",
+            value: .number(2),
+            metadata: dayNightChoiceMetadata(values: [
+                .number(10), .number(20), .number(2),
+            ])
+        )
+
+        let target = try XCTUnwrap(CameraDayNightModeTarget(
+            controls: [control]
+        ))
+
+        XCTAssertEqual(target.control.id, control.id)
+        XCTAssertEqual(target.choices.map(\.mode), [
+            .day, .night, .automatic,
+        ])
+        XCTAssertEqual(target.selectedMode, .automatic)
+        XCTAssertEqual(target.wireValue(for: .day), .number(10))
+        XCTAssertEqual(target.wireValue(for: .night), .number(20))
+        XCTAssertEqual(target.wireValue(for: .automatic), .number(2))
+    }
+
+    func testDayNightModeSupportsSemanticMetadataAndStringValues() throws {
+        let control = liveControl(
+            identifier: "Vendor.Illumination",
+            value: .string("infrared"),
+            metadata: dayNightChoiceMetadata(values: [
+                .string("visible"),
+                .string("infrared"),
+                .string("adaptive"),
+            ]).merging([
+                CameraDayNightModeTarget.semanticMetadataKey: true,
+            ]) { _, new in new }
+        )
+
+        let target = try XCTUnwrap(CameraDayNightModeTarget(
+            controls: [control]
+        ))
+
+        XCTAssertEqual(target.selectedMode, .night)
+        XCTAssertEqual(
+            target.wireValue(for: .automatic),
+            .string("adaptive")
+        )
+    }
+
+    func testDayNightModeRejectsUnrelatedChoiceControls() {
+        let control = liveControl(
+            identifier: "Tapo.Image.LightFrequency",
+            value: .number(0),
+            metadata: dayNightChoiceMetadata(values: [
+                .number(0), .number(1), .number(2),
+            ])
+        )
+
+        XCTAssertNil(CameraDayNightModeTarget(controls: [control]))
+    }
+
+    func testDayNightModeUsesRequestedSymbols() {
+        XCTAssertEqual(CameraDayNightMode.day.systemImageName, "sun.max")
+        XCTAssertEqual(CameraDayNightMode.night.systemImageName, "moon")
+        XCTAssertEqual(
+            CameraDayNightMode.automatic.systemImageName,
+            "sun.max.fill"
+        )
+    }
+
     func testVideoIsDisplayedOnlyWhileActivelyPlaying() {
         XCTAssertFalse(CameraLiveVideoModel.State.idle.displaysVideo)
         XCTAssertFalse(CameraLiveVideoModel.State.connecting.displaysVideo)
@@ -436,6 +504,19 @@ final class CameraLiveVideoTests: XCTestCase {
             metadata["canonicalComponent"] = .string(component)
         }
         return metadata
+    }
+
+    private func dayNightChoiceMetadata(
+        values: [HBJSONValue]
+    ) -> [String: HBJSONValue] {
+        precondition(values.count == 3)
+        return [
+            "choices": .array([
+                .object(["value": values[0], "label": .string("day")]),
+                .object(["value": values[1], "label": .string("night")]),
+                .object(["value": values[2], "label": .string("auto")]),
+            ]),
+        ]
     }
 
     private func panTiltControls(

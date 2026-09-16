@@ -1121,13 +1121,18 @@ struct CameraFullScreenLiveVideoView: View {
         ToolbarItem(placement: .topBarLeading) {
             closeButton
         }
+        ToolbarItem(placement: .topBarTrailing) {
+            qualityControl
+        }
+        if let dayNightModeControl {
+            ToolbarItem(placement: .topBarTrailing) {
+                dayNightModeControl
+            }
+        }
         if let privacyControl {
             ToolbarItem(placement: .topBarTrailing) {
                 privacyControl
             }
-        }
-        ToolbarItem(placement: .topBarTrailing) {
-            qualityControl
         }
     }
 #else
@@ -1136,13 +1141,18 @@ struct CameraFullScreenLiveVideoView: View {
         ToolbarItem(placement: .navigation) {
             closeButton
         }
+        ToolbarItem(placement: .primaryAction) {
+            qualityControl
+        }
+        if let dayNightModeControl {
+            ToolbarItem(placement: .primaryAction) {
+                dayNightModeControl
+            }
+        }
         if let privacyControl {
             ToolbarItem(placement: .primaryAction) {
                 privacyControl
             }
-        }
-        ToolbarItem(placement: .primaryAction) {
-            qualityControl
         }
     }
 #endif
@@ -1164,6 +1174,16 @@ struct CameraFullScreenLiveVideoView: View {
         guard let privacy = controls.privacy else { return nil }
         return CameraPrivacyToolbarControl(
             control: privacy,
+            model: controlsModel
+        )
+    }
+
+    private var dayNightModeControl: CameraDayNightModeToolbarControl? {
+        guard let target = CameraDayNightModeTarget(
+            controls: controlsModel.controls
+        ) else { return nil }
+        return CameraDayNightModeToolbarControl(
+            target: target,
             model: controlsModel
         )
     }
