@@ -1161,6 +1161,12 @@ struct CameraFullScreenLiveVideoView: View {
             .success,
             trigger: recordingController.successfulSaveCount
         )
+        .sensoryFeedback(
+            .start,
+            trigger: recordingController.state
+        ) { previousState, currentState in
+            previousState != .recording && currentState == .recording
+        }
         .alert(
             "Recording Unavailable",
             isPresented: recordingErrorIsPresented
