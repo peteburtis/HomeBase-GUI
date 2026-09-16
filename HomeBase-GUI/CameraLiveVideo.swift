@@ -1162,7 +1162,7 @@ struct CameraFullScreenLiveVideoView: View {
             trigger: recordingController.successfulSaveCount
         )
         .sensoryFeedback(
-            .start,
+            .impact(weight: .medium),
             trigger: recordingController.state
         ) { previousState, currentState in
             previousState != .recording && currentState == .recording
