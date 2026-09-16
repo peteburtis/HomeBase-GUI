@@ -357,6 +357,29 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertNil(CameraPanTiltGestureTarget(controls: [controls[0]]))
     }
 
+    func testZoomGestureMapsPinchOutToZoomIn() throws {
+        let target = try XCTUnwrap(CameraZoomGestureTarget(
+            controls: panTiltControls(pan: 0, tilt: 0, zoom: 0)
+        ))
+
+        XCTAssertEqual(
+            target.value(afterMagnifyingBy: 2),
+            1,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            target.value(afterMagnifyingBy: 0.5),
+            -1,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testZoomGestureRequiresAnAvailableZoomControl() {
+        XCTAssertNil(CameraZoomGestureTarget(
+            controls: panTiltControls(pan: 0, tilt: 0)
+        ))
+    }
+
 #if os(iOS)
     func testCameraPresentationRestrictsSupportedOrientationsToLandscape()
         async throws

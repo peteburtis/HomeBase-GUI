@@ -210,6 +210,36 @@ struct CameraPanTiltGestureTarget {
     }
 }
 
+struct CameraZoomGestureTarget {
+    private static let rangeFractionPerDoubling = 0.5
+
+    let control: LiveDeviceControl
+    let range: ClosedRange<Double>
+    let value: Double
+
+    init?(controls: [LiveDeviceControl]) {
+        guard let control = CameraDetailControlSet(controls: controls).zoom,
+              control.valid != false,
+              let range = control.cameraOverlayScalarRange,
+              let value = control.cameraOverlayNumericValue else {
+            return nil
+        }
+        self.control = control
+        self.range = range
+        self.value = value.clamped(to: range)
+    }
+
+    func value(afterMagnifyingBy magnification: CGFloat) -> Double {
+        let magnification = Double(magnification)
+        guard magnification.isFinite, magnification > 0 else { return value }
+        let span = range.upperBound - range.lowerBound
+        let delta = log2(magnification)
+            * span
+            * Self.rangeFractionPerDoubling
+        return (value + delta).clamped(to: range)
+    }
+}
+
 @MainActor
 final class CameraPanTiltGestureController: ObservableObject {
     private struct WriteRequest {
@@ -337,6 +367,130 @@ final class CameraPanTiltGestureController: ObservableObject {
                 try? await model.setCanonicalPresentedValue(
                     request.target.payload(for: request.position),
                     controlPath: request.target.canonicalControlPath
+                )
+            }
+            if writerGeneration == generation {
+                writerTask = nil
+                writerGeneration = nil
+            }
+        }
+    }
+}
+
+@MainActor
+final class CameraZoomGestureController: ObservableObject {
+    private struct WriteRequest {
+        let target: CameraZoomGestureTarget
+        let value: Double
+    }
+
+    private static let interactiveWriteInterval = Duration.milliseconds(125)
+
+    private let model: LiveDeviceControlsModel
+    private var magnificationTarget: CameraZoomGestureTarget?
+    private var pendingInteractiveWrite: WriteRequest?
+    private var interactiveWriteTask: Task<Void, Never>?
+    private var interactiveWriteGeneration: UUID?
+    private var pendingWrite: WriteRequest?
+    private var writerTask: Task<Void, Never>?
+    private var writerGeneration: UUID?
+
+    init(model: LiveDeviceControlsModel) {
+        self.model = model
+    }
+
+    func beginMagnification(using target: CameraZoomGestureTarget) {
+        magnificationTarget = target
+        pendingInteractiveWrite = nil
+    }
+
+    func updateMagnification(_ magnification: CGFloat) {
+        guard let magnificationTarget else { return }
+        scheduleInteractiveWrite(WriteRequest(
+            target: magnificationTarget,
+            value: magnificationTarget.value(
+                afterMagnifyingBy: magnification
+            )
+        ))
+    }
+
+    func endMagnification(_ magnification: CGFloat) {
+        guard let magnificationTarget else { return }
+        let request = WriteRequest(
+            target: magnificationTarget,
+            value: magnificationTarget.value(
+                afterMagnifyingBy: magnification
+            )
+        )
+        cancelInteractiveThrottle()
+        self.magnificationTarget = nil
+        enqueue(request)
+    }
+
+    func cancelMagnification() {
+        magnificationTarget = nil
+        cancelInteractiveThrottle()
+    }
+
+    func stop() {
+        cancelMagnification()
+        pendingWrite = nil
+        writerTask?.cancel()
+        writerTask = nil
+        writerGeneration = nil
+    }
+
+    private func scheduleInteractiveWrite(_ request: WriteRequest) {
+        pendingInteractiveWrite = request
+        guard interactiveWriteTask == nil else { return }
+
+        pendingInteractiveWrite = nil
+        enqueue(request)
+
+        let generation = UUID()
+        interactiveWriteGeneration = generation
+        interactiveWriteTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(
+                        for: Self.interactiveWriteInterval
+                    )
+                } catch {
+                    break
+                }
+                guard let request = pendingInteractiveWrite else { break }
+                pendingInteractiveWrite = nil
+                enqueue(request)
+            }
+            if interactiveWriteGeneration == generation {
+                interactiveWriteTask = nil
+                interactiveWriteGeneration = nil
+            }
+        }
+    }
+
+    private func cancelInteractiveThrottle() {
+        pendingInteractiveWrite = nil
+        interactiveWriteTask?.cancel()
+        interactiveWriteTask = nil
+        interactiveWriteGeneration = nil
+    }
+
+    private func enqueue(_ request: WriteRequest) {
+        pendingWrite = request
+        guard writerTask == nil else { return }
+
+        let generation = UUID()
+        writerGeneration = generation
+        writerTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while let request = pendingWrite {
+                pendingWrite = nil
+                try? await model.setPresentedValue(
+                    .number(request.value),
+                    for: request.target.control,
+                    origin: .inline
                 )
             }
             if writerGeneration == generation {

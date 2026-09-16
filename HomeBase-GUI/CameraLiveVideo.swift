@@ -796,11 +796,26 @@ private enum CameraPanGesturePhase {
     case cancelled
 }
 
+private enum CameraMagnifyGesturePhase {
+    case began
+    case changed
+    case ended
+    case cancelled
+}
+
 #if canImport(UIKit)
 private final class CameraLiveGestureUIView: UIView {
     var onPan: ((CameraPanGesturePhase, CGSize, CGSize) -> Void)?
+    var onMagnify: ((CameraMagnifyGesturePhase, CGFloat) -> Void)? {
+        didSet { pinchRecognizer.isEnabled = onMagnify != nil }
+    }
     var onSingleTap: (() -> Void)?
     var onTwoFingerTap: (() -> Void)?
+
+    private lazy var pinchRecognizer = UIPinchGestureRecognizer(
+        target: self,
+        action: #selector(pinched(_:))
+    )
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -814,6 +829,9 @@ private final class CameraLiveGestureUIView: UIView {
         pan.minimumNumberOfTouches = 1
         pan.maximumNumberOfTouches = 1
         addGestureRecognizer(pan)
+
+        pinchRecognizer.isEnabled = false
+        addGestureRecognizer(pinchRecognizer)
 
         let singleTap = UITapGestureRecognizer(
             target: self,
@@ -861,6 +879,23 @@ private final class CameraLiveGestureUIView: UIView {
         onSingleTap?()
     }
 
+    @objc private func pinched(_ recognizer: UIPinchGestureRecognizer) {
+        let phase: CameraMagnifyGesturePhase
+        switch recognizer.state {
+        case .began:
+            phase = .began
+        case .changed:
+            phase = .changed
+        case .ended:
+            phase = .ended
+        case .cancelled, .failed:
+            phase = .cancelled
+        default:
+            return
+        }
+        onMagnify?(phase, recognizer.scale)
+    }
+
     @objc private func twoFingerTapped() {
         onTwoFingerTap?()
     }
@@ -868,6 +903,7 @@ private final class CameraLiveGestureUIView: UIView {
 
 private struct CameraLiveGestureSurface: UIViewRepresentable {
     let onPan: (CameraPanGesturePhase, CGSize, CGSize) -> Void
+    let onMagnify: ((CameraMagnifyGesturePhase, CGFloat) -> Void)?
     let onSingleTap: () -> Void
     let onTwoFingerTap: () -> Void
 
@@ -886,6 +922,7 @@ private struct CameraLiveGestureSurface: UIViewRepresentable {
 
     private func update(_ view: CameraLiveGestureUIView) {
         view.onPan = onPan
+        view.onMagnify = onMagnify
         view.onSingleTap = onSingleTap
         view.onTwoFingerTap = onTwoFingerTap
     }
@@ -893,13 +930,15 @@ private struct CameraLiveGestureSurface: UIViewRepresentable {
 #else
 private struct CameraLiveGestureSurface: View {
     let onPan: (CameraPanGesturePhase, CGSize, CGSize) -> Void
+    let onMagnify: ((CameraMagnifyGesturePhase, CGFloat) -> Void)?
     let onSingleTap: () -> Void
     let onTwoFingerTap: () -> Void
     @State private var isDragging = false
+    @State private var isMagnifying = false
 
     var body: some View {
         GeometryReader { geometry in
-            Color.clear
+            let surface = Color.clear
                 .contentShape(Rectangle())
                 .gesture(
                     DragGesture(minimumDistance: 8)
@@ -926,6 +965,25 @@ private struct CameraLiveGestureSurface: View {
                 .simultaneousGesture(
                     TapGesture().onEnded(onSingleTap)
                 )
+
+            if let onMagnify {
+                surface.simultaneousGesture(
+                    MagnifyGesture()
+                        .onChanged { value in
+                            if !isMagnifying {
+                                isMagnifying = true
+                                onMagnify(.began, 1)
+                            }
+                            onMagnify(.changed, value.magnification)
+                        }
+                        .onEnded { value in
+                            isMagnifying = false
+                            onMagnify(.ended, value.magnification)
+                        }
+                )
+            } else {
+                surface
+            }
         }
     }
 }
@@ -940,6 +998,7 @@ struct CameraFullScreenLiveVideoView: View {
     @StateObject private var controlsModel: LiveDeviceControlsModel
     @StateObject private var panTiltGestureController:
         CameraPanTiltGestureController
+    @StateObject private var zoomGestureController: CameraZoomGestureController
     @State private var videoRestartRequest = 0
     @State private var controlsVisible = true
     @State private var selectedQuality: HBCameraLiveQuality
@@ -960,6 +1019,9 @@ struct CameraFullScreenLiveVideoView: View {
         _panTiltGestureController = StateObject(wrappedValue:
             CameraPanTiltGestureController(model: controlsModel)
         )
+        _zoomGestureController = StateObject(wrappedValue:
+            CameraZoomGestureController(model: controlsModel)
+        )
     }
 
     var body: some View {
@@ -979,6 +1041,7 @@ struct CameraFullScreenLiveVideoView: View {
         }
         .onDisappear {
             panTiltGestureController.stop()
+            zoomGestureController.stop()
             Task {
                 await controlsModel.stop()
             }
@@ -1044,6 +1107,7 @@ struct CameraFullScreenLiveVideoView: View {
                 Color.black.ignoresSafeArea()
                 CameraLiveGestureSurface(
                     onPan: handlePanGesture,
+                    onMagnify: magnifyGestureHandler,
                     onSingleTap: toggleControls,
                     onTwoFingerTap: recenterCamera
                 )
@@ -1146,6 +1210,23 @@ struct CameraFullScreenLiveVideoView: View {
         return CameraPanTiltGestureTarget(controls: controlsModel.controls)
     }
 
+    private var zoomGestureTarget: CameraZoomGestureTarget? {
+        guard controlsModel.state == .live else { return nil }
+        return CameraZoomGestureTarget(controls: controlsModel.controls)
+    }
+
+    private var magnifyGestureHandler:
+        ((CameraMagnifyGesturePhase, CGFloat) -> Void)?
+    {
+        guard zoomGestureTarget != nil else { return nil }
+        return { phase, magnification in
+            handleMagnifyGesture(
+                phase: phase,
+                magnification: magnification
+            )
+        }
+    }
+
     private func captureInitialPanTiltPosition() {
         guard let panTiltGestureTarget else { return }
         panTiltGestureController.captureInitialPosition(
@@ -1174,6 +1255,25 @@ struct CameraFullScreenLiveVideoView: View {
             )
         case .cancelled:
             panTiltGestureController.cancelDrag()
+        }
+    }
+
+    private func handleMagnifyGesture(
+        phase: CameraMagnifyGesturePhase,
+        magnification: CGFloat
+    ) {
+        switch phase {
+        case .began:
+            guard let zoomGestureTarget else { return }
+            zoomGestureController.beginMagnification(
+                using: zoomGestureTarget
+            )
+        case .changed:
+            zoomGestureController.updateMagnification(magnification)
+        case .ended:
+            zoomGestureController.endMagnification(magnification)
+        case .cancelled:
+            zoomGestureController.cancelMagnification()
         }
     }
 
