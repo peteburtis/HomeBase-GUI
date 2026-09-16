@@ -717,31 +717,42 @@ struct CameraLiveVideoPlayer: View {
 
 struct CameraFullScreenLiveVideoView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
 
-    let deviceIdentifier: String
-    let displayName: String
+    let device: HBTopologyDeviceDescriptor
     let quality: HBCameraLiveQuality
     let client: HomeBaseWebSocketClient
+    @StateObject private var controlsModel: LiveDeviceControlsModel
+
+    init(
+        device: HBTopologyDeviceDescriptor,
+        quality: HBCameraLiveQuality,
+        client: HomeBaseWebSocketClient
+    ) {
+        self.device = device
+        self.quality = quality
+        self.client = client
+        _controlsModel = StateObject(wrappedValue: LiveDeviceControlsModel(
+            device: device,
+            client: client
+        ))
+    }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             CameraLiveVideoPlayer(
-                deviceIdentifier: deviceIdentifier,
+                deviceIdentifier: device.addressableName,
                 quality: quality,
                 client: client,
                 allowsRetry: true
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
+            CameraDetailControlsOverlay(model: controlsModel)
+
             VStack {
                 HStack {
-                    Text(displayName)
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(.black.opacity(0.6), in: Capsule())
                     Spacer()
                     Button {
                         dismiss()
@@ -763,6 +774,16 @@ struct CameraFullScreenLiveVideoView: View {
         }
         .onDisappear {
             CameraLandscapeOrientation.restore()
+            Task {
+                await controlsModel.stop()
+            }
+        }
+        .task(id: scenePhase) {
+            if scenePhase == .active {
+                await controlsModel.run(reactivating: true)
+            } else {
+                await controlsModel.stop()
+            }
         }
     }
 }

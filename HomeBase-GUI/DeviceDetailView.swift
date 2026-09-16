@@ -113,8 +113,7 @@ struct DeviceDetailView: View {
     private var fullScreenVideo: some View {
         if let cameraCapability {
             CameraFullScreenLiveVideoView(
-                deviceIdentifier: device.addressableName,
-                displayName: device.displayName,
+                device: device,
                 quality: cameraCapability.fullScreenQuality,
                 client: client
             )
