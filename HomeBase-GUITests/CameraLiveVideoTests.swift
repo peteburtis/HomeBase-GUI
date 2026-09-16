@@ -229,17 +229,17 @@ final class CameraLiveVideoTests: XCTestCase {
         )
 
         let position = target.position(
-            afterScrollingBy: CGSize(width: 100, height: 50),
+            afterScrollingBy: CGSize(width: 50, height: 50),
             in: CGSize(width: 200, height: 100)
         )
 
         XCTAssertEqual(target.canonicalControlPath, "Camera:PTZ.Position")
-        XCTAssertEqual(position.pan, -0.75, accuracy: 0.000_001)
-        XCTAssertEqual(position.tilt, 0.75, accuracy: 0.000_001)
+        XCTAssertEqual(position.pan, 0.75, accuracy: 0.000_001)
+        XCTAssertEqual(position.tilt, -1, accuracy: 0.000_001)
         XCTAssertEqual(target.payload(for: position), .object([
             "PanTilt": .array([
-                .number(-0.75),
                 .number(0.75),
+                .number(-1),
             ]),
             "Zoom": .array([.number(0.5)]),
         ]))
@@ -255,8 +255,8 @@ final class CameraLiveVideoTests: XCTestCase {
             in: CGSize(width: 100, height: 100)
         )
 
-        XCTAssertEqual(position.pan, 1)
-        XCTAssertEqual(position.tilt, -1)
+        XCTAssertEqual(position.pan, -1)
+        XCTAssertEqual(position.tilt, 1)
     }
 
     func testPanTiltGestureOpeningPositionIgnoresOptimisticValues() throws {

@@ -178,9 +178,9 @@ struct CameraPanTiltGestureTarget {
         let panSpan = panRange.upperBound - panRange.lowerBound
         let tiltSpan = tiltRange.upperBound - tiltRange.lowerBound
         return CameraPanTiltPosition(
-            pan: (position.pan - Double(translation.width / width) * panSpan)
+            pan: (position.pan + Double(translation.width / width) * panSpan)
                 .clamped(to: panRange),
-            tilt: (position.tilt + Double(translation.height / height) * tiltSpan)
+            tilt: (position.tilt - Double(translation.height / height) * tiltSpan)
                 .clamped(to: tiltRange)
         )
     }
@@ -386,7 +386,6 @@ struct CameraPrivacyToolbarControl: View {
                 .accessibilityHidden(true)
 
             Toggle(
-                "Privacy",
                 isOn: Binding(
                     get: { isOn },
                     set: { requestedValue in
@@ -401,7 +400,10 @@ struct CameraPrivacyToolbarControl: View {
                         }
                     }
                 )
-            )
+            ) {
+                EmptyView()
+            }
+            .toggleStyle(.switch)
             .labelsHidden()
             .disabled(!isEnabled || control.isUpdating)
             .accessibilityLabel("Privacy mode")

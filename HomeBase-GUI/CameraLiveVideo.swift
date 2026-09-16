@@ -989,30 +989,30 @@ struct CameraFullScreenLiveVideoView: View {
     }
 
     private var liveVideo: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-
-            CameraLiveGestureSurface(
-                onPan: handlePanGesture,
-                onSingleTap: toggleControls,
-                onTwoFingerTap: recenterCamera
-            )
-
-            CameraLiveVideoPlayer(
-                deviceIdentifier: device.addressableName,
-                quality: quality,
-                client: client,
-                allowsRetry: true,
-                restartRequest: videoRestartRequest
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
+        CameraLiveVideoPlayer(
+            deviceIdentifier: device.addressableName,
+            quality: quality,
+            client: client,
+            allowsRetry: true,
+            restartRequest: videoRestartRequest
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            ZStack {
+                Color.black.ignoresSafeArea()
+                CameraLiveGestureSurface(
+                    onPan: handlePanGesture,
+                    onSingleTap: toggleControls,
+                    onTwoFingerTap: recenterCamera
+                )
+            }
+        }
+        .overlay {
             if controlsVisible {
                 CameraDetailControlsOverlay(model: controlsModel)
                     .transition(.opacity)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .animation(.snappy, value: controlsVisible)
         .accessibilityAction(named: "Toggle camera controls") {
             toggleControls()
