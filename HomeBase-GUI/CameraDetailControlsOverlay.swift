@@ -172,6 +172,8 @@ struct CameraPrivacyToolbarControl: View {
 
 struct CameraDetailControlsOverlay: View {
     @ObservedObject var model: LiveDeviceControlsModel
+    @State private var isPanTiltExpanded = true
+    @State private var isZoomExpanded = true
 
     var body: some View {
         GeometryReader { geometry in
@@ -210,19 +212,30 @@ struct CameraDetailControlsOverlay: View {
         length: CGFloat
     ) -> some View {
         VStack(spacing: 8) {
-            CameraOverlaySlider(
-                control: control,
-                model: model,
-                orientation: .vertical,
-                length: length,
-                interactionEnabled: interactionEnabled(for: control)
-            )
+            if isZoomExpanded {
+                CameraOverlaySlider(
+                    control: control,
+                    model: model,
+                    orientation: .vertical,
+                    length: length,
+                    interactionEnabled: interactionEnabled(for: control)
+                )
+                .transition(
+                    .opacity.combined(with: .scale(0.8, anchor: .bottom))
+                )
+            }
 
             CameraOverlayIcon(
                 systemName: "plus.magnifyingglass",
-                accessibilityLabel: "Zoom"
-            )
+                accessibilityLabel: "zoom controls",
+                isExpanded: isZoomExpanded
+            ) {
+                withAnimation(.snappy) {
+                    isZoomExpanded.toggle()
+                }
+            }
         }
+        .animation(.snappy, value: isZoomExpanded)
     }
 
     private func panTiltCluster(
@@ -234,38 +247,52 @@ struct CameraDetailControlsOverlay: View {
         let spacing: CGFloat = 8
 
         return ZStack(alignment: .bottomTrailing) {
-            if let pan {
-                CameraOverlaySlider(
-                    control: pan,
-                    model: model,
-                    orientation: .horizontal,
-                    length: length,
-                    interactionEnabled: interactionEnabled(for: pan)
-                )
-                .padding(.trailing, iconLength + spacing)
-            }
+            if isPanTiltExpanded {
+                if let pan {
+                    CameraOverlaySlider(
+                        control: pan,
+                        model: model,
+                        orientation: .horizontal,
+                        length: length,
+                        interactionEnabled: interactionEnabled(for: pan)
+                    )
+                    .padding(.trailing, iconLength + spacing)
+                    .transition(.opacity)
+                }
 
-            if let tilt {
-                CameraOverlaySlider(
-                    control: tilt,
-                    model: model,
-                    orientation: .vertical,
-                    length: length,
-                    interactionEnabled: interactionEnabled(for: tilt)
-                )
-                .padding(.bottom, iconLength + spacing)
+                if let tilt {
+                    CameraOverlaySlider(
+                        control: tilt,
+                        model: model,
+                        orientation: .vertical,
+                        length: length,
+                        interactionEnabled: interactionEnabled(for: tilt)
+                    )
+                    .padding(.bottom, iconLength + spacing)
+                    .transition(.opacity)
+                }
             }
 
             CameraOverlayIcon(
                 systemName: "arrow.up.and.down.and.arrow.left.and.right",
-                accessibilityLabel: "Pan and tilt"
-            )
+                accessibilityLabel: "pan and tilt controls",
+                isExpanded: isPanTiltExpanded
+            ) {
+                withAnimation(.snappy) {
+                    isPanTiltExpanded.toggle()
+                }
+            }
         }
         .frame(
-            width: length + iconLength + spacing,
-            height: length + iconLength + spacing,
+            width: isPanTiltExpanded
+                ? length + iconLength + spacing
+                : iconLength,
+            height: isPanTiltExpanded
+                ? length + iconLength + spacing
+                : iconLength,
             alignment: .bottomTrailing
         )
+        .animation(.snappy, value: isPanTiltExpanded)
     }
 
     private func interactionEnabled(
@@ -466,14 +493,22 @@ private struct CameraOverlaySlider: View {
 private struct CameraOverlayIcon: View {
     let systemName: String
     let accessibilityLabel: String
+    let isExpanded: Bool
+    let action: () -> Void
 
     var body: some View {
-        Image(systemName: systemName)
-            .font(.title3.weight(.semibold))
-            .foregroundStyle(.white)
-            .frame(width: 44, height: 44)
-            .cameraGlassBacker(in: Circle())
-            .accessibilityLabel(accessibilityLabel)
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+        }
+        .buttonStyle(.plain)
+        .cameraGlassBacker(in: Circle(), interactive: true)
+        .accessibilityLabel(
+            "\(isExpanded ? "Hide" : "Show") \(accessibilityLabel)"
+        )
+        .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
     }
 }
 
