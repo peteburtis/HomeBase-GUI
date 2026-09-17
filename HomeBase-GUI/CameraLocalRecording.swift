@@ -81,6 +81,7 @@ final class CameraLocalRecordingController: ObservableObject {
     @Published private(set) var state: State = .idle
     @Published private(set) var isStreamAvailable = false
     @Published private(set) var successfulSaveCount = 0
+    @Published private(set) var recordingStartedAt: Date?
 
     private let destination: any CameraRecordingDestination
     private var streamOwnerID: UUID?
@@ -191,6 +192,7 @@ final class CameraLocalRecordingController: ObservableObject {
                     sampleBuffer,
                     formatDescription: streamFormat.formatDescription
                 )
+                recordingStartedAt = Date()
                 state = .recording
             }
 
@@ -236,6 +238,7 @@ final class CameraLocalRecordingController: ObservableObject {
         self.writerInput = nil
         self.outputURL = nil
         recordingCreationDate = nil
+        recordingStartedAt = nil
         state = .saving
 
         writerInput.markAsFinished()
@@ -308,6 +311,7 @@ final class CameraLocalRecordingController: ObservableObject {
         writerInput = nil
         outputURL = nil
         recordingCreationDate = nil
+        recordingStartedAt = nil
     }
 
     private func fail(_ error: Error) {

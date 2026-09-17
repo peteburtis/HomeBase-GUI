@@ -1090,6 +1090,7 @@ struct CameraFullScreenLiveVideoView: View {
     @StateObject private var recordingController:
         CameraLocalRecordingController
     @State private var savedConfirmationVisible = false
+    @State private var livePlaybackControlsVisible = false
 #endif
 
     init(
@@ -1172,11 +1173,16 @@ struct CameraFullScreenLiveVideoView: View {
                 savedConfirmationVisible = true
             }
             do {
-                try await Task.sleep(for: .seconds(2.5))
+                try await Task.sleep(for: .seconds(1.5))
             } catch {
                 return
             }
             withAnimation(.easeOut(duration: 0.2)) {
+                savedConfirmationVisible = false
+            }
+        }
+        .onChange(of: recordingController.state) { _, state in
+            if state == .requestingAuthorization {
                 savedConfirmationVisible = false
             }
         }
@@ -1254,10 +1260,31 @@ struct CameraFullScreenLiveVideoView: View {
         ToolbarItem(placement: .topBarLeading) {
             closeButton
         }
-        if savedConfirmationVisible {
-            ToolbarItem(placement: .principal) {
-                savedConfirmation
+        if showsLiveControls {
+            if livePlaybackControlsVisible {
+                ToolbarSpacer(.fixed, placement: .topBarLeading)
+                ToolbarItem(placement: .topBarLeading) {
+                    playbackControl("Back 30 seconds", systemImage: "gobackward.30")
+                }
+                ToolbarSpacer(.fixed, placement: .topBarLeading)
+                ToolbarItem(placement: .topBarLeading) {
+                    playbackControl("Pause", systemImage: "pause.fill")
+                }
+                ToolbarSpacer(.fixed, placement: .topBarLeading)
+                ToolbarItem(placement: .topBarLeading) {
+                    playbackControl("Forward 30 seconds", systemImage: "goforward.30")
+                }
+                ToolbarSpacer(.fixed, placement: .topBarLeading)
             }
+            ToolbarItem(placement: .topBarLeading) {
+                liveButton
+            }
+        } else {
+            ToolbarItem(placement: .principal) {
+                cameraStatusMessage
+                    .fixedSize()
+            }
+            .sharedBackgroundVisibility(.hidden)
         }
         ToolbarItem(placement: .topBarTrailing) {
             recordingControl
@@ -1310,22 +1337,82 @@ struct CameraFullScreenLiveVideoView: View {
     }
 
 #if os(iOS)
-    private var savedConfirmation: some View {
-        Text("Saved to Photos")
-            .font(.callout.weight(.medium))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .glassEffect(.regular, in: Capsule(style: .continuous))
-            .accessibilityAddTraits(.isStaticText)
+    private var showsLiveControls: Bool {
+        !recordingController.isRecording
+            && recordingController.state != .saving
+            && !savedConfirmationVisible
     }
 
+    @ViewBuilder
+    private var cameraStatusMessage: some View {
+        if recordingController.state == .waitingForKeyFrame {
+            CameraToolbarStatus(
+                title: "Recording",
+                showsActivityIndicator: true,
+                accessibilityValue: "Waiting for video to start"
+            )
+        } else if recordingController.state == .recording {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let elapsed = recordingController.recordingStartedAt.map {
+                    max(0, context.date.timeIntervalSince($0))
+                } ?? 0
+                let timer = Duration.seconds(elapsed).formatted(
+                    .time(pattern: .minuteSecond(padMinuteToLength: 1))
+                )
+                CameraToolbarStatus(
+                    title: "Recording \(timer)",
+                    prominent: true,
+                    monospacedDigits: true
+                )
+            }
+        } else if recordingController.state == .saving {
+            CameraToolbarStatus(title: "Saving to Photos…")
+        } else if savedConfirmationVisible {
+            CameraToolbarStatus(title: "Saved to Photos")
+        }
+    }
+
+    private var liveButton: some View {
+        Button("Live") {
+            withAnimation(.snappy) {
+                livePlaybackControlsVisible.toggle()
+            }
+        }
+        .buttonStyle(.glassProminent)
+        .tint(.red)
+        .accessibilityHint(livePlaybackControlsVisible
+            ? "Hides playback controls"
+            : "Shows playback controls")
+    }
+
+    private func playbackControl(
+        _ title: String,
+        systemImage: String
+    ) -> some View {
+        Button(title, systemImage: systemImage) {
+            // Playback actions will be connected when history is available.
+        }
+        .labelStyle(.iconOnly)
+    }
+
+    @ViewBuilder
     private var recordingControl: some View {
+        if recordingController.isRecording {
+            recordingButton.buttonStyle(.glassProminent)
+        } else {
+            recordingButton
+        }
+    }
+
+    private var recordingButton: some View {
         Button {
             recordingController.toggle()
         } label: {
-            Image(systemName: "record.circle")
+            Image(systemName: recordingController.isRecording
+                ? "stop.fill"
+                : "record.circle")
         }
-        .tint(recordingController.isRecording ? .red : .primary)
+        .tint(.red)
         .disabled(
             recordingController.state == .requestingAuthorization
                 || recordingController.state == .saving

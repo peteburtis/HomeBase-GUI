@@ -22,7 +22,6 @@ struct VideoView: View {
             }
             .padding(gridSpacing)
         }
-        .navigationTitle("Video")
 #if os(iOS)
         .fullScreenCover(
             item: $selectedCamera,

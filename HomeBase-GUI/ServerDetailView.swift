@@ -46,15 +46,13 @@ struct ServerDetailView: View {
                 }
 
             if !cameras.isEmpty {
-                NavigationStack {
-                    VideoView(
-                        cameras: cameras,
-                        client: connection.client
-                    )
+                VideoView(
+                    cameras: cameras,
+                    client: connection.client
+                )
+                .tabItem {
+                    Label("Cameras", systemImage: "video")
                 }
-                    .tabItem {
-                        Label("Video", systemImage: "video")
-                    }
             }
 
             NavigationStack {
