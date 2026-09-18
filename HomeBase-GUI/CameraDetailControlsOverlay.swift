@@ -25,6 +25,8 @@ struct CameraDetailControlSet {
         pan != nil || tilt != nil
     }
 
+    var hasPTZ: Bool { hasPanTilt || zoom != nil }
+
     var hasAnyControl: Bool {
         privacy != nil || hasPanTilt || zoom != nil
     }
@@ -266,6 +268,11 @@ final class CameraPanTiltGestureController: ObservableObject {
     func captureInitialPosition(from target: CameraPanTiltGestureTarget) {
         guard initialPosition == nil else { return }
         initialPosition = target.observedPosition
+    }
+
+    func resetInitialPosition() {
+        stop()
+        initialPosition = nil
     }
 
     func beginDrag(using target: CameraPanTiltGestureTarget) {
@@ -724,16 +731,26 @@ struct CameraPrivacyToolbarControl: View {
 struct CameraDayNightModeToolbarControl: View {
     let target: CameraDayNightModeTarget
     @ObservedObject var model: LiveDeviceControlsModel
+    var appliesRepeatedSelections = false
 
     var body: some View {
         Menu {
-            Picker("Day and night mode", selection: selection) {
+            if appliesRepeatedSelections {
                 ForEach(target.choices) { choice in
-                    Label(
-                        choice.mode.title,
-                        systemImage: choice.mode.systemImageName
-                    )
-                    .tag(Optional(choice.mode))
+                    Button { apply(choice.mode) } label: {
+                        if target.selectedMode == choice.mode { Label(choice.mode.title, systemImage: "checkmark") }
+                        else { Label(choice.mode.title, systemImage: choice.mode.systemImageName) }
+                    }
+                }
+            } else {
+                Picker("Day and night mode", selection: selection) {
+                    ForEach(target.choices) { choice in
+                        Label(
+                            choice.mode.title,
+                            systemImage: choice.mode.systemImageName
+                        )
+                        .tag(Optional(choice.mode))
+                    }
                 }
             }
         } label: {
@@ -759,26 +776,22 @@ struct CameraDayNightModeToolbarControl: View {
             get: { target.selectedMode },
             set: { mode in
                 guard let mode,
-                      mode != target.selectedMode,
-                      let wireValue = target.wireValue(for: mode) else {
+                      mode != target.selectedMode else {
                     return
                 }
-                Task {
-                    try? await model.setPresentedValue(
-                        wireValue,
-                        for: target.control,
-                        origin: .inline
-                    )
-                }
+                apply(mode)
             }
         )
+    }
+
+    private func apply(_ mode: CameraDayNightMode) {
+        guard let wireValue = target.wireValue(for: mode) else { return }
+        Task { try? await model.setPresentedValue(wireValue, for: target.control, origin: .inline) }
     }
 }
 
 struct CameraDetailControlsOverlay: View {
     @ObservedObject var model: LiveDeviceControlsModel
-    @State private var isPanTiltExpanded = false
-    @State private var isZoomExpanded = true
 
     var body: some View {
         GeometryReader { geometry in
@@ -791,7 +804,12 @@ struct CameraDetailControlsOverlay: View {
 
                     HStack(alignment: .bottom) {
                         if let zoom = controls.zoom {
-                            zoomCluster(zoom, length: axisLength)
+                            CameraOverlaySlider(
+                                control: zoom, model: model, orientation: .vertical,
+                                direction: .normal,
+                                length: CameraPTZOverlayMetrics.zoomLength(axisLength: axisLength),
+                                interactionEnabled: interactionEnabled(for: zoom)
+                            )
                         }
 
                         Spacer(minLength: 24)
@@ -804,43 +822,11 @@ struct CameraDetailControlsOverlay: View {
                             )
                         }
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 12)
+                    .padding(.horizontal, CameraPTZOverlayMetrics.inset)
+                    .padding(.bottom, CameraPTZOverlayMetrics.inset)
                 }
             }
         }
-    }
-
-    private func zoomCluster(
-        _ control: LiveDeviceControl,
-        length: CGFloat
-    ) -> some View {
-        VStack(spacing: 8) {
-            if isZoomExpanded {
-                CameraOverlaySlider(
-                    control: control,
-                    model: model,
-                    orientation: .vertical,
-                    direction: .normal,
-                    length: length,
-                    interactionEnabled: interactionEnabled(for: control)
-                )
-                .transition(
-                    .opacity.combined(with: .scale(0.8, anchor: .bottom))
-                )
-            }
-
-            CameraOverlayIcon(
-                systemName: "plus.magnifyingglass",
-                accessibilityLabel: "zoom controls",
-                isExpanded: isZoomExpanded
-            ) {
-                withAnimation(.snappy) {
-                    isZoomExpanded.toggle()
-                }
-            }
-        }
-        .animation(.snappy, value: isZoomExpanded)
     }
 
     private func panTiltCluster(
@@ -848,58 +834,40 @@ struct CameraDetailControlsOverlay: View {
         tilt: LiveDeviceControl?,
         length: CGFloat
     ) -> some View {
-        let iconLength: CGFloat = 44
-        let spacing: CGFloat = 8
+        let clearance = CameraPTZOverlayMetrics.buttonClearance
 
         return ZStack(alignment: .bottomTrailing) {
-            if isPanTiltExpanded {
-                if let pan {
-                    CameraOverlaySlider(
-                        control: pan,
-                        model: model,
-                        orientation: .horizontal,
-                        direction: .inverted,
-                        length: length,
-                        interactionEnabled: interactionEnabled(for: pan)
-                    )
-                    .padding(.trailing, iconLength + spacing)
-                    .transition(.opacity)
-                }
-
-                if let tilt {
-                    CameraOverlaySlider(
-                        control: tilt,
-                        model: model,
-                        orientation: .vertical,
-                        direction: .normal,
-                        length: length,
-                        interactionEnabled: interactionEnabled(for: tilt)
-                    )
-                    .padding(.bottom, iconLength + spacing)
-                    .transition(.opacity)
-                }
+            if let pan {
+                CameraOverlaySlider(
+                    control: pan,
+                    model: model,
+                    orientation: .horizontal,
+                    direction: .inverted,
+                    length: length,
+                    interactionEnabled: interactionEnabled(for: pan)
+                )
+                .padding(.trailing, clearance)
+                .transition(.opacity)
             }
 
-            CameraOverlayIcon(
-                systemName: "arrow.up.and.down.and.arrow.left.and.right",
-                accessibilityLabel: "pan and tilt controls",
-                isExpanded: isPanTiltExpanded
-            ) {
-                withAnimation(.snappy) {
-                    isPanTiltExpanded.toggle()
-                }
+            if let tilt {
+                CameraOverlaySlider(
+                    control: tilt,
+                    model: model,
+                    orientation: .vertical,
+                    direction: .normal,
+                    length: length,
+                    interactionEnabled: interactionEnabled(for: tilt)
+                )
+                .padding(.bottom, clearance)
+                .transition(.opacity)
             }
         }
         .frame(
-            width: isPanTiltExpanded
-                ? length + iconLength + spacing
-                : iconLength,
-            height: isPanTiltExpanded
-                ? length + iconLength + spacing
-                : iconLength,
+            width: length + clearance + 2 * CameraPTZOverlayMetrics.sliderPadding,
+            height: length + clearance + 2 * CameraPTZOverlayMetrics.sliderPadding,
             alignment: .bottomTrailing
         )
-        .animation(.snappy, value: isPanTiltExpanded)
     }
 
     private func interactionEnabled(
@@ -996,7 +964,7 @@ private struct CameraOverlaySlider: View {
                     .frame(width: length, height: 44)
             }
         }
-        .padding(5)
+        .padding(CameraPTZOverlayMetrics.sliderPadding)
         .cameraGlassBacker(in: Capsule(), interactive: true)
         .onChange(of: sourceValue) { _, updatedValue in
             guard let updatedValue else { return }
@@ -1132,28 +1100,6 @@ private struct CameraOverlaySlider: View {
 
     private var ownsPresentedValue: Bool {
         isEditing || activeWrite != nil || pendingWrite != nil
-    }
-}
-
-private struct CameraOverlayIcon: View {
-    let systemName: String
-    let accessibilityLabel: String
-    let isExpanded: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(.white)
-                .frame(width: 44, height: 44)
-        }
-        .buttonStyle(.plain)
-        .cameraGlassBacker(in: Circle(), interactive: true)
-        .accessibilityLabel(
-            "\(isExpanded ? "Hide" : "Show") \(accessibilityLabel)"
-        )
-        .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
     }
 }
 

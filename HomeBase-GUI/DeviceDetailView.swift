@@ -40,6 +40,7 @@ struct DeviceDetailView: View {
                         quality: cameraCapability.previewQuality,
                         client: client,
                         allowsRetry: false,
+                        isStreamEnabled: !isShowingFullScreenVideo,
                         restartRequest: videoRestartRequest
                     )
                     .clipShape(RoundedRectangle(cornerRadius: 10))
@@ -56,9 +57,6 @@ struct DeviceDetailView: View {
                     }
                     .contentShape(Rectangle())
                     .onTapGesture {
-#if os(iOS)
-                        CameraLandscapeOrientation.prepareForPresentation()
-#endif
                         isShowingFullScreenVideo = true
                     }
                     .accessibilityAddTraits(.isButton)
@@ -110,10 +108,7 @@ struct DeviceDetailView: View {
             videoRestartRequest &+= 1
         }
 #if os(iOS)
-        .fullScreenCover(
-            isPresented: $isShowingFullScreenVideo,
-            onDismiss: CameraLandscapeOrientation.restore
-        ) {
+        .fullScreenCover(isPresented: $isShowingFullScreenVideo) {
             fullScreenVideo
         }
 #else
@@ -333,9 +328,13 @@ final class LiveDeviceControlsModel: ObservableObject {
     private let device: HBTopologyDeviceDescriptor?
     private let client: HomeBaseWebSocketClient
     private var subscriptionID: UUID?
+    private var metadataTask: Task<Void, Never>?
     private var detailsByIdentifier: [String: HBControlDescriptor] = [:]
     private var controlsByIdentity: [String: LiveDeviceControl] = [:]
     private var suggestedControlOrder = SuggestedControlDisplayOrder()
+    private var routedWrite: ((HBJSONValue, LiveDeviceControl, ControlValueCommitOrigin) async throws -> Void)?
+    private var routedCanonicalWrite: ((HBJSONValue, String) async throws -> Void)?
+    private var aggregateWrites: Set<String> = []
 
     init(
         device: HBTopologyDeviceDescriptor?,
@@ -344,6 +343,30 @@ final class LiveDeviceControlsModel: ObservableObject {
         self.device = device
         self.client = client
         deviceMetadata = device?.metadata ?? [:]
+    }
+
+    /// A screen-local camera group, not an engine configuration or virtual group.
+    /// Installing observations here never sends a write to any camera.
+    func installWriteRouting(
+        value: @escaping (HBJSONValue, LiveDeviceControl, ControlValueCommitOrigin) async throws -> Void,
+        canonical: @escaping (HBJSONValue, String) async throws -> Void
+    ) {
+        precondition(device == nil)
+        routedWrite = value; routedCanonicalWrite = canonical
+    }
+
+    func installAggregatePresentation(_ values: [LiveDeviceControl]) {
+        precondition(device == nil)
+        controlsByIdentity = Dictionary(uniqueKeysWithValues: values.map { control in
+            var value = control
+            if let previous = controlsByIdentity[control.id], aggregateWrites.contains(control.id) {
+                value.pendingValue = previous.pendingValue
+                value.isUpdating = true
+            }
+            return (value.id, value)
+        })
+        controls = values.map { controlsByIdentity[$0.id]! }
+        state = .live
     }
 
     func run(reactivating: Bool = false) async {
@@ -357,9 +380,19 @@ final class LiveDeviceControlsModel: ObservableObject {
             } else {
                 try await client.connect()
             }
-            let details = try await client.deviceDetails(for: device)
+            let metadata = try await client.deviceDetailsWithMetadata(for: device)
+            let details = metadata.details
             try Task.checkCancellation()
-            deviceMetadata = details.metadata
+            deviceMetadata = metadata.metadata
+            metadataTask?.cancel()
+            metadataTask = Task { [weak self] in
+                do {
+                    for try await values in metadata.events {
+                        guard !Task.isCancelled else { return }
+                        self?.deviceMetadata = values
+                    }
+                } catch {} // Control subscription owns connection-error presentation.
+            }
             suggestedControlOrder = SuggestedControlDisplayOrder(
                 metadata: details.metadata
             )
@@ -459,6 +492,9 @@ final class LiveDeviceControlsModel: ObservableObject {
             throw UpdateError.unavailable
         }
 
+        if routedWrite != nil { aggregateWrites.insert(identity) }
+        defer { aggregateWrites.remove(identity) }
+
         current.pendingValue = value
         current.isUpdating = true
         current.updateError = nil
@@ -466,7 +502,9 @@ final class LiveDeviceControlsModel: ObservableObject {
         publishControls()
 
         do {
-            if origin == .editor {
+            if let routedWrite {
+                try await routedWrite(value, current, origin)
+            } else if origin == .editor {
                 do {
                     try await client.setControl(
                         current.descriptor.control,
@@ -525,6 +563,10 @@ final class LiveDeviceControlsModel: ObservableObject {
         controlPath: String
     ) async throws {
         guard state == .live else { throw UpdateError.unavailable }
+        if let routedCanonicalWrite {
+            try await routedCanonicalWrite(value, controlPath)
+            return
+        }
         try await client.setControl(controlPath, to: value)
     }
 
@@ -717,6 +759,7 @@ final class LiveDeviceControlsModel: ObservableObject {
     }
 
     private func stopSubscription() async {
+        metadataTask?.cancel(); metadataTask = nil
         guard let subscriptionID else { return }
         self.subscriptionID = nil
         try? await client.cancelSubscription(subscriptionID)

@@ -6,6 +6,10 @@ import HomeBaseProtocol
 /// Use the per-camera playback advertisement, not the presence of an NVR
 /// recording control (which need not imply readable history for this camera).
 enum CameraPlaybackHistoryAvailability {
+    static func metadata(in metadata: [String: HBJSONValue]) -> HBCameraPlaybackMetadata? {
+        guard isAvailable(in: metadata), let value = metadata[HBDeviceMetadataKeys.cameraPlayback] else { return nil }
+        return try? value.decoded(HBCameraPlaybackMetadata.self)
+    }
     static func isAvailable(in metadata: [String: HBJSONValue]) -> Bool {
         guard let value = metadata[HBDeviceMetadataKeys.cameraPlayback],
               let history = try? value.decoded(HBCameraPlaybackMetadata.self) else { return false }
@@ -72,6 +76,7 @@ struct CameraLivePlaybackTimeline {
     }
 
     var tail: TimeInterval? { entries.first?.time }
+    var lastFrameArrival: TimeInterval? { lastArrival }
     var canControlPlayback: Bool { head != nil }
     var isLive: Bool { mode == .live }
     var canSeekBackward: Bool {
@@ -144,7 +149,7 @@ struct CameraLivePlaybackTimeline {
     }
 
     mutating func pause() {
-        guard canControlPlayback else { return }
+        guard canControlPlayback || !isLive else { return }
         mode = .paused
         needsDecoderReset = true
     }
@@ -175,11 +180,13 @@ struct CameraLivePlaybackTimeline {
         needsDecoderReset = true
     }
 
-    mutating func advance(by seconds: TimeInterval) {
+    @discardableResult
+    mutating func advance(by seconds: TimeInterval) -> Bool {
         guard mode == .playing, let head, let position,
-              seconds.isFinite, seconds >= 0 else { return }
+              seconds.isFinite, seconds >= 0 else { return false }
         self.position = min(head, position + seconds)
         clampToBufferStart()
+        return seconds > 0 && self.position == head
     }
 
     private mutating func clampToBufferStart() {
@@ -192,6 +199,14 @@ struct CameraLivePlaybackTimeline {
         mode = .live
         position = head
         resetPresentation()
+    }
+
+    /// A multi-camera clock owns this cursor. Do not independently clamp a pane
+    /// to its own tail/head: missing footage must be black, not a different time.
+    mutating func followGroup(position: Double?, paused: Bool, seeking: Bool) {
+        mode = paused ? .paused : .playing
+        self.position = position
+        if seeking { resetPresentation() }
     }
 
     mutating func discardBuffer() {
@@ -271,11 +286,18 @@ struct CameraLivePlaybackTimeline {
 @MainActor
 final class CameraLivePlaybackController: ObservableObject {
     @Published private(set) var mode: CameraLivePlaybackTimeline.Mode = .live
+    @Published private(set) var playbackSpeed: CameraPlaybackSpeed = .normal
     @Published private(set) var canControlPlayback = false
     @Published private(set) var canSeekBackward = false
     @Published private(set) var errorMessage: String?
+    @Published private(set) var historyState: CameraHistoryPlayback.State = .idle
+    @Published private(set) var loadingHistoryDate: Date?
+    @Published private(set) var historyNavigation: CameraHistoryNavigationState = .idle
+    @Published private(set) var isUsingHistory = false
     let renderer = CameraH264Renderer()
-    private(set) var timeline = CameraLivePlaybackTimeline()
+    private(set) var timeline: CameraLivePlaybackTimeline
+    let history: CameraHistoryPlayback
+    private let clock: () -> TimeInterval
     private var ownerID: UUID?
     private var ticker: Task<Void, Never>?
     private var presentationTask: Task<Void, Never>?
@@ -285,13 +307,181 @@ final class CameraLivePlaybackController: ObservableObject {
     private var rendererEpoch: UInt64?
     private var lastPrunedEpochs: (oldest: UInt64, source: UInt64)?
     private var isClosed = false
+    private var isSuspended = false
+    private var historyIdentity: String?
+    private var historyTransport: (any CameraHistoryFetching)?
+    private var historyPreparation: Task<Void, Never>?
+    private var historyPiece: UUID?
+    private var historyIndex: Int?
+    private var historyShowingBlack = false
+    private(set) var externallyClocked = false
+    /// A valid media-lease interruption also pauses the shared multi-camera clock.
+    var streamDidStop: (() -> Void)?
+
+    init(clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.clock = clock
+        timeline = CameraLivePlaybackTimeline(clock: clock)
+        history = CameraHistoryPlayback(clock: clock)
+        history.changed = { [weak self] in
+            self?.publishState()
+            self?.present()
+        }
+        history.resetPresentation = { [weak self] in self?.resetHistoryPresentation() }
+    }
 
     var isLive: Bool { mode == .live }
     var isPaused: Bool { mode == .paused }
 
+    func setPlaybackSpeed(_ speed: CameraPlaybackSpeed) {
+        guard !isClosed, !isLive, speed != playbackSpeed else { return }
+        updateClock() // Elapsed time belongs to the previous speed.
+        followGroupSpeed(speed)
+        lastTick = clock()
+    }
+
+    /// The shared clock owns speed and catch-up decisions for every pane.
+    func followGroupSpeed(_ speed: CameraPlaybackSpeed) {
+        guard playbackSpeed != speed else { return }
+        playbackSpeed = speed
+        history.setPlaybackSpeed(speed)
+    }
+
+    var playbackDate: Date? {
+        if history.isActive, let position = history.position {
+            return Date(timeIntervalSince1970: position)
+        }
+        if let offset = history.canonicalOffset, let position = timeline.position {
+            return Date(timeIntervalSince1970: offset + position)
+        }
+        return nil
+    }
+
     func setNVRHistoryAvailable(_ available: Bool) {
         timeline.hasAvailableNVRHistory = available
         publishState()
+    }
+
+    func positionForCameraSwitch(metadata: [String: HBJSONValue]) -> CameraSwitchPosition {
+        updateClock()
+        guard !isLive else { return .live }
+        let source = CameraPlaybackHistoryAvailability.metadata(in: metadata)
+        if let position = history.switchPosition(cameraID: source?.cameraID) { return position }
+        if let date = playbackDate { return .canonical(date.timeIntervalSince1970, paused: isPaused) }
+        guard let source,
+              let position = timeline.position, let head = timeline.head else { return .live }
+        let now = clock()
+        let age = max(0, now - (timeline.lastFrameArrival ?? now))
+        return .relative(cameraID: source.cameraID, offset: min(0, position - head) - age,
+            capturedAt: now, paused: isPaused)
+    }
+
+    func applyCameraSwitch(_ position: CameraSwitchPosition) {
+        switch position {
+        case .live: break // A fresh camera session already starts Live.
+        case .canonical(let time, let paused): seek(to: Date(timeIntervalSince1970: time), paused: paused)
+        case .relative: assertionFailure("Resolve the source camera clock before switching sessions")
+        }
+    }
+
+    func useGroupClock() {
+        externallyClocked = true
+        ticker?.cancel(); ticker = nil
+        history.setGroupClock(true)
+    }
+
+    func useLocalClock() {
+        externallyClocked = false
+        history.setGroupClock(false)
+        lastTick = clock()
+        if mode == .playing { startTicker() }
+    }
+
+    func followGroupBuffer(position: Double?, paused: Bool, seeking: Bool) {
+        guard !isClosed else { return }
+        if position == nil, seeking || history.isActive || timeline.isLive {
+            cancelPresentation(); renderer.reset()
+        }
+        if history.isActive { history.deactivate(); resetHistoryPresentation() }
+        if seeking { cancelPresentation(); errorMessage = nil }
+        timeline.followGroup(position: position, paused: paused, seeking: seeking)
+        publishState(); present()
+    }
+
+    func followGroupHistory(time: Double, liveEdge: Double?, paused: Bool, seeking: Bool) {
+        guard !isClosed else { return }
+        if seeking || !history.isActive {
+            cancelTasks(); timeline.goLive(); errorMessage = nil
+            history.enterGroup(time: time, liveEdge: liveEdge, localHead: timeline.head ?? 0, paused: paused)
+        } else {
+            history.followGroup(time: time, liveEdge: liveEdge, paused: paused)
+        }
+        publishState(); present()
+    }
+
+    /// Called on screen entry and capability changes, before any rewind gesture.
+    func prepareHistory(metadata: [String: HBJSONValue], client: HomeBaseWebSocketClient) {
+        guard !isClosed, !isSuspended else { return }
+        let capability = CameraPlaybackHistoryAvailability.metadata(in: metadata)
+        setNVRHistoryAvailable(capability != nil)
+        guard let capability else { return }
+        let identity = capability.nvrInstanceID + "/" + capability.cameraID
+        guard identity != historyIdentity || (historyTransport == nil && historyPreparation == nil) else { return }
+        if identity != historyIdentity { history.close(); resetHistoryPresentation() }
+        historyIdentity = identity
+        historyPreparation?.cancel()
+        historyPreparation = Task { [weak self] in
+            let transport = await client.makeHistoryTransport()
+            guard let self, !self.isClosed, !Task.isCancelled, self.historyIdentity == identity else {
+                await transport.close(); return
+            }
+            self.historyTransport = transport
+            self.history.configure(cameraID: capability.cameraID, transport: transport)
+            self.publishState()
+            if self.mode == .playing {
+                self.lastTick = self.clock()
+                self.startTicker(); self.present()
+            }
+            await transport.start()
+            self.historyPreparation = nil
+        }
+    }
+
+    func retryHistory() { history.retry() }
+
+    func seekToAdjacentRecording(previous: Bool) {
+        guard let date = history.adjacentRecording(previous: previous) else { return }
+        seek(to: date)
+    }
+
+    /// Freeze the existing playback cursor, without ever turning Live into Pause.
+    /// This is deliberately idempotent; lease cleanup and scene suspension can
+    /// both arrive for the same interruption.
+    func pauseForInterruption() {
+        guard !isClosed, !isLive else { return }
+        cancelTasks()
+        if history.isActive { history.pause() }
+        else { timeline.pause() }
+        resetHistoryPresentation()
+        renderer.reset(removingDisplayedImage: false)
+        lastTick = nil
+        publishState()
+    }
+
+    func suspend() {
+        isSuspended = true
+        pauseForInterruption()
+        historyPreparation?.cancel(); historyPreparation = nil
+        history.disconnect(); historyTransport = nil
+        cancelTasks()
+    }
+
+    /// Reconnect collection separately from playback. Non-live playback stays
+    /// paused until an explicit Play or Live action.
+    func resume() {
+        guard !isClosed, isSuspended else { return }
+        isSuspended = false
+        lastTick = clock()
+        present()
     }
 
     func configure(
@@ -299,19 +489,20 @@ final class CameraLivePlaybackController: ObservableObject {
         ownerID: UUID
     ) throws -> CMVideoFormatDescription {
         guard !isClosed else { throw CancellationError() }
-        cancelTasks()
-        let description = try renderer.configure(configuration, removingDisplayedImage: !isPaused)
+        if !history.isActive { cancelTasks() }
+        let description = try renderer.configure(configuration, removingDisplayedImage: !isPaused,
+                                                  updateRenderer: !history.isActive)
         self.ownerID = ownerID
         timeline.configure(
             generation: configuration.generation,
             timeScale: configuration.timeScale
         )
         configurations[timeline.sourceEpoch] = configuration
-        rendererEpoch = timeline.sourceEpoch
+        if !history.isActive { rendererEpoch = timeline.sourceEpoch }
         pruneConfigurations()
         errorMessage = nil
         publishState()
-        if timeline.mode == .playing { startTicker() }
+        if mode == .playing { startTicker() }
         return description
     }
 
@@ -324,15 +515,16 @@ final class CameraLivePlaybackController: ObservableObject {
         let previousEpoch = timeline.sourceEpoch
         if timeline.receive(frame) {
             configurations[timeline.sourceEpoch] = configurations[previousEpoch]
-            if timeline.isLive {
+            if timeline.isLive && !history.isActive {
                 cancelPresentation()
                 renderer.reset()
             }
         }
         pruneConfigurations()
+        history.updateLiveHead(timeline.head)
         publishState()
         // Only actual live samples can enter the explicit Photos recorder.
-        guard timeline.isLive else { return nil }
+        guard timeline.isLive, !history.isActive else { return nil }
         try activateRenderer(for: timeline.sourceEpoch)
         return try renderer.enqueue(frame)
     }
@@ -340,9 +532,22 @@ final class CameraLivePlaybackController: ObservableObject {
     func togglePause() {
         guard canControlPlayback else { return }
         updateClock()
+        if history.isActive {
+            history.togglePause()
+            if history.isPaused {
+                ticker?.cancel(); ticker = nil
+                resetHistoryPresentation()
+                renderer.reset(removingDisplayedImage: false)
+            } else {
+                lastTick = clock()
+                startTicker(); present()
+            }
+            publishState()
+            return
+        }
         if timeline.mode == .paused {
             timeline.play()
-            lastTick = ProcessInfo.processInfo.systemUptime
+            lastTick = clock()
             startTicker()
             present()
         } else {
@@ -360,19 +565,53 @@ final class CameraLivePlaybackController: ObservableObject {
         if isLive && seconds >= 0 { return }
         updateClock()
         cancelPresentation()
+        if history.isActive {
+            history.updateLiveHead(timeline.head)
+            if history.seek(by: seconds) { goLive(); return }
+            lastTick = clock()
+            if !history.isPaused { startTicker() }
+            publishState(); present()
+            return
+        }
         timeline.seek(by: seconds)
         if timeline.isLive {
             goLive()
             return
         }
-        lastTick = ProcessInfo.processInfo.systemUptime
+        if timeline.hasAvailableNVRHistory, historyTransport != nil || historyPreparation != nil,
+           let position = timeline.position, let head = timeline.head,
+           position < (timeline.tail ?? head) {
+            let paused = timeline.mode == .paused
+            timeline.goLive() // Collection stays live; history owns the visible cursor.
+            history.enter(localPosition: position, localHead: head, paused: paused)
+        }
+        lastTick = clock()
         present()
-        if timeline.mode == .playing { startTicker() }
+        if mode == .playing || (!history.isActive && timeline.mode == .playing) { startTicker() }
         publishState()
+    }
+
+    /// A calendar seek always uses the NVR's absolute canonical timeline, even
+    /// when the live stream has not started or the camera is currently offline.
+    func seek(to date: Date, paused requestedPause: Bool? = nil) {
+        let time = date.timeIntervalSince1970
+        guard !isClosed, timeline.hasAvailableNVRHistory,
+              time.isFinite, abs(time) < 1e11 - 60 else { return }
+        let paused = requestedPause ?? isPaused
+        cancelTasks()
+        timeline.goLive()
+        errorMessage = nil
+        history.enter(canonicalTime: time, localHead: timeline.head ?? 0, paused: paused)
+        lastTick = clock()
+        if !paused { startTicker() }
+        publishState(); present()
     }
 
     func goLive() {
         cancelTasks()
+        history.deactivate()
+        followGroupSpeed(.normal)
+        resetHistoryPresentation()
         timeline.goLive()
         errorMessage = nil
         // Reset only decoder state. Encoded history remains available, with its
@@ -390,9 +629,13 @@ final class CameraLivePlaybackController: ObservableObject {
 
     func stop(ownerID: UUID) {
         guard self.ownerID == ownerID else { return }
-        cancelTasks()
+        pauseForInterruption()
+        if !history.isActive {
+            cancelTasks()
+            renderer.reset(removingDisplayedImage: false)
+        }
         self.ownerID = nil
-        renderer.reset(removingDisplayedImage: false)
+        streamDidStop?()
         // Ending a lease (backgrounding, retry, quality change) is not closing
         // the screen. The next lease appends a distinct epoch to this history.
         publishState()
@@ -401,6 +644,9 @@ final class CameraLivePlaybackController: ObservableObject {
     func close() {
         isClosed = true
         cancelTasks()
+        historyPreparation?.cancel(); historyPreparation = nil
+        history.close(); historyTransport = nil
+        followGroupSpeed(.normal)
         self.ownerID = nil
         timeline.reset()
         configurations.removeAll()
@@ -413,6 +659,7 @@ final class CameraLivePlaybackController: ObservableObject {
     func trimBufferForMemoryPressure() {
         cancelPresentation()
         timeline.trimForMemoryPressure()
+        history.trimForMemoryPressure()
         pruneConfigurations()
         if !isPaused { present() }
         publishState()
@@ -436,41 +683,68 @@ final class CameraLivePlaybackController: ObservableObject {
     }
 
     private func publishState() {
-        if mode != timeline.mode { mode = timeline.mode }
-        if canControlPlayback != timeline.canControlPlayback {
-            canControlPlayback = timeline.canControlPlayback
+        let currentMode: CameraLivePlaybackTimeline.Mode = history.isActive ? (history.isPaused ? .paused : .playing) : timeline.mode
+        if mode != currentMode { mode = currentMode }
+        if isUsingHistory != history.isActive { isUsingHistory = history.isActive }
+        if historyState != history.state { historyState = history.state }
+        if loadingHistoryDate != history.loadingDate { loadingHistoryDate = history.loadingDate }
+        if historyNavigation != history.navigation { historyNavigation = history.navigation }
+        let controllable = timeline.canControlPlayback || history.isActive
+        if canControlPlayback != controllable {
+            canControlPlayback = controllable
         }
-        if canSeekBackward != timeline.canSeekBackward {
-            canSeekBackward = timeline.canSeekBackward
+        let backward = history.isActive || timeline.canSeekBackward
+        if canSeekBackward != backward {
+            canSeekBackward = backward
         }
     }
 
     private func startTicker() {
-        guard ticker == nil else { return }
+        guard !isSuspended, !externallyClocked, ticker == nil else { return }
         ticker = Task { [weak self] in
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .milliseconds(16)) }
                 catch { return }
                 guard let self else { return }
-                self.updateClock()
-                self.present()
+                self.tick()
             }
         }
     }
 
+    func tick() {
+        updateClock()
+        present()
+    }
+
     private func updateClock() {
-        let now = ProcessInfo.processInfo.systemUptime
-        if let lastTick { timeline.advance(by: max(0, now - lastTick)) }
+        guard !isSuspended, !externallyClocked else { return }
+        let now = clock()
+        if let lastTick {
+            let elapsed = max(0, now - lastTick) * playbackSpeed.multiplier
+            let caughtUp = history.isActive
+                ? history.advance(by: elapsed)
+                : timeline.advance(by: elapsed)
+            // Stay in buffered/history playback at the edge. Only the speed
+            // changes; neither pause state nor the visible controls change.
+            if caughtUp { followGroupSpeed(.normal) }
+        }
         lastTick = now
     }
 
     private func present() {
-        guard presentationTask == nil else { return }
+        guard !isClosed, !isSuspended, presentationTask == nil else { return }
+        if history.isActive { presentHistory(); return }
         switch timeline.presentation() {
         case .unchanged:
             break
         case .black:
             renderer.reset()
+            if !externallyClocked, timeline.hasAvailableNVRHistory, historyTransport != nil,
+               let position = timeline.position, let head = timeline.head {
+                let paused = timeline.mode == .paused
+                timeline.goLive()
+                history.enter(localPosition: position, localHead: head, paused: paused)
+            }
         case .frames(let frames, let resetDecoder):
             do {
                 guard let epoch = timeline.presentationEpoch else { throw PlaybackError.missingConfiguration }
@@ -513,6 +787,53 @@ final class CameraLivePlaybackController: ObservableObject {
                 }
                 if self.presentationID == id { self.presentationTask = nil }
             }
+        }
+    }
+
+    private func resetHistoryPresentation() {
+        cancelPresentation()
+        historyPiece = nil; historyIndex = nil; historyShowingBlack = false
+    }
+
+    private func presentHistory() {
+        guard let location = history.location(preferredPiece: historyPiece) else {
+            if !historyShowingBlack { renderer.reset(); historyShowingBlack = true }
+            historyPiece = nil; historyIndex = nil
+            return
+        }
+        let piece = location.piece, target = location.index
+        let reset = historyPiece != piece.id || historyIndex == nil || historyIndex! > target
+        let start = reset ? (piece.samples[...target].lastIndex(where: { $0.frame.keyFrame }) ?? 0) : historyIndex! + 1
+        guard start <= target else { return }
+        do {
+            if reset { try renderer.configureHistory(piece.segment); rendererEpoch = nil }
+        } catch { errorMessage = error.localizedDescription; return }
+        historyPiece = piece.id; historyIndex = target; historyShowingBlack = false
+        let samples = Array(piece.samples[start...target]), id = UUID()
+        presentationID = id
+        presentationTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                for (index, sample) in samples.enumerated() {
+                    try Task.checkCancellation()
+                    let deadline = ProcessInfo.processInfo.systemUptime + 2
+                    while !self.renderer.isReadyForMoreMediaData {
+                        guard ProcessInfo.processInfo.systemUptime < deadline else { throw PlaybackError.decoderStalled }
+                        try await Task.sleep(for: .milliseconds(5))
+                    }
+                    try Task.checkCancellation()
+                    try self.renderer.enqueueHistory(sample, segment: piece.segment, display: index == samples.count - 1)
+                    if index % 16 == 15 { await Task.yield() }
+                }
+            } catch is CancellationError { return }
+            catch {
+                guard self.presentationID == id else { return }
+                self.errorMessage = error.localizedDescription
+                if !self.history.isPaused { self.history.togglePause() }
+                self.ticker?.cancel(); self.ticker = nil
+                self.renderer.reset()
+            }
+            if self.presentationID == id { self.presentationTask = nil }
         }
     }
 

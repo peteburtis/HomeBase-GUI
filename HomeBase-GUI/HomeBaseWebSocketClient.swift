@@ -8,6 +8,17 @@ import HomeBaseProtocol
 import OSLog
 
 actor HomeBaseWebSocketClient {
+    struct DeviceMetadataSubscription: Sendable {
+        let details: HBDeviceDescriptor
+        let metadata: [String: HBJSONValue]
+        let events: AsyncThrowingStream<[String: HBJSONValue], Error>
+    }
+    private struct MetadataObserver {
+        let identifiers: Set<String>
+        let continuation: AsyncThrowingStream<[String: HBJSONValue], Error>.Continuation
+        var state = DeviceMetadataObservation()
+    }
+    private var metadataObservers: [UUID: MetadataObserver] = [:]
     struct CameraLiveLease: Sendable {
         let mediaHost: String
         let opened: HBCameraLiveOpenResult
@@ -144,6 +155,10 @@ actor HomeBaseWebSocketClient {
         receiveTask?.cancel()
         acknowledgementTask?.cancel()
         task?.cancel(with: .goingAway, reason: nil)
+    }
+
+    func makeHistoryTransport() -> CameraHistoryTransport {
+        CameraHistoryTransport(endpoint: endpoint, clientID: clientID, session: urlSession)
     }
 
     func connect() async throws {
@@ -859,6 +874,36 @@ actor HomeBaseWebSocketClient {
         )
     }
 
+    /// Snapshot plus sequenced metadata changes from this ordinary connection.
+    /// Register before the snapshot request, then discard older buffered events
+    /// so a racing advertisement cannot overwrite newer snapshot state.
+    func deviceDetailsWithMetadata(for device: HBTopologyDeviceDescriptor) async throws -> DeviceMetadataSubscription {
+        let id = UUID()
+        let (events, continuation) = AsyncThrowingStream<[String: HBJSONValue], Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        metadataObservers[id] = MetadataObserver(identifiers: Set([device.identifier.lowercased(), device.addressableName.lowercased()]), continuation: continuation)
+        continuation.onTermination = { [weak self] _ in Task { await self?.removeMetadataObserver(id) } }
+        do {
+            let request = try sessionRequest(operation: HBProtocolOperations.listDevices,
+                payload: HBDeviceListRequest(device: device.addressableName, includeValues: true))
+            let response = try await sendRequest(request)
+            let result = try response.decodedPayload(as: HBProtocolResponse.self).decodedResult(as: HBDeviceListResult.self)
+            guard let details = result.devices.first, let sequence = response.deliverySequence,
+                  var observer = metadataObservers[id],
+                  observer.identifiers.contains(details.addressableName.lowercased()) || observer.identifiers.contains(details.identifier.lowercased()) else {
+                throw ClientError.invalidMessage("device metadata snapshot returned a different device or session")
+            }
+            observer.state.install(details.metadata, at: sequence)
+            metadataObservers[id] = observer
+            try Task.checkCancellation()
+            return DeviceMetadataSubscription(details: details, metadata: observer.state.metadata, events: events)
+        } catch {
+            metadataObservers.removeValue(forKey: id)?.continuation.finish(throwing: error)
+            throw error
+        }
+    }
+
+    private func removeMetadataObserver(_ id: UUID) { metadataObservers.removeValue(forKey: id) }
+
     func deviceDetails(
         named device: String,
         projection: HBControlStateProjection?
@@ -1432,7 +1477,7 @@ actor HomeBaseWebSocketClient {
             ) {
                 continuation.resume(returning: envelope)
             } else {
-                cancelAbandonedSubscription(from: envelope)
+                releaseAbandonedResource(from: envelope)
             }
         case .event:
             try processEvent(envelope)
@@ -1445,6 +1490,16 @@ actor HomeBaseWebSocketClient {
 
     private func processEvent(_ envelope: HBProtocolEnvelope) throws {
         switch envelope.operation {
+        case HBProtocolOperations.deviceMetadataChanged:
+            let event = try envelope.decodedPayload(as: HBDeviceMetadataChanged.self)
+            guard let sequence = envelope.deliverySequence else { throw ClientError.invalidMessage("unsequenced metadata event") }
+            for id in Array(metadataObservers.keys) {
+                guard var observer = metadataObservers[id], observer.identifiers.contains(event.deviceIdentifier.lowercased()) else { continue }
+                if observer.state.apply(key: event.key, value: event.value, sequence: sequence) {
+                    observer.continuation.yield(observer.state.metadata)
+                }
+                metadataObservers[id] = observer
+            }
         case HBProtocolOperations.streamControls:
             let event = try envelope.decodedPayload(
                 as: HBControlWatchStreamEvent.self
@@ -1726,7 +1781,7 @@ actor HomeBaseWebSocketClient {
         }
     }
 
-    private func cancelAbandonedSubscription(
+    private func releaseAbandonedResource(
         from envelope: HBProtocolEnvelope
     ) {
         guard let body = try? envelope.decodedPayload(
@@ -1737,6 +1792,14 @@ actor HomeBaseWebSocketClient {
 
         let subscriptionID: UUID?
         switch envelope.operation {
+        case HBProtocolOperations.openCameraLiveStream:
+            // The player may disappear or be covered before its open request
+            // completes. A late reply still owns a lease that needs closing.
+            guard let opened = try? body.decodedResult(as: HBCameraLiveOpenResult.self) else { return }
+            Task { [weak self] in
+                try? await self?.closeCameraLiveStream(opened.streamID)
+            }
+            return
         case HBProtocolOperations.streamControls:
             subscriptionID = try? body.decodedResult(
                 as: HBControlWatchStreamAccepted.self
@@ -1830,6 +1893,9 @@ actor HomeBaseWebSocketClient {
         }
 
         let pending = pendingResponses.values
+        let observers = metadataObservers.values
+        metadataObservers.removeAll()
+        for observer in observers { observer.continuation.finish(throwing: error) }
         pendingResponses.removeAll()
         for continuation in pending {
             continuation.resume(throwing: error)

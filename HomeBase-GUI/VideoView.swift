@@ -23,10 +23,7 @@ struct VideoView: View {
             .padding(gridSpacing)
         }
 #if os(iOS)
-        .fullScreenCover(
-            item: $selectedCamera,
-            onDismiss: CameraLandscapeOrientation.restore
-        ) { camera in
+        .fullScreenCover(item: $selectedCamera) { camera in
             fullScreenVideo(for: camera)
         }
 #else
@@ -57,9 +54,6 @@ struct VideoView: View {
 
     private func cameraButton(_ camera: CameraVideoDevice) -> some View {
         Button {
-#if os(iOS)
-            CameraLandscapeOrientation.prepareForPresentation()
-#endif
             selectedCamera = camera
         } label: {
             VStack(alignment: .leading, spacing: 0) {
@@ -67,7 +61,8 @@ struct VideoView: View {
                     deviceIdentifier: camera.device.addressableName,
                     quality: camera.capability.previewQuality,
                     client: client,
-                    allowsRetry: false
+                    allowsRetry: false,
+                    isStreamEnabled: selectedCamera == nil
                 )
                 .frame(maxWidth: .infinity)
                 .background(Color.black)

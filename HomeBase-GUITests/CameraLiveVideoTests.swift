@@ -432,6 +432,29 @@ final class CameraLiveVideoTests: XCTestCase {
         )
     }
 
+    func testCoveredPreviewSuspendsUntilVisibleAndForegrounded() {
+        for phase: ScenePhase in [.active, .inactive, .background] {
+            XCTAssertTrue(CameraLiveVideoLifecycle.isSuspended(in: phase, isStreamEnabled: false))
+        }
+        let visible = CameraLiveVideoLifecycle.taskIdentity(retryID: 0, scenePhase: .active)
+        let covered = CameraLiveVideoLifecycle.taskIdentity(
+            retryID: 0, scenePhase: .active, isStreamEnabled: false
+        )
+        XCTAssertNotEqual(visible, covered)
+        XCTAssertEqual(covered, CameraLiveVideoLifecycle.taskIdentity(
+            retryID: 0, scenePhase: .inactive, isStreamEnabled: false
+        ))
+        // Dismissing the cover in the background must not open a stream.
+        XCTAssertEqual(covered, CameraLiveVideoLifecycle.taskIdentity(
+            retryID: 0, scenePhase: .background, isStreamEnabled: true
+        ))
+        XCTAssertEqual(visible, CameraLiveVideoLifecycle.taskIdentity(
+            retryID: 0, scenePhase: .active, isStreamEnabled: true
+        ))
+        // Full-screen players opt in independently of their covered previews.
+        XCTAssertFalse(CameraLiveVideoLifecycle.isSuspended(in: .active))
+    }
+
     func testVideoIsDisplayedOnlyWhileActivelyPlaying() {
         XCTAssertFalse(CameraLiveVideoModel.State.idle.displaysVideo)
         XCTAssertFalse(CameraLiveVideoModel.State.connecting.displaysVideo)
@@ -611,47 +634,42 @@ final class CameraLiveVideoTests: XCTestCase {
     }
 
 #if os(iOS)
-    func testCameraPresentationRestrictsSupportedOrientationsToLandscape()
-        async throws
-    {
-        defer { CameraLandscapeOrientation.restore() }
-
-        CameraLandscapeOrientation.restore()
-        XCTAssertEqual(
-            CameraLandscapeOrientation.supportedInterfaceOrientations(
-                for: nil
-            ),
-            .allButUpsideDown
-        )
-
-        CameraLandscapeOrientation.prepareForPresentation()
-        XCTAssertEqual(
-            CameraLandscapeOrientation.supportedInterfaceOrientations(
-                for: nil
-            ),
-            .landscape
-        )
-
-        CameraLandscapeOrientation.activate()
+    func testCameraPresentationKeepsSystemOrientationAndAllowsPortraitAndLandscape() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
             .first { $0.activationState == .foregroundActive })
-        for _ in 0..<40 where
-            !scene.effectiveGeometry.interfaceOrientation.isLandscape
-        {
-            try await Task.sleep(for: .milliseconds(50))
+        let originalOrientation = scene.effectiveGeometry.interfaceOrientation
+        let previousKeyWindow = scene.keyWindow
+        let window = UIWindow(windowScene: scene)
+        let presenter = UIHostingController(rootView: Color.black)
+        window.rootViewController = presenter
+        window.makeKeyAndVisible()
+        try await Task.sleep(for: .milliseconds(100))
+        defer {
+            window.isHidden = true; window.rootViewController = nil
+            previousKeyWindow?.makeKey()
         }
-        XCTAssertTrue(
-            scene.effectiveGeometry.interfaceOrientation.isLandscape
-        )
-
-        scene.requestGeometryUpdate(.iOS(
-            interfaceOrientations: .portrait
-        ))
+        let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
+        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let camera = HBTopologyDeviceDescriptor(identifier: "orientation-test", addressableName: "OrientationTest", displayName: "Test Camera")
+        let player = UIHostingController(rootView: CameraFullScreenLiveVideoView(device: camera, quality: .high, client: client)
+            .environment(\.scenePhase, .background)) // Mount real UI without connecting to a camera/server.
+        player.modalPresentationStyle = .fullScreen
+        await withCheckedContinuation { continuation in
+            presenter.present(player, animated: false) { continuation.resume() }
+        }
         try await Task.sleep(for: .milliseconds(250))
-        XCTAssertTrue(
-            scene.effectiveGeometry.interfaceOrientation.isLandscape
-        )
+        for orientation: UIInterfaceOrientationMask in [.portrait, .landscapeLeft, .landscapeRight] {
+            XCTAssertTrue(UIApplication.shared.supportedInterfaceOrientations(for: window).contains(orientation))
+            XCTAssertTrue(player.supportedInterfaceOrientations.contains(orientation))
+        }
+        XCTAssertEqual(scene.effectiveGeometry.interfaceOrientation, originalOrientation, "Opening the player must not request rotation")
+        await withCheckedContinuation { continuation in
+            presenter.dismiss(animated: false) { continuation.resume() }
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(scene.effectiveGeometry.interfaceOrientation, originalOrientation, "Closing the player must not request rotation")
+        await client.disconnect()
     }
 #endif
 

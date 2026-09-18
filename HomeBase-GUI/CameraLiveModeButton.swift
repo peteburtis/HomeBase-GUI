@@ -1,28 +1,87 @@
 import SwiftUI
 
-/// One button with fixed label geometry. Only the glass tint and foreground
-/// change, so the toolbar cannot replace the inactive state with an icon circle.
+/// Native toolbar styling owns the glass, sizing, and foreground contrast.
 struct CameraLiveModeButton: View {
     let isLive: Bool
-    let shuttleControlsVisible: Bool
     let action: () -> Void
 
+    var systemImage: String {
+        isLive
+            ? "dot.radiowaves.left.and.right"
+            : "chevron.forward.dotted.chevron.forward"
+    }
+
+    @ViewBuilder
     var body: some View {
-        Button(action: action) {
-            Text("Live")
-                .font(.body)
-                .fixedSize()
-                .padding(.horizontal, 14)
-                .frame(minWidth: 64, minHeight: 44)
+        if isLive {
+            button.buttonStyle(.borderedProminent).tint(.red)
+        } else {
+            button
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(isLive ? Color.black : Color.white)
-        .cameraGlassBacker(in: Capsule(), interactive: true, tint: isLive ? .red : nil)
-        .fixedSize()
+    }
+
+    private var button: some View {
+        Button(action: returnToLive) {
+            // Toolbars hide standard Label titles even with .titleAndIcon.
+            // Compose only the content; leave all button styling native.
+            HStack {
+                Image(systemName: systemImage)
+                Text("Live")
+            }
+        }
         .accessibilityLabel("Live")
         .accessibilityValue(isLive ? "Live" : "Not live")
-        .accessibilityHint(isLive
-            ? (shuttleControlsVisible ? "Hides playback controls" : "Shows playback controls")
-            : "Returns to live playback and hides playback controls")
+        .accessibilityHint(isLive ? "Already playing live" : "Returns to live playback")
+    }
+
+    func returnToLive() {
+        guard !isLive else { return }
+        action()
+    }
+}
+
+enum CameraPlaybackToolbarMetrics {
+    static let separation: CGFloat = 24
+}
+
+/// Timeline visibility never changes the leading playback controls. Native
+/// grouping gives the three shuttle buttons one shared glass capsule.
+struct CameraPlaybackToolbar<Back: View, Pause: View, Forward: View, Speed: View>: ToolbarContent {
+    let isLive: Bool
+    let playbackEnabled: Bool
+    let close: () -> Void
+    let goLive: () -> Void
+    let back: Back
+    let pause: Pause
+    let forward: Forward
+    let speed: Speed
+
+    private var placement: ToolbarItemPlacement {
+#if os(iOS)
+        .topBarLeading
+#else
+        .navigation
+#endif
+    }
+
+    @ToolbarContentBuilder var body: some ToolbarContent {
+        ToolbarItem(placement: placement) {
+            CameraPlayerCloseButton(separatesPlayback: true, action: close)
+        }
+        .sharedBackgroundVisibility(.hidden)
+        ToolbarItemGroup(placement: placement) {
+            back.disabled(!playbackEnabled)
+            pause.disabled(!playbackEnabled)
+            forward.disabled(!playbackEnabled)
+        }
+        ToolbarSpacer(.fixed, placement: placement)
+        ToolbarItem(placement: placement) {
+            CameraLiveModeButton(isLive: isLive, action: goLive)
+                .disabled(!playbackEnabled)
+        }
+        if !isLive {
+            ToolbarSpacer(.fixed, placement: placement)
+            ToolbarItem(placement: placement) { speed.disabled(!playbackEnabled) }
+        }
     }
 }

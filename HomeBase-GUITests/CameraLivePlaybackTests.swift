@@ -425,6 +425,64 @@ final class CameraLivePlaybackTests: XCTestCase {
         XCTAssertTrue(timeline.isLive)
     }
 
+    func testPlaybackSpeedScalesClockAndCatchesUpWithoutGoingLive() async throws {
+        let fixture = try video()
+        for speed in CameraPlaybackSpeed.allCases {
+            var now = 100.0
+            let controller = CameraLivePlaybackController(clock: { now })
+            defer { controller.close() }
+            let owner = UUID()
+            _ = try controller.configure(fixture.configuration, ownerID: owner)
+            _ = try controller.receive(fixture.frames[0], ownerID: owner)
+            controller.setPlaybackSpeed(speed)
+            XCTAssertEqual(controller.playbackSpeed, .normal, "Actual Live always runs at 1×")
+            controller.togglePause()
+            for frame in fixture.frames.dropFirst() { _ = try controller.receive(frame, ownerID: owner) }
+            controller.setPlaybackSpeed(speed)
+            now += 10; controller.tick()
+            XCTAssertTrue(controller.isPaused)
+            XCTAssertEqual(controller.timeline.position, 0, "Choosing a speed does not unpause")
+            controller.togglePause()
+            now += 0.25; controller.tick()
+            XCTAssertEqual(try XCTUnwrap(controller.timeline.position), 0.25 * speed.multiplier, accuracy: 0.000_001)
+            now += 10; controller.tick()
+            XCTAssertEqual(controller.playbackSpeed, .normal)
+            XCTAssertEqual(controller.mode, .playing)
+            XCTAssertFalse(controller.isLive)
+            XCTAssertEqual(controller.timeline.position, controller.timeline.head)
+            var next = fixture.frames[0]
+            next.presentationTimestamp = 4 * 90_000; next.sequence = 100
+            _ = try controller.receive(next, ownerID: owner)
+            let caughtUp = try XCTUnwrap(controller.timeline.position)
+            now += 0.25; controller.tick()
+            XCTAssertEqual(try XCTUnwrap(controller.timeline.position), caughtUp + 0.25, accuracy: 0.000_001)
+            controller.togglePause(); controller.setPlaybackSpeed(.quadruple)
+            controller.goLive()
+            XCTAssertTrue(controller.isLive)
+            XCTAssertEqual(controller.playbackSpeed, .normal)
+        }
+    }
+
+    func testChangingSpeedUsesOldRateForElapsedTimeAndSurvivesPause() async throws {
+        var now = 0.0
+        let fixture = try video(), controller = CameraLivePlaybackController(clock: { now })
+        defer { controller.close() }
+        let owner = UUID()
+        _ = try controller.configure(fixture.configuration, ownerID: owner)
+        _ = try controller.receive(fixture.frames[0], ownerID: owner)
+        controller.togglePause()
+        for frame in fixture.frames.dropFirst() { _ = try controller.receive(frame, ownerID: owner) }
+        controller.togglePause()
+        now = 0.25; controller.setPlaybackSpeed(.double)
+        XCTAssertEqual(controller.timeline.position, 0.25)
+        now = 0.5; controller.tick()
+        XCTAssertEqual(controller.timeline.position, 0.75)
+        controller.suspend(); now = 100; controller.resume(); controller.tick()
+        XCTAssertEqual(controller.timeline.position, 0.75)
+        XCTAssertEqual(controller.playbackSpeed, .double)
+        XCTAssertTrue(controller.isPaused)
+    }
+
     func testControllerKeepsPhotosSamplesLiveOnlyAndIgnoresOldOwner() async throws {
         let fixture = try video()
         let controller = CameraLivePlaybackController()
@@ -468,6 +526,77 @@ final class CameraLivePlaybackTests: XCTestCase {
         XCTAssertFalse(controller.canControlPlayback)
         XCTAssertFalse(controller.canSeekBackward)
         XCTAssertEqual(controller.timeline.retainedBytes, 0)
+    }
+
+    func testBackgroundPausesBufferedPlaybackAndReconnectKeepsCursorAndBuffer() async throws {
+        let fixture = try video()
+        for initiallyPaused in [false, true] {
+            let controller = CameraLivePlaybackController()
+            defer { controller.close() }
+            let owner = UUID(), replacement = UUID()
+            _ = try controller.configure(fixture.configuration, ownerID: owner)
+            for frame in fixture.frames { _ = try controller.receive(frame, ownerID: owner) }
+            controller.seek(by: -1)
+            if initiallyPaused { controller.togglePause() }
+            let cursor = controller.timeline.position, bytes = controller.timeline.retainedBytes
+            controller.suspend()
+            controller.suspend() // Repeated scene/lease notifications must not toggle Play.
+            controller.stop(ownerID: owner)
+            XCTAssertTrue(controller.isPaused)
+            controller.resume()
+            _ = try controller.configure(fixture.configuration, ownerID: replacement)
+            _ = try controller.receive(fixture.frames[0], ownerID: replacement)
+            try await Task.sleep(for: .milliseconds(60))
+            XCTAssertTrue(controller.isPaused)
+            XCTAssertFalse(controller.isLive)
+            XCTAssertEqual(controller.timeline.position, cursor)
+            XCTAssertGreaterThan(controller.timeline.retainedBytes, bytes)
+            controller.togglePause()
+            XCTAssertFalse(controller.isPaused, "Only an explicit Play action resumes the buffer")
+        }
+    }
+
+    func testLeaseUnloadPausesPlaybackButDelayedOldOwnerCleanupDoesNot() async throws {
+        let fixture = try video(), controller = CameraLivePlaybackController()
+        defer { controller.close() }
+        let first = UUID(), replacement = UUID()
+        var interruptions = 0
+        controller.streamDidStop = { interruptions += 1 }
+        _ = try controller.configure(fixture.configuration, ownerID: first)
+        for frame in fixture.frames { _ = try controller.receive(frame, ownerID: first) }
+        controller.seek(by: -1)
+        controller.stop(ownerID: UUID())
+        XCTAssertEqual(controller.mode, .playing)
+        XCTAssertEqual(interruptions, 0)
+        controller.stop(ownerID: first)
+        XCTAssertTrue(controller.isPaused)
+        XCTAssertEqual(interruptions, 1)
+        _ = try controller.configure(fixture.configuration, ownerID: replacement)
+        controller.togglePause()
+        controller.stop(ownerID: first)
+        XCTAssertEqual(controller.mode, .playing)
+        XCTAssertEqual(interruptions, 1)
+        controller.stop(ownerID: replacement)
+        XCTAssertTrue(controller.isPaused)
+        XCTAssertEqual(interruptions, 2)
+    }
+
+    func testLiveRemainsLiveAcrossBackgroundAndNewLease() async throws {
+        let fixture = try video(), controller = CameraLivePlaybackController()
+        defer { controller.close() }
+        let owner = UUID(), replacement = UUID()
+        _ = try controller.configure(fixture.configuration, ownerID: owner)
+        for frame in fixture.frames { _ = try controller.receive(frame, ownerID: owner) }
+        let bytes = controller.timeline.retainedBytes
+        controller.suspend(); controller.stop(ownerID: owner)
+        XCTAssertTrue(controller.isLive)
+        controller.resume()
+        _ = try controller.configure(fixture.configuration, ownerID: replacement)
+        _ = try controller.receive(fixture.frames[0], ownerID: replacement)
+        XCTAssertTrue(controller.isLive)
+        XCTAssertFalse(controller.isPaused)
+        XCTAssertEqual(controller.timeline.position, controller.timeline.head)
+        XCTAssertGreaterThan(controller.timeline.retainedBytes, bytes)
     }
 
     func testRendererMarksPrerollDecodeOnlyAndFlushRequiresKeyframe() async throws {
