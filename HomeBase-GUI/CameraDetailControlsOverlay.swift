@@ -504,14 +504,16 @@ final class CameraZoomGestureController: ObservableObject {
 private struct CameraGlassBacker<BackerShape: Shape>: ViewModifier {
     let shape: BackerShape
     let isInteractive: Bool
+    let tint: Color?
 
     @ViewBuilder
     func body(content: Content) -> some View {
 #if os(visionOS)
         content.background(.ultraThinMaterial, in: shape)
+            .background(tint ?? .clear, in: shape)
 #else
         content.glassEffect(
-            isInteractive ? .regular.interactive() : .regular,
+            .regular.tint(tint).interactive(isInteractive),
             in: shape
         )
 #endif
@@ -521,11 +523,13 @@ private struct CameraGlassBacker<BackerShape: Shape>: ViewModifier {
 extension View {
     func cameraGlassBacker<BackerShape: Shape>(
         in shape: BackerShape,
-        interactive: Bool = false
+        interactive: Bool = false,
+        tint: Color? = nil
     ) -> some View {
         modifier(CameraGlassBacker(
             shape: shape,
-            isInteractive: interactive
+            isInteractive: interactive,
+            tint: tint
         ))
     }
 }
@@ -1009,6 +1013,8 @@ private struct CameraOverlaySlider: View {
             interactiveWriteTask = nil
             interactiveWriteGeneration = nil
             pendingInteractiveWrite = nil
+            pendingWrite = nil
+            isEditing = false
         }
     }
 

@@ -321,6 +321,7 @@ final class CameraH264Renderer: ObservableObject {
     private var timeScale: Int32 = 90_000
     private var firstTimestamp: UInt64?
     private var sampleDuration: CMTime = .invalid
+    private var waitingForKeyframe = true
 
     init() {
         layer.videoGravity = .resizeAspect
@@ -328,7 +329,8 @@ final class CameraH264Renderer: ObservableObject {
     }
 
     func configure(
-        _ configuration: HBMediaStreamConfiguration
+        _ configuration: HBMediaStreamConfiguration,
+        removingDisplayedImage: Bool = true
     ) throws -> CMVideoFormatDescription {
         guard configuration.codec.lowercased() == "h264" else {
             throw RendererError.unsupportedCodec(configuration.codec)
@@ -370,10 +372,7 @@ final class CameraH264Renderer: ObservableObject {
             )
         }
 
-        layer.sampleBufferRenderer.flush(
-            removingDisplayedImage: true,
-            completionHandler: nil
-        )
+        reset(removingDisplayedImage: removingDisplayedImage)
         formatDescription = description
         generation = configuration.generation
         timeScale = Int32(configuration.timeScale)
@@ -392,7 +391,7 @@ final class CameraH264Renderer: ObservableObject {
     }
 
     @discardableResult
-    func enqueue(_ frame: HBMediaFrame) throws -> CMSampleBuffer? {
+    func enqueue(_ frame: HBMediaFrame, display: Bool = true) throws -> CMSampleBuffer? {
         guard frame.type == .videoAccessUnit,
               frame.generation == generation,
               let formatDescription else {
@@ -400,6 +399,11 @@ final class CameraH264Renderer: ObservableObject {
         }
         guard Self.isValidAVCCAccessUnit(frame.payload) else {
             throw RendererError.invalidAccessUnit
+        }
+        if layer.sampleBufferRenderer.status == .failed { reset() }
+        if waitingForKeyframe {
+            guard frame.flags.contains(.keyFrame) else { return nil }
+            waitingForKeyframe = false
         }
 
         var blockBuffer: CMBlockBuffer?
@@ -478,15 +482,26 @@ final class CameraH264Renderer: ObservableObject {
         ) as? [NSMutableDictionary],
            let attachment = attachments.first {
             attachment[kCMSampleAttachmentKey_DisplayImmediately] = true
+            attachment[kCMSampleAttachmentKey_DoNotDisplay] = !display
             attachment[kCMSampleAttachmentKey_NotSync] =
                 !frame.flags.contains(.keyFrame)
         }
 
-        if layer.sampleBufferRenderer.status == .failed {
-            layer.sampleBufferRenderer.flush()
-        }
         layer.sampleBufferRenderer.enqueue(sampleBuffer)
         return sampleBuffer
+    }
+
+    var isReadyForMoreMediaData: Bool {
+        layer.sampleBufferRenderer.isReadyForMoreMediaData
+    }
+
+    func reset(removingDisplayedImage: Bool = true) {
+        layer.sampleBufferRenderer.flush(
+            removingDisplayedImage: removingDisplayedImage,
+            completionHandler: nil
+        )
+        firstTimestamp = nil
+        waitingForKeyframe = true
     }
 
     static func isValidAVCCAccessUnit(_ data: Data) -> Bool {
@@ -523,12 +538,13 @@ final class CameraLiveVideoModel: ObservableObject {
     @Published private(set) var state: State = .idle
     @Published private(set) var aspectRatio: CGFloat = 16 / 9
 
-    let renderer = CameraH264Renderer()
+    let renderer: CameraH264Renderer
 
     private let deviceIdentifier: String
     private let quality: HBCameraLiveQuality
     private let client: HomeBaseWebSocketClient
     private let recordingController: CameraLocalRecordingController?
+    private let playbackController: CameraLivePlaybackController?
     private let recordingOwnerID = UUID()
     private var mediaConnection: HomeBaseMediaConnection?
     private var streamID: UUID?
@@ -538,12 +554,15 @@ final class CameraLiveVideoModel: ObservableObject {
         deviceIdentifier: String,
         quality: HBCameraLiveQuality,
         client: HomeBaseWebSocketClient,
-        recordingController: CameraLocalRecordingController? = nil
+        recordingController: CameraLocalRecordingController? = nil,
+        playbackController: CameraLivePlaybackController? = nil
     ) {
         self.deviceIdentifier = deviceIdentifier
         self.quality = quality
         self.client = client
         self.recordingController = recordingController
+        self.playbackController = playbackController
+        self.renderer = playbackController?.renderer ?? CameraH264Renderer()
     }
 
     func run() async {
@@ -598,11 +617,15 @@ final class CameraLiveVideoModel: ObservableObject {
             streamID: ownedStreamID
         )
         await recordingController?.streamDidEnd(ownerID: recordingOwnerID)
-        if runToken == token { runToken = nil }
+        if runToken == token {
+            playbackController?.stop(ownerID: recordingOwnerID)
+            runToken = nil
+        }
     }
 
     func stop() async {
         runToken = nil
+        playbackController?.stop(ownerID: recordingOwnerID)
         let connection = mediaConnection
         let streamID = streamID
         await releaseLease(connection: connection, streamID: streamID)
@@ -629,7 +652,14 @@ final class CameraLiveVideoModel: ObservableObject {
                         "the H.264 generation did not match its frame"
                     )
             }
-            let formatDescription = try renderer.configure(configuration)
+            let formatDescription: CMVideoFormatDescription
+            if let playbackController {
+                formatDescription = try playbackController.configure(
+                    configuration, ownerID: recordingOwnerID
+                )
+            } else {
+                formatDescription = try renderer.configure(configuration)
+            }
             await recordingController?.configure(
                 ownerID: recordingOwnerID,
                 generation: configuration.generation,
@@ -641,7 +671,15 @@ final class CameraLiveVideoModel: ObservableObject {
             }
             state = .waiting("Waiting for video…")
         case .videoAccessUnit:
-            if let sampleBuffer = try renderer.enqueue(frame) {
+            let sampleBuffer: CMSampleBuffer?
+            if let playbackController {
+                sampleBuffer = try playbackController.receive(
+                    frame, ownerID: recordingOwnerID
+                )
+            } else {
+                sampleBuffer = try renderer.enqueue(frame)
+            }
+            if let sampleBuffer {
                 recordingController?.append(
                     sampleBuffer,
                     ownerID: recordingOwnerID,
@@ -730,13 +768,15 @@ struct CameraLiveVideoPlayer: View {
         client: HomeBaseWebSocketClient,
         allowsRetry: Bool,
         restartRequest: Int = 0,
-        recordingController: CameraLocalRecordingController? = nil
+        recordingController: CameraLocalRecordingController? = nil,
+        playbackController: CameraLivePlaybackController? = nil
     ) {
         _model = StateObject(wrappedValue: CameraLiveVideoModel(
             deviceIdentifier: deviceIdentifier,
             quality: quality,
             client: client,
-            recordingController: recordingController
+            recordingController: recordingController,
+            playbackController: playbackController
         ))
         self.allowsRetry = allowsRetry
         self.restartRequest = restartRequest
@@ -873,14 +913,14 @@ private struct CameraToolbarVisibility: ViewModifier {
     }
 }
 
-private enum CameraPanGesturePhase {
+enum CameraPanGesturePhase {
     case began
     case changed
     case ended
     case cancelled
 }
 
-private enum CameraMagnifyGesturePhase {
+enum CameraMagnifyGesturePhase {
     case began
     case changed
     case ended
@@ -888,10 +928,13 @@ private enum CameraMagnifyGesturePhase {
 }
 
 #if canImport(UIKit)
-private final class CameraLiveGestureUIView: UIView {
+final class CameraLiveGestureUIView: UIView {
+    var cameraControlsEnabled = true {
+        didSet { updateRecognizerAvailability() }
+    }
     var onPan: ((CameraPanGesturePhase, CGSize, CGSize) -> Void)?
     var onMagnify: ((CameraMagnifyGesturePhase, CGFloat) -> Void)? {
-        didSet { pinchRecognizer.isEnabled = onMagnify != nil }
+        didSet { updateRecognizerAvailability() }
     }
     var onSingleTap: (() -> Void)?
     var onTwoFingerTap: (() -> Void)?
@@ -900,19 +943,21 @@ private final class CameraLiveGestureUIView: UIView {
         target: self,
         action: #selector(pinched(_:))
     )
+    private lazy var panRecognizer = UIPanGestureRecognizer(
+        target: self, action: #selector(panned(_:))
+    )
+    private lazy var twoFingerTapRecognizer = UITapGestureRecognizer(
+        target: self, action: #selector(twoFingerTapped)
+    )
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
         isMultipleTouchEnabled = true
 
-        let pan = UIPanGestureRecognizer(
-            target: self,
-            action: #selector(panned(_:))
-        )
-        pan.minimumNumberOfTouches = 1
-        pan.maximumNumberOfTouches = 1
-        addGestureRecognizer(pan)
+        panRecognizer.minimumNumberOfTouches = 1
+        panRecognizer.maximumNumberOfTouches = 1
+        addGestureRecognizer(panRecognizer)
 
         pinchRecognizer.isEnabled = false
         addGestureRecognizer(pinchRecognizer)
@@ -924,12 +969,14 @@ private final class CameraLiveGestureUIView: UIView {
         singleTap.numberOfTouchesRequired = 1
         addGestureRecognizer(singleTap)
 
-        let twoFingerTap = UITapGestureRecognizer(
-            target: self,
-            action: #selector(twoFingerTapped)
-        )
-        twoFingerTap.numberOfTouchesRequired = 2
-        addGestureRecognizer(twoFingerTap)
+        twoFingerTapRecognizer.numberOfTouchesRequired = 2
+        addGestureRecognizer(twoFingerTapRecognizer)
+    }
+
+    private func updateRecognizerAvailability() {
+        panRecognizer.isEnabled = cameraControlsEnabled
+        pinchRecognizer.isEnabled = cameraControlsEnabled && onMagnify != nil
+        twoFingerTapRecognizer.isEnabled = cameraControlsEnabled
     }
 
     @available(*, unavailable)
@@ -986,6 +1033,7 @@ private final class CameraLiveGestureUIView: UIView {
 }
 
 private struct CameraLiveGestureSurface: UIViewRepresentable {
+    let cameraControlsEnabled: Bool
     let onPan: (CameraPanGesturePhase, CGSize, CGSize) -> Void
     let onMagnify: ((CameraMagnifyGesturePhase, CGFloat) -> Void)?
     let onSingleTap: () -> Void
@@ -1005,6 +1053,7 @@ private struct CameraLiveGestureSurface: UIViewRepresentable {
     }
 
     private func update(_ view: CameraLiveGestureUIView) {
+        view.cameraControlsEnabled = cameraControlsEnabled
         view.onPan = onPan
         view.onMagnify = onMagnify
         view.onSingleTap = onSingleTap
@@ -1013,6 +1062,7 @@ private struct CameraLiveGestureSurface: UIViewRepresentable {
 }
 #else
 private struct CameraLiveGestureSurface: View {
+    let cameraControlsEnabled: Bool
     let onPan: (CameraPanGesturePhase, CGSize, CGSize) -> Void
     let onMagnify: ((CameraMagnifyGesturePhase, CGFloat) -> Void)?
     let onSingleTap: () -> Void
@@ -1044,13 +1094,14 @@ private struct CameraLiveGestureSurface: View {
                                 value.translation,
                                 geometry.size
                             )
-                        }
+                        },
+                    including: cameraControlsEnabled ? .all : .none
                 )
                 .simultaneousGesture(
                     TapGesture().onEnded(onSingleTap)
                 )
 
-            if let onMagnify {
+            if cameraControlsEnabled, let onMagnify {
                 surface.simultaneousGesture(
                     MagnifyGesture()
                         .onChanged { value in
@@ -1069,6 +1120,12 @@ private struct CameraLiveGestureSurface: View {
                 surface
             }
         }
+        .onChange(of: cameraControlsEnabled) { _, enabled in
+            if !enabled {
+                isDragging = false
+                isMagnifying = false
+            }
+        }
     }
 }
 #endif
@@ -1083,6 +1140,8 @@ struct CameraFullScreenLiveVideoView: View {
     @StateObject private var panTiltGestureController:
         CameraPanTiltGestureController
     @StateObject private var zoomGestureController: CameraZoomGestureController
+    @StateObject private var playbackController = CameraLivePlaybackController()
+    @State private var livePlaybackControlsVisible = false
     @State private var videoRestartRequest = 0
     @State private var controlsVisible = true
     @State private var selectedQuality: HBCameraLiveQuality
@@ -1090,7 +1149,6 @@ struct CameraFullScreenLiveVideoView: View {
     @StateObject private var recordingController:
         CameraLocalRecordingController
     @State private var savedConfirmationVisible = false
-    @State private var livePlaybackControlsVisible = false
 #endif
 
     init(
@@ -1137,11 +1195,14 @@ struct CameraFullScreenLiveVideoView: View {
             captureInitialPanTiltPosition()
         }
         .onDisappear {
-            panTiltGestureController.stop()
-            zoomGestureController.stop()
+            stopLiveCameraGestures()
+            playbackController.close()
             Task {
                 await controlsModel.stop()
             }
+        }
+        .onChange(of: playbackController.isLive) { _, isLive in
+            if !isLive { stopLiveCameraGestures() }
         }
         .task(id: CameraLiveVideoLifecycle.isSuspended(in: scenePhase)) {
             if CameraLiveVideoLifecycle.isSuspended(in: scenePhase) {
@@ -1167,6 +1228,11 @@ struct CameraFullScreenLiveVideoView: View {
             selectedQuality = fallbackQuality
         }
 #if os(iOS)
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didReceiveMemoryWarningNotification
+        )) { _ in
+            playbackController.trimBufferForMemoryPressure()
+        }
         .task(id: recordingController.successfulSaveCount) {
             guard recordingController.successfulSaveCount > 0 else { return }
             withAnimation(.snappy) {
@@ -1207,6 +1273,14 @@ struct CameraFullScreenLiveVideoView: View {
             Text(recordingController.errorMessage ?? "Unknown error")
         }
 #endif
+        .alert("Playback Unavailable", isPresented: Binding(
+            get: { playbackController.errorMessage != nil },
+            set: { if !$0 { playbackController.dismissError() } }
+        )) {
+            Button("OK") { playbackController.dismissError() }
+        } message: {
+            Text(playbackController.errorMessage ?? "Unknown error")
+        }
     }
 
     private var liveVideo: some View {
@@ -1214,7 +1288,7 @@ struct CameraFullScreenLiveVideoView: View {
             videoPresentation
                 .ignoresSafeArea(.container)
 
-            if controlsVisible {
+            if controlsVisible && playbackController.isLive {
                 CameraDetailControlsOverlay(model: controlsModel)
                     .transition(.opacity)
             }
@@ -1222,12 +1296,19 @@ struct CameraFullScreenLiveVideoView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black.ignoresSafeArea())
         .animation(.snappy, value: controlsVisible)
-        .accessibilityAction(named: "Toggle camera controls") {
-            toggleControls()
+        .onChange(of: hasAvailableNVRHistory, initial: true) { _, available in
+            playbackController.setNVRHistoryAvailable(available)
         }
-        .accessibilityAction(named: "Recenter camera") {
-            recenterCamera()
+        .accessibilityActions {
+            Button("Toggle player controls", action: toggleControls)
+            if playbackController.isLive {
+                Button("Recenter camera", action: recenterCamera)
+            }
         }
+    }
+
+    private var hasAvailableNVRHistory: Bool {
+        CameraPlaybackHistoryAvailability.isAvailable(in: controlsModel.deviceMetadata)
     }
 
     private var videoPresentation: some View {
@@ -1237,7 +1318,8 @@ struct CameraFullScreenLiveVideoView: View {
             client: client,
             allowsRetry: true,
             restartRequest: videoRestartRequest,
-            recordingController: videoRecordingController
+            recordingController: videoRecordingController,
+            playbackController: playbackController
         )
         .id(selectedQuality)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1245,6 +1327,7 @@ struct CameraFullScreenLiveVideoView: View {
             ZStack {
                 Color.black.ignoresSafeArea()
                 CameraLiveGestureSurface(
+                    cameraControlsEnabled: playbackController.isLive,
                     onPan: handlePanGesture,
                     onMagnify: magnifyGestureHandler,
                     onSingleTap: toggleControls,
@@ -1264,21 +1347,22 @@ struct CameraFullScreenLiveVideoView: View {
             if livePlaybackControlsVisible {
                 ToolbarSpacer(.fixed, placement: .topBarLeading)
                 ToolbarItem(placement: .topBarLeading) {
-                    playbackControl("Back 30 seconds", systemImage: "gobackward.30")
+                    backControl
                 }
                 ToolbarSpacer(.fixed, placement: .topBarLeading)
                 ToolbarItem(placement: .topBarLeading) {
-                    playbackControl("Pause", systemImage: "pause.fill")
+                    pauseControl
                 }
                 ToolbarSpacer(.fixed, placement: .topBarLeading)
                 ToolbarItem(placement: .topBarLeading) {
-                    playbackControl("Forward 30 seconds", systemImage: "goforward.30")
+                    forwardControl
                 }
                 ToolbarSpacer(.fixed, placement: .topBarLeading)
             }
             ToolbarItem(placement: .topBarLeading) {
                 liveButton
             }
+            .sharedBackgroundVisibility(.hidden)
         } else {
             ToolbarItem(placement: .principal) {
                 cameraStatusMessage
@@ -1286,21 +1370,23 @@ struct CameraFullScreenLiveVideoView: View {
             }
             .sharedBackgroundVisibility(.hidden)
         }
-        ToolbarItem(placement: .topBarTrailing) {
-            recordingControl
-        }
-        ToolbarSpacer(.fixed, placement: .topBarTrailing)
-        ToolbarItem(placement: .topBarTrailing) {
-            qualityControl
-        }
-        if let dayNightModeControl {
+        if playbackController.isLive {
             ToolbarItem(placement: .topBarTrailing) {
-                dayNightModeControl
+                recordingControl
             }
-        }
-        if let privacyControl {
+            ToolbarSpacer(.fixed, placement: .topBarTrailing)
             ToolbarItem(placement: .topBarTrailing) {
-                privacyControl
+                qualityControl
+            }
+            if let dayNightModeControl {
+                ToolbarItem(placement: .topBarTrailing) {
+                    dayNightModeControl
+                }
+            }
+            if let privacyControl {
+                ToolbarItem(placement: .topBarTrailing) {
+                    privacyControl
+                }
             }
         }
     }
@@ -1310,17 +1396,30 @@ struct CameraFullScreenLiveVideoView: View {
         ToolbarItem(placement: .navigation) {
             closeButton
         }
-        ToolbarItem(placement: .primaryAction) {
-            qualityControl
-        }
-        if let dayNightModeControl {
-            ToolbarItem(placement: .primaryAction) {
-                dayNightModeControl
+        if livePlaybackControlsVisible {
+            ToolbarItemGroup(placement: .navigation) {
+                backControl
+                pauseControl
+                forwardControl
             }
         }
-        if let privacyControl {
+        ToolbarItem(placement: .navigation) {
+            liveButton
+        }
+        .sharedBackgroundVisibility(.hidden)
+        if playbackController.isLive {
             ToolbarItem(placement: .primaryAction) {
-                privacyControl
+                qualityControl
+            }
+            if let dayNightModeControl {
+                ToolbarItem(placement: .primaryAction) {
+                    dayNightModeControl
+                }
+            }
+            if let privacyControl {
+                ToolbarItem(placement: .primaryAction) {
+                    privacyControl
+                }
             }
         }
     }
@@ -1338,14 +1437,15 @@ struct CameraFullScreenLiveVideoView: View {
 
 #if os(iOS)
     private var showsLiveControls: Bool {
-        !recordingController.isRecording
-            && recordingController.state != .saving
+        !recordingController.locksStreamConfiguration
             && !savedConfirmationVisible
     }
 
     @ViewBuilder
     private var cameraStatusMessage: some View {
-        if recordingController.state == .waitingForKeyFrame {
+        if recordingController.state == .requestingAuthorization {
+            CameraToolbarStatus(title: "Requesting Photos access…")
+        } else if recordingController.state == .waitingForKeyFrame {
             CameraToolbarStatus(
                 title: "Recording",
                 showsActivityIndicator: true,
@@ -1370,29 +1470,6 @@ struct CameraFullScreenLiveVideoView: View {
         } else if savedConfirmationVisible {
             CameraToolbarStatus(title: "Saved to Photos")
         }
-    }
-
-    private var liveButton: some View {
-        Button("Live") {
-            withAnimation(.snappy) {
-                livePlaybackControlsVisible.toggle()
-            }
-        }
-        .buttonStyle(.glassProminent)
-        .tint(.red)
-        .accessibilityHint(livePlaybackControlsVisible
-            ? "Hides playback controls"
-            : "Shows playback controls")
-    }
-
-    private func playbackControl(
-        _ title: String,
-        systemImage: String
-    ) -> some View {
-        Button(title, systemImage: systemImage) {
-            // Playback actions will be connected when history is available.
-        }
-        .labelStyle(.iconOnly)
     }
 
     @ViewBuilder
@@ -1448,6 +1525,49 @@ struct CameraFullScreenLiveVideoView: View {
     }
 #endif
 
+    private var liveButton: some View {
+        CameraLiveModeButton(
+            isLive: playbackController.isLive,
+            shuttleControlsVisible: livePlaybackControlsVisible
+        ) {
+            withAnimation(.snappy) {
+                if playbackController.isLive {
+                    livePlaybackControlsVisible.toggle()
+                } else {
+                    playbackController.goLive()
+                    livePlaybackControlsVisible = false
+                }
+            }
+        }
+    }
+
+    private var backControl: some View {
+        Button("Back 30 seconds", systemImage: "gobackward.30") {
+            stopLiveCameraGestures()
+            playbackController.seek(by: -30)
+        }
+        .labelStyle(.iconOnly)
+        .disabled(!playbackController.canSeekBackward)
+    }
+
+    private var pauseControl: some View {
+        Button(playbackController.isPaused ? "Play" : "Pause",
+               systemImage: playbackController.isPaused ? "play.fill" : "pause.fill") {
+            stopLiveCameraGestures()
+            playbackController.togglePause()
+        }
+        .labelStyle(.iconOnly)
+        .disabled(!playbackController.canControlPlayback)
+    }
+
+    private var forwardControl: some View {
+        Button("Forward 30 seconds", systemImage: "goforward.30") {
+            playbackController.seek(by: 30)
+        }
+        .labelStyle(.iconOnly)
+        .disabled(playbackController.isLive || !playbackController.canControlPlayback)
+    }
+
     private var privacyControl: CameraPrivacyToolbarControl? {
         let controls = CameraDetailControlSet(
             controls: controlsModel.controls
@@ -1492,6 +1612,7 @@ struct CameraFullScreenLiveVideoView: View {
         .accessibilityValue(
             CameraLiveQualityPresentation.title(for: selectedQuality)
         )
+        .disabled(!playbackController.isLive)
 #if os(iOS)
         .disabled(recordingController.locksStreamConfiguration)
 #endif
@@ -1520,12 +1641,12 @@ struct CameraFullScreenLiveVideoView: View {
     }
 
     private var panTiltGestureTarget: CameraPanTiltGestureTarget? {
-        guard controlsModel.state == .live else { return nil }
+        guard playbackController.isLive, controlsModel.state == .live else { return nil }
         return CameraPanTiltGestureTarget(controls: controlsModel.controls)
     }
 
     private var zoomGestureTarget: CameraZoomGestureTarget? {
-        guard controlsModel.state == .live else { return nil }
+        guard playbackController.isLive, controlsModel.state == .live else { return nil }
         return CameraZoomGestureTarget(controls: controlsModel.controls)
     }
 
@@ -1553,6 +1674,10 @@ struct CameraFullScreenLiveVideoView: View {
         translation: CGSize,
         viewport: CGSize
     ) {
+        guard playbackController.isLive else {
+            panTiltGestureController.stop()
+            return
+        }
         switch phase {
         case .began:
             guard let panTiltGestureTarget else { return }
@@ -1576,6 +1701,10 @@ struct CameraFullScreenLiveVideoView: View {
         phase: CameraMagnifyGesturePhase,
         magnification: CGFloat
     ) {
+        guard playbackController.isLive else {
+            zoomGestureController.stop()
+            return
+        }
         switch phase {
         case .began:
             guard let zoomGestureTarget else { return }
@@ -1595,6 +1724,11 @@ struct CameraFullScreenLiveVideoView: View {
         withAnimation(.snappy) {
             controlsVisible.toggle()
         }
+    }
+
+    private func stopLiveCameraGestures() {
+        panTiltGestureController.stop()
+        zoomGestureController.stop()
     }
 
     private func recenterCamera() {
