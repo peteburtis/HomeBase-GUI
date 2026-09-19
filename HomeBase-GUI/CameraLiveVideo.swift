@@ -1617,7 +1617,7 @@ private struct CameraFullScreenCameraContent: View {
     private var cameraPickerControl: some View {
         Button { cameraPickerVisible = true } label: {
             if switchingCamera { ProgressView() }
-            else { Image(systemName: "rectangle.split.2x1") }
+            else { Image(systemName: "rectangle.grid.3x3.fill") }
         }
         .accessibilityLabel("Choose camera")
         .accessibilityValue(group.active ? group.sessions.map { $0.camera.device.displayName }.joined(separator: ", ") : device.displayName)

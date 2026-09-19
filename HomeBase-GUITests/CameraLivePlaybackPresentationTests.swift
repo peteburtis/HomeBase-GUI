@@ -27,7 +27,7 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
     }
 
     func testCompactWidthMovesSecondaryActionsToSystemOverflow() async throws {
-        XCTAssertNotNil(UIImage(systemName: "rectangle.split.2x1"))
+        XCTAssertNotNil(UIImage(systemName: "rectangle.grid.3x3.fill"))
         for live in [true, false] {
             for width: CGFloat in [375, 393, 430] {
                 try await assertToolbarOverflow(live: live, width: width, compact: true)
@@ -67,7 +67,7 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
                 }
                 if !compact { ToolbarSpacer(.fixed, placement: .topBarTrailing) }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Choose camera", systemImage: "rectangle.split.2x1", action: {}).labelStyle(.iconOnly)
+                    Button("Choose camera", systemImage: "rectangle.grid.3x3.fill", action: {}).labelStyle(.iconOnly)
                 }
             }
             .toolbarBackgroundVisibility(.hidden, for: .navigationBar)

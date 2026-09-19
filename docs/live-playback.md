@@ -208,7 +208,7 @@ screen still ends its session and releases its buffers.
 
 ## Switching cameras
 
-The far-right camera-selection button uses the side-by-side `rectangle.split.2x1`
+The far-right camera-selection button uses the filled-grid `rectangle.grid.3x3.fill`
 symbol and stays in its own toolbar group in both Live and History.
 Its popover lists the server's viewable cameras by display name, with a checkmark
 on the current camera. Selecting that camera is a no-op. The picker is disabled
