@@ -116,6 +116,7 @@ struct CameraGroupVideo: View {
     let cameraControlsEnabled: Bool
     let controlsVisible: Bool
     var isAccessAllowed = true
+    var credentials: CameraS3Credentials? = nil
     let onSingleTap: () -> Void
 
     var body: some View {
@@ -129,6 +130,7 @@ struct CameraGroupVideo: View {
                         CameraGroupPane(session: session, group: group, cameraControlsEnabled: cameraControlsEnabled,
                             controlsVisible: controlsVisible,
                             isAccessAllowed: isAccessAllowed,
+                            credentials: credentials,
                             safeBounds: safeBounds.offsetBy(dx: -cells[index].minX, dy: -cells[index].minY),
                             labelBelowVideo: CameraGroupLayout.labelsBelowVideo(count: group.sessions.count, arrangement: arrangement),
                             onSingleTap: onSingleTap)
@@ -154,6 +156,7 @@ private struct CameraGroupPane: View {
     let cameraControlsEnabled: Bool
     let controlsVisible: Bool
     let isAccessAllowed: Bool
+    let credentials: CameraS3Credentials?
     let safeBounds: CGRect
     let labelBelowVideo: Bool
     let onSingleTap: () -> Void
@@ -161,6 +164,7 @@ private struct CameraGroupPane: View {
     init(session: CameraGroupSession, group: CameraGroupPlayback, cameraControlsEnabled: Bool,
          controlsVisible: Bool,
          isAccessAllowed: Bool,
+         credentials: CameraS3Credentials?,
          safeBounds: CGRect, labelBelowVideo: Bool,
          onSingleTap: @escaping () -> Void) {
         self.session = session; self.group = group
@@ -169,6 +173,7 @@ private struct CameraGroupPane: View {
         self.cameraControlsEnabled = cameraControlsEnabled
         self.controlsVisible = controlsVisible
         self.isAccessAllowed = isAccessAllowed
+        self.credentials = credentials
         self.safeBounds = safeBounds; self.labelBelowVideo = labelBelowVideo
         self.onSingleTap = onSingleTap
     }
@@ -195,7 +200,6 @@ private struct CameraGroupPane: View {
                 recordingController: session.videoRecordingController, playbackController: playback,
                 usesHistory: !isLive, onStateChanged: { session.liveState = $0 },
                 onAspectRatioChanged: { aspectRatio = $0 })
-                .id(session.quality)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background {
                     CameraLiveGestureSurface(videoVisible: group.showsVideo(session), cameraControlsEnabled: gesturesEnabled,
@@ -233,7 +237,10 @@ private struct CameraGroupPane: View {
             }
         }
         .onChange(of: controls.deviceMetadata, initial: true) { _, metadata in
-            if isAccessAllowed { playback.prepareHistory(metadata: metadata, client: group.client) }
+            if isAccessAllowed { playback.prepareHistory(metadata: metadata, client: group.client, credentials: credentials) }
+        }
+        .onChange(of: credentials) { _, value in
+            if isAccessAllowed { playback.prepareHistory(metadata: controls.deviceMetadata, client: group.client, credentials: value) }
         }
         .onChange(of: gesturesEnabled, initial: true) { _, enabled in session.gestures.update(enabled: enabled) }
         .onChange(of: panTiltTarget?.observedPosition, initial: true) { _, _ in session.gestures.update(enabled: gesturesEnabled) }
@@ -249,7 +256,7 @@ private struct CameraGroupPane: View {
                 playback.suspend(); await controls.stop()
             } else {
                 playback.resume()
-                playback.prepareHistory(metadata: controls.deviceMetadata, client: group.client)
+                playback.prepareHistory(metadata: controls.deviceMetadata, client: group.client, credentials: credentials)
                 await controls.run(reactivating: true)
             }
         }

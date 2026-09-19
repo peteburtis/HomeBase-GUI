@@ -15,6 +15,9 @@ nonisolated enum CameraS3CredentialPresence: Equatable, Sendable {
     case missing
     case biometricProtected
     case unprotected
+    /// Noninteractive inspection could not determine the item's attributes.
+    /// Retry the real read after authentication; never infer absence from this.
+    case authenticationRequired
 }
 
 /// LAContext is designed for a request to cross the Keychain/LA boundary. Keep
@@ -24,6 +27,7 @@ nonisolated final class CameraAuthenticationAttempt: @unchecked Sendable {
     let context = LAContext()
 
     init() {
+        context.interactionNotAllowed = false
         context.localizedFallbackTitle = ""
         context.touchIDAuthenticationAllowableReuseDuration = 0
     }
@@ -57,23 +61,27 @@ final class CameraKeychainCredentialStore: CameraS3CredentialStoring {
             var query = self.baseQuery
             query[kSecReturnAttributes as String] = true
             query[kSecMatchLimit as String] = kSecMatchLimitOne
-            // Attribute inspection must not prompt. In particular, a denied
-            // inspection is an error, NOT evidence that credentials are absent.
+            // A physical device may require authentication even for this
+            // attributes-only probe. Defer that requirement to the real read.
             let context = LAContext()
             context.interactionNotAllowed = true
+            defer { context.invalidate() }
             query[kSecUseAuthenticationContext as String] = context
             var result: CFTypeRef?
             let status = SecItemCopyMatching(query as CFDictionary, &result)
-            if status == errSecItemNotFound { return .missing }
-            guard status == errSecSuccess else { throw CameraAccessError.keychain(status) }
-            guard let attributes = result as? [String: Any] else {
-                throw CameraAccessError.invalidSavedCredentials
-            }
-            return Self.presence(for: attributes)
+            return try Self.presence(status: status, attributes: result as? [String: Any])
         }.value
     }
 
-    /// Unknown formats and ACLs always take the mandatory biometric branch.
+    nonisolated static func presence(status: OSStatus, attributes: [String: Any]?) throws -> CameraS3CredentialPresence {
+        if status == errSecItemNotFound { return .missing }
+        if status == errSecInteractionNotAllowed { return .authenticationRequired }
+        guard status == errSecSuccess else { throw CameraAccessError.keychain(status) }
+        guard let attributes else { throw CameraAccessError.invalidSavedCredentials }
+        return presence(for: attributes)
+    }
+
+    /// Unknown formats and ACLs always require biometrics for credential reads.
     /// An explicit legacy marker without an ACL is the only unprotected case;
     /// the current app never writes that format.
     nonisolated static func presence(for attributes: [String: Any]) -> CameraS3CredentialPresence {

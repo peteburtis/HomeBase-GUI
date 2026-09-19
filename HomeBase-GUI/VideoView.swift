@@ -24,7 +24,7 @@ struct VideoView: View {
                 }
                 .padding(gridSpacing)
 
-                if !access.isUnlocked {
+                if access.showsUnlockRecovery {
                     CameraUnlockButton(access: access)
                         .padding()
                 }
@@ -68,7 +68,7 @@ struct VideoView: View {
         access: CameraAccessPresentation
     ) -> some View {
         Button {
-            guard access.isUnlocked else { return }
+            guard access.isUnlocked, access.session?.isUnlocked != false else { return }
             // Retain the camera-section lease before presentation can obscure
             // its parent; don't depend on onChange/onDisappear callback order.
             onPresentationChanged(true)
@@ -103,11 +103,16 @@ struct VideoView: View {
             .contentShape(RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(.plain)
-        .disabled(!access.isUnlocked)
+        // Disabled plain buttons dim even an opaque black preview to gray in
+        // light mode. Keep it black and inert without fading the entire chip.
+        // The action also guards authorization for accessibility activation.
+        .allowsHitTesting(access.isUnlocked)
+        .accessibilityRemoveTraits(access.isUnlocked ? [] : .isButton)
+        .accessibilityAddTraits(access.isUnlocked ? .isButton : .isStaticText)
         .accessibilityLabel(camera.device.displayName)
         .accessibilityHint(access.isUnlocked
             ? "Opens camera controls and full-screen video"
-            : "Locked. Use Unlock to authenticate.")
+            : (access.showsUnlockRecovery ? "Locked. Use Unlock to authenticate." : "Camera preview hidden during authentication."))
     }
 
     private func fullScreenVideo(

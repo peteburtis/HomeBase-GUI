@@ -26,36 +26,55 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
         }
     }
 
-    func testNativePlaybackAndCameraToolbarsFitTogether() async throws {
+    func testCompactWidthMovesSecondaryActionsToSystemOverflow() async throws {
+        XCTAssertNotNil(UIImage(systemName: "rectangle.split.2x1"))
         for live in [true, false] {
-            try await assertNativePlaybackAndCameraToolbars(live: live)
+            for width: CGFloat in [375, 393, 430] {
+                try await assertToolbarOverflow(live: live, width: width, compact: true)
+            }
+            // A wide window with compact traits must still use the same policy.
+            try await assertToolbarOverflow(live: live, width: 852, compact: true)
+            try await assertToolbarOverflow(live: live, width: 852, compact: false)
         }
     }
 
-    private func assertNativePlaybackAndCameraToolbars(live: Bool) async throws {
+    private func assertToolbarOverflow(live: Bool, width: CGFloat, compact: Bool) async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let host = UIHostingController(rootView: NavigationStack {
             Color.black.ignoresSafeArea().toolbar {
                 CameraPlaybackToolbar(isLive: live, playbackEnabled: true,
                     close: {}, goLive: {},
-                    back: Button("Back", systemImage: "gobackward.30", action: {}).labelStyle(.iconOnly),
+                    back: Button("Back 30 seconds", systemImage: "gobackward.30", action: {}),
                     pause: Button("Pause", systemImage: "pause.fill", action: {}).labelStyle(.iconOnly),
-                    forward: Button("Forward", systemImage: "goforward.30", action: {}).labelStyle(.iconOnly),
+                    forward: Button("Forward 30 seconds", systemImage: "goforward.30", action: {}).disabled(live),
                     speed: CameraPlaybackSpeedMenu(speed: .constant(.double)))
-                ToolbarItem(placement: .topBarTrailing) { Button("Record", systemImage: "record.circle", action: {}).labelStyle(.iconOnly).disabled(!live) }
-                if CameraPlaybackControlsPresentation(isLive: live, timelineVisible: false).cameraControlsEnabled {
-                    ToolbarSpacer(.fixed, placement: .topBarTrailing)
-                    ToolbarItem(placement: .topBarTrailing) { Button("Quality", systemImage: "slider.horizontal.3", action: {}).labelStyle(.iconOnly) }
-                    ToolbarItem(placement: .topBarTrailing) { Button("Day/night", systemImage: "sun.max", action: {}).labelStyle(.iconOnly) }
-                    ToolbarItem(placement: .topBarTrailing) { Button("Privacy", systemImage: "eye", action: {}).labelStyle(.iconOnly) }
+                if !compact || live {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Record", systemImage: "record.circle", action: {}).disabled(!live)
+                    }
                 }
-                ToolbarSpacer(.fixed, placement: .topBarTrailing)
-                ToolbarItem(placement: .topBarTrailing) { Button("Cameras", systemImage: "list.bullet", action: {}).labelStyle(.iconOnly) }
+                if live {
+                    if !compact { ToolbarSpacer(.fixed, placement: .topBarTrailing) }
+                    ToolbarItemGroup(placement: compact ? .secondaryAction : .topBarTrailing) {
+                        Menu { Button("High", action: {}) } label: {
+                            Label("Video quality", systemImage: "slider.horizontal.3")
+                        }
+                        Menu { Button("Day", action: {}) } label: {
+                            Label("Day and night mode", systemImage: "sun.max")
+                        }
+                        Button("Privacy mode", systemImage: "eye", action: {})
+                    }
+                }
+                if !compact { ToolbarSpacer(.fixed, placement: .topBarTrailing) }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Choose camera", systemImage: "rectangle.split.2x1", action: {}).labelStyle(.iconOnly)
+                }
             }
             .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
-        }.preferredColorScheme(.dark))
+        }.environment(\.horizontalSizeClass, compact ? .compact : .regular)
+            .preferredColorScheme(.dark))
         let window = UIWindow(windowScene: scene)
-        window.frame = CGRect(x: 0, y: 0, width: 852, height: 393)
+        window.frame = CGRect(x: 0, y: 0, width: width, height: width > 500 ? 393 : 852)
         window.rootViewController = host; window.isHidden = false
         defer { window.isHidden = true }
         host.view.frame = window.bounds; host.view.layoutIfNeeded()
@@ -64,29 +83,76 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
             host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
         }
         let attachment = XCTAttachment(image: screenshot)
-        attachment.name = "Native toolbar, live=\(live) — Record retained, live-only controls hidden in history"
+        attachment.name = "Native toolbar overflow, compact=\(compact), live=\(live), width=\(width)"
         attachment.lifetime = .keepAlways; add(attachment)
         let shapes = try toolbarShapeBounds(in: screenshot)
-        XCTAssertEqual(shapes.count, 6, "Close, shuttles, Live, Record, picker; plus camera controls when live or speed otherwise")
-        if shapes.count == 6 {
-            XCTAssertGreaterThan(shapes[1].width, 100, "Shuttles share a single native capsule")
-            XCTAssertGreaterThan(shapes[4].minX, shapes[3].maxX)
-            XCTAssertLessThanOrEqual(shapes[5].maxX, 852)
+        XCTAssertFalse(shapes.isEmpty)
+        XCTAssertTrue(shapes.allSatisfy { $0.minX >= 0 && $0.maxX <= width })
+        let navigation = try XCTUnwrap(navigationController(in: host))
+        let item = try XCTUnwrap(navigation.navigationBar.topItem)
+        // In the navigator toolbar role, UIKit puts center groups into its
+        // system overflow. The generated overflow button is not itself in
+        // rightBarButtonItems; inspect the secondary groups, not that button.
+        let secondaryItems = item.centerItemGroups.flatMap(\.barButtonItems)
+        let titles = itemTitles(secondaryItems)
+        let leadingTitles = itemTitles(item.leadingItemGroups.flatMap(\.barButtonItems))
+        let trailingTitles = itemTitles(item.trailingItemGroups.flatMap(\.barButtonItems))
+        // UIKit exposes this menu's current-rate title, not the SwiftUI
+        // accessibility label, on its bar item.
+        let speedTitle = CameraPlaybackSpeed.double.label
+        if live {
+            XCTAssertFalse(leadingTitles.contains(speedTitle))
+            XCTAssertFalse(trailingTitles.contains(speedTitle))
+            XCTAssertTrue(trailingTitles.contains("Record"))
+        } else if compact {
+            XCTAssertFalse(leadingTitles.contains(speedTitle))
+            XCTAssertTrue(trailingTitles.contains(speedTitle))
+            XCTAssertFalse(trailingTitles.contains("Record"))
+        } else {
+            XCTAssertTrue(leadingTitles.contains(speedTitle))
+            XCTAssertFalse(trailingTitles.contains(speedTitle))
+            XCTAssertTrue(trailingTitles.contains("Record"))
         }
-        // Do not implement our own wrapping/rows. Capture the native compact
-        // adaptation as well, so it is visible during review.
-        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        host.view.frame = window.bounds; host.view.layoutIfNeeded()
-        try await Task.sleep(for: .milliseconds(100))
-        let compact = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
-            host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+        XCTAssertTrue(trailingTitles.contains("Choose camera"))
+        XCTAssertFalse(titles.contains(speedTitle))
+        XCTAssertFalse(titles.contains("Record"))
+        XCTAssertFalse(titles.contains("Choose camera"))
+        let menuAttachment = XCTAttachment(string: titles.joined(separator: "\n"))
+        menuAttachment.name = "Overflow titles, compact=\(compact), live=\(live), width=\(width)"
+        menuAttachment.lifetime = .keepAlways; add(menuAttachment)
+        if compact {
+            XCTAssertTrue(titles.contains("Back 30 seconds"))
+            XCTAssertTrue(titles.contains("Forward 30 seconds"))
+            if live {
+                XCTAssertTrue(titles.contains("Video quality"))
+                XCTAssertTrue(titles.contains("Day and night mode"))
+                XCTAssertTrue(titles.contains("Privacy mode"))
+            }
+        } else {
+            XCTAssertFalse(titles.contains("Back 30 seconds"))
+            XCTAssertFalse(titles.contains("Forward 30 seconds"))
         }
-        let compactAttachment = XCTAttachment(image: compact)
-        compactAttachment.name = "Native narrow navigation-bar adaptation, live=\(live)"
-        compactAttachment.lifetime = .keepAlways; add(compactAttachment)
     }
 
-    func testPlaybackToolbarAlwaysShowsShuttlesAndLiveButSpeedOnlyWhenNotLive() async throws {
+    private func navigationController(in controller: UIViewController) -> UINavigationController? {
+        (controller as? UINavigationController) ?? controller.children.lazy.compactMap { self.navigationController(in: $0) }.first
+    }
+
+    private func itemTitles(_ items: [UIBarButtonItem]) -> [String] {
+        items.flatMap { button in
+            [button.title ?? "", button.accessibilityLabel ?? "", button.primaryAction?.title ?? ""]
+                + (button.menu.map(menuTitles) ?? [])
+        }
+    }
+
+    private func menuTitles(_ menu: UIMenu) -> [String] {
+        [menu.title] + menu.children.flatMap { element -> [String] in
+            if let menu = element as? UIMenu { return menuTitles(menu) }
+            return [element.title]
+        }
+    }
+
+    func testRegularWidthShowsShuttlesAndLiveButSpeedOnlyWhenNotLive() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         for live in [true, false] {
             let host = UIHostingController(rootView: NavigationStack {
@@ -99,7 +165,7 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
                         speed: CameraPlaybackSpeedMenu(speed: .constant(.normal)))
                 }
                 .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
-            }.preferredColorScheme(.dark))
+            }.environment(\.horizontalSizeClass, .regular).preferredColorScheme(.dark))
             let window = UIWindow(windowScene: scene)
             window.frame = CGRect(x: 0, y: 0, width: 852, height: 393)
             window.rootViewController = host; window.isHidden = false
@@ -110,17 +176,10 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
                 host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
             }
             let attachment = XCTAttachment(image: screenshot)
-            attachment.name = "Permanent playback toolbar (live=\(live))"
+            attachment.name = "Regular-width playback toolbar (live=\(live))"
             attachment.lifetime = .keepAlways; add(attachment)
             let shapes = try toolbarShapeBounds(in: screenshot)
-            XCTAssertEqual(shapes.count, live ? 3 : 4,
-                "Close, one shuttle capsule, Live, and speed only when not live")
-            guard shapes.count == (live ? 3 : 4) else { continue }
-            let leadingGap = shapes[1].minX - shapes[0].maxX
-            XCTAssertGreaterThanOrEqual(leadingGap, 29)
-            XCTAssertLessThanOrEqual(leadingGap, 48)
-            XCTAssertGreaterThan(shapes[1].width, 100, "The three shuttles share their background")
-            XCTAssertGreaterThan(shapes[2].width, shapes[0].width + 20, "Live always includes its label")
+            XCTAssertEqual(shapes.count, live ? 3 : 4, "Close, shuttles, Live, and optional speed use separate native groups")
         }
     }
 
@@ -238,13 +297,14 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
         XCTAssertNotNil(UIImage(systemName: CameraPlayerPanelPicker.historySymbol))
     }
 
-    func testLiveButtonUsesNativeToolbarSizingAndAlwaysRetainsLabel() async throws {
+    func testLiveButtonUsesNativeSizingWithTitleOnlyInRegularWidth() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        for live in [true, false] {
+        let cases: [(Bool, UserInterfaceSizeClass)] = [(true, .compact), (false, .compact), (true, .regular), (false, .regular)]
+        for (live, sizeClass) in cases {
             let host = UIHostingController(rootView: NavigationStack {
                 Color.black.ignoresSafeArea().toolbar {
                     ToolbarItem(placement: .topBarLeading) {
-                        Button("Close", systemImage: "xmark", action: {}).labelStyle(.iconOnly)
+                        CameraPlayerCloseButton(action: {})
                     }
                     ToolbarSpacer(.fixed, placement: .topBarLeading)
                     ToolbarItem(placement: .topBarLeading) {
@@ -252,7 +312,7 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
                     }
                 }
                 .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
-            }.preferredColorScheme(.dark))
+            }.environment(\.horizontalSizeClass, sizeClass).preferredColorScheme(.dark))
             let window = UIWindow(windowScene: scene)
             window.frame = CGRect(x: 0, y: 0, width: 852, height: 393)
             window.rootViewController = host; window.isHidden = false
@@ -263,14 +323,50 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
                 host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
             }
             let attachment = XCTAttachment(image: screenshot)
-            attachment.name = "Native Live button (live=\(live))"
+            attachment.name = "Native Live button (live=\(live), compact=\(sizeClass == .compact))"
             attachment.lifetime = .keepAlways; add(attachment)
             let shapes = try toolbarShapeBounds(in: screenshot)
             XCTAssertEqual(shapes.count, 2)
             guard shapes.count == 2 else { continue }
             let close = shapes[0], button = shapes[1]
             XCTAssertEqual(button.height, close.height, accuracy: 1)
-            XCTAssertGreaterThan(button.width, close.width + 20, "Live must always retain its title, not collapse to an icon")
+            if sizeClass == .compact {
+                XCTAssertEqual(button.width, close.width, accuracy: 1, "Compact Live uses native icon-only toolbar sizing")
+            } else {
+                XCTAssertGreaterThan(button.width, close.width + 20, "Regular-width Live retains its title")
+            }
+        }
+    }
+
+    func testCloseUsesSystemToolbarSizing() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        for width: CGFloat in [375, 393, 430, 852] {
+            let host = UIHostingController(rootView: NavigationStack {
+                Color.black.ignoresSafeArea().toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        CameraPlayerCloseButton(action: {})
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        // Compare with an unmodified system button, not a point constant.
+                        Button(role: .close, action: {})
+                    }
+                }
+                .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
+            }.preferredColorScheme(.dark))
+            let window = UIWindow(windowScene: scene)
+            window.frame = CGRect(x: 0, y: 0, width: width, height: 852)
+            window.rootViewController = host; window.isHidden = false
+            defer { window.isHidden = true }
+            host.view.frame = window.bounds; host.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(100))
+            let screenshot = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
+                host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+            }
+            let shapes = try toolbarShapeBounds(in: screenshot)
+            XCTAssertEqual(shapes.count, 2)
+            guard shapes.count == 2 else { continue }
+            XCTAssertEqual(shapes[0].width, shapes[1].width, accuracy: 1)
+            XCTAssertEqual(shapes[0].height, shapes[1].height, accuracy: 1)
         }
     }
 

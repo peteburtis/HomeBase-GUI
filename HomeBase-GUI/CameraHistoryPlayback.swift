@@ -44,6 +44,14 @@ final class CameraHistoryPlayback {
         self.cameraID = cameraID; self.transport = transport
         ensureRequest()
     }
+    /// Credential repair can make previously confirmed LOCAL gaps readable.
+    /// Keep the cursor/pause state, but invalidate that source's cached coverage.
+    func replaceSource(cameraID: String, transport: any CameraHistoryFetching) {
+        disconnect(); buffer.removeAll(); failure = nil; retryAfter = 0; quickRetries = 0
+        self.cameraID = cameraID; self.transport = transport
+        if let position, let liveEdge { goal = CameraHistoryPolicy.initialWindow(at: position, liveEdge: liveEdge) }
+        resetPresentation?(); refreshState(); ensureRequest(); changed?()
+    }
     var sourceLiveEdge: Double? { canonicalOffset.map { $0 + localHead } }
     var liveEdge: Double? { groupLiveEdge ?? sourceLiveEdge }
     func updateLiveHead(_ head: Double?) { if let head { localHead = head } }
@@ -203,6 +211,7 @@ final class CameraHistoryPlayback {
         guard isActive, !fetching, clock() >= retryAfter, let transport, let cameraID else { return }
         let request: HBNVRMediaRequest
         let capturedHead = localHead, capturedOffset = initialOffset
+        let capturedPosition = position
         if position != nil, canonicalOffset == nil {
             // Resolve the live edge without fetching unrelated video or using
             // the phone's wall clock as a live-to-canonical mapping.
@@ -239,15 +248,32 @@ final class CameraHistoryPlayback {
             guard !Task.isCancelled else { return }
             do {
                 let batch: CameraHistoryBatch
+                var fetchedFrames = request.operation == "frames"
                 let onBegin: CameraHistoryBeginHandler = { [weak self] _, anchor in
                     await self?.requestBegan(id: id, anchor: anchor, offset: capturedOffset)
                 }
-                do { batch = try await transport.fetch(request, onBegin: onBegin) }
-                catch CameraHistoryError.remote(3, _) where request.relativeTo == "live" {
-                    // A stopped camera has no live anchor. The NVR's own clock
-                    // remains authoritative; do not substitute the phone clock.
-                    var fallback = request; fallback.relativeTo = "now"
-                    batch = try await transport.fetch(fallback, onBegin: onBegin)
+                do {
+                    do { batch = try await transport.fetch(request, onBegin: onBegin) }
+                    catch CameraHistoryError.remote(3, _) where request.relativeTo == "live" {
+                        var fallback = request; fallback.relativeTo = "now"
+                        batch = try await transport.fetch(fallback, onBegin: onBegin)
+                    }
+                } catch {
+                    try Task.checkCancellation()
+                    guard request.operation == "availability", let target = capturedPosition else { throw error }
+                    // An absolute archive seek does not need a live-camera clock.
+                    // If NVR is offline, keep its exact selected UTC instant and
+                    // use wall time only as an approximate forward-play ceiling.
+                    // Relative Live-minus seeks still require a server anchor.
+                    let ceiling = max(Date().timeIntervalSince1970, target + 30)
+                    let range = CameraHistoryPolicy.initialWindow(at: target, liveEdge: ceiling)
+                    let absolute = HBNVRMediaRequest(requestID: UUID().uuidString, operation: "frames", cameraID: cameraID,
+                        timeline: "canonical", range: .init(start: range.start, end: range.end))
+                    let resolved = try await transport.fetch(absolute, onBegin: onBegin)
+                    batch = .init(id: resolved.id, range: resolved.range, anchor: ceiling, pieces: resolved.pieces,
+                        gaps: resolved.gaps, neighbors: resolved.neighbors, unresolved: resolved.unresolved,
+                        sourceWarning: resolved.sourceWarning)
+                    fetchedFrames = true
                 }
                 guard let self, self.token == id, !Task.isCancelled else { return }
                 if self.canonicalOffset == nil {
@@ -260,7 +286,7 @@ final class CameraHistoryPlayback {
                         self.position = anchor + capturedOffset
                     }
                 }
-                if request.operation == "frames" {
+                if fetchedFrames {
                     self.buffer.insert(batch, at: self.clock(), around: self.position!)
                 } else if request.operation == "neighbors" {
                     guard let neighbors = batch.neighbors else { throw CameraHistoryError.invalidResponse }
@@ -272,7 +298,8 @@ final class CameraHistoryPlayback {
                     self.navigationExpires = self.clock() + (neighbors.next == nil ? 5 : 60)
                     self.scheduleNavigationRefresh()
                 }
-                self.fetching = false; self.task = nil; self.failure = nil; self.quickRetries = 0
+                self.fetching = false; self.task = nil; self.failure = batch.sourceWarning; self.quickRetries = 0
+                if batch.sourceWarning != nil { self.retryAfter = self.clock() + 5 }
                 self.refreshState(); self.ensureRequest(); self.changed?()
             } catch {
                 guard let self, self.token == id, !Task.isCancelled else { return }

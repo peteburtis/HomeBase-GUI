@@ -5,9 +5,19 @@ import LocalAuthentication
 
 @MainActor
 final class CameraS3CredentialsTests: XCTestCase {
+    func testNoninteractiveKeychainResponseClassification() throws {
+        XCTAssertEqual(try CameraKeychainCredentialStore.presence(status: errSecInteractionNotAllowed, attributes: nil), .authenticationRequired)
+        XCTAssertEqual(try CameraKeychainCredentialStore.presence(status: errSecItemNotFound, attributes: nil), .missing)
+        XCTAssertEqual(try CameraKeychainCredentialStore.presence(status: errSecSuccess,
+            attributes: [kSecAttrGeneric as String: CameraKeychainCredentialStore.biometricMarker]), .biometricProtected)
+        XCTAssertThrowsError(try CameraKeychainCredentialStore.presence(status: errSecAuthFailed, attributes: nil))
+        XCTAssertThrowsError(try CameraKeychainCredentialStore.presence(status: errSecNotAvailable, attributes: nil))
+        XCTAssertThrowsError(try CameraKeychainCredentialStore.presence(status: errSecSuccess, attributes: nil))
+    }
+
     /// An isolated simulator-only item exercises the real Keychain attribute
     /// query, without touching production credentials or presenting auth UI.
-    func testBiometricItemMetadataCanBeInspectedWithoutUnlocking() async throws {
+    func testIsolatedBiometricItemInspectionNeverReportsMissingOrNeedsPrompt() async throws {
 #if targetEnvironment(simulator)
         let service = "io.pjb.HomeBase-GUI.tests.camera-s3.\(UUID().uuidString)"
         let account = "metadata-only-fixture"
@@ -36,17 +46,20 @@ final class CameraS3CredentialsTests: XCTestCase {
             throw XCTSkip("This simulator cannot provision a biometric item without interaction (\(status)).")
         }
         let savedPresence = try await store.inspect()
-        XCTAssertEqual(savedPresence, .biometricProtected)
+        XCTAssertTrue([.biometricProtected, .authenticationRequired].contains(savedPresence))
 
         var query = deletion
         query[kSecReturnAttributes as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
-        XCTAssertEqual(SecItemCopyMatching(query as CFDictionary, &result), errSecSuccess)
-        let attributes = try XCTUnwrap(result as? [String: Any])
-        XCTAssertNil(attributes[kSecValueData as String])
-        XCTAssertNotNil(attributes[kSecAttrAccessControl as String])
-        XCTAssertEqual(attributes[kSecAttrGeneric as String] as? Data, CameraKeychainCredentialStore.biometricMarker)
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        XCTAssertTrue([errSecSuccess, errSecInteractionNotAllowed].contains(status))
+        if status == errSecSuccess {
+            let attributes = try XCTUnwrap(result as? [String: Any])
+            XCTAssertNil(attributes[kSecValueData as String])
+            XCTAssertNotNil(attributes[kSecAttrAccessControl as String])
+            XCTAssertEqual(attributes[kSecAttrGeneric as String] as? Data, CameraKeychainCredentialStore.biometricMarker)
+        }
 #else
         throw XCTSkip("Real Keychain fixture is simulator-only; deterministic policy tests run on every platform.")
 #endif

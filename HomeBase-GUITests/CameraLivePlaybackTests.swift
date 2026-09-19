@@ -663,6 +663,26 @@ final class CameraLivePlaybackTests: XCTestCase {
         XCTAssertThrowsError(try controller.configure(newVideo.configuration, ownerID: UUID()))
     }
 
+    func testQualityHandoffKeepsBufferAndPausedPositionWithoutStoppingOwner() async throws {
+        // Like the other renderer tests, use an async XCTest entry point for
+        // iOS 26.1's nested MainActor-isolated deinit runtime compatibility.
+        let old = try video(), new = try video(width: 128, generation: 2)
+        let controller = CameraLivePlaybackController()
+        let owner = UUID()
+        _ = try controller.configure(old.configuration, ownerID: owner)
+        for frame in old.frames { _ = try controller.receive(frame, ownerID: owner) }
+        controller.togglePause()
+        let position = controller.timeline.position
+        let bytes = controller.timeline.retainedBytes
+        _ = try controller.configure(new.configuration, ownerID: owner, preservingDisplayedImage: true)
+        for frame in new.frames { _ = try controller.receive(frame, ownerID: owner) }
+        XCTAssertTrue(controller.isPaused)
+        XCTAssertEqual(controller.timeline.position, position)
+        XCTAssertGreaterThan(controller.timeline.retainedBytes, bytes)
+        XCTAssertNil(controller.errorMessage)
+        controller.close()
+    }
+
     private func configured(duration: Double = 300, bytes: Int = 64 * 1024 * 1024)
         -> CameraLivePlaybackTimeline {
         var timeline = CameraLivePlaybackTimeline(maximumDuration: duration, maximumBytes: bytes, clock: { 0 })

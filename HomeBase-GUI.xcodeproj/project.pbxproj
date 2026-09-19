@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		C7A000000000000000000003 /* AWSS3 in Frameworks */ = {isa = PBXBuildFile; productRef = C7A000000000000000000002 /* AWSS3 */; };
 		E2CD710130269489002FCE2D /* HomeBaseProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = E2CD710330269489002FCE2D /* HomeBaseProtocol */; };
 		F0F122010000000000000007 /* HomeBaseProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = E2CD710330269489002FCE2D /* HomeBaseProtocol */; };
 /* End PBXBuildFile section */
@@ -57,6 +58,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C7A000000000000000000003 /* AWSS3 in Frameworks */,
 				E2CD710130269489002FCE2D /* HomeBaseProtocol in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -110,6 +112,7 @@
 			);
 			name = "HomeBase-GUI";
 			packageProductDependencies = (
+				C7A000000000000000000002 /* AWSS3 */,
 				E2CD710330269489002FCE2D /* HomeBaseProtocol */,
 			);
 			productName = "HomeBase-GUI";
@@ -169,6 +172,7 @@
 			mainGroup = E2CD70E830269489002FCE2D;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				C7A000000000000000000001 /* XCRemoteSwiftPackageReference "aws-sdk-swift" */,
 				E2CD710230269489002FCE2D /* XCLocalSwiftPackageReference "../HomeBase/HomeBaseProtocol" */,
 			);
 			preferredProjectObjectVersion = 77;
@@ -531,12 +535,25 @@
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		C7A000000000000000000002 /* AWSS3 */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C7A000000000000000000001 /* XCRemoteSwiftPackageReference "aws-sdk-swift" */;
+			productName = AWSS3;
+		};
 		E2CD710330269489002FCE2D /* HomeBaseProtocol */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = E2CD710230269489002FCE2D /* XCLocalSwiftPackageReference "../HomeBase/HomeBaseProtocol" */;
 			productName = HomeBaseProtocol;
 		};
 /* End XCSwiftPackageProductDependency section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		C7A000000000000000000001 /* XCRemoteSwiftPackageReference "aws-sdk-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/awslabs/aws-sdk-swift";
+			requirement = {kind = exactVersion; version = 1.7.78; };
+		};
+/* End XCRemoteSwiftPackageReference section */
 	};
 	rootObject = E2CD70E930269489002FCE2D /* Project object */;
 }

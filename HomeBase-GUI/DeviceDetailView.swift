@@ -78,7 +78,7 @@ struct DeviceDetailView: View {
                 .listRowInsets(EdgeInsets())
                 .listRowBackground(Color.black)
 
-                if !access.isUnlocked {
+                if access.showsUnlockRecovery {
                     Section {
                         CameraUnlockButton(access: access)
                             .frame(maxWidth: .infinity)

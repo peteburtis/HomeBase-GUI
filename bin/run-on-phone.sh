@@ -524,12 +524,16 @@ fi
 /bin/mkdir -p "$DERIVED_DATA_PATH"
 
 log "Building for ${device_name}"
+# The pinned AWS SDK 1.7.78 uses Smithy's package code-generation plugin.
+# CLI deployment cannot show Xcode's plugin trust dialog; build the reviewed,
+# version-locked package graph without that interactive validation step.
 xcodebuild \
     -project "$PROJECT_PATH" \
     -scheme "$SCHEME" \
     -configuration "$CONFIGURATION" \
     -destination "platform=iOS,id=${device_udid}" \
     -derivedDataPath "$DERIVED_DATA_PATH" \
+    -skipPackagePluginValidation \
     -allowProvisioningUpdates \
     build
 

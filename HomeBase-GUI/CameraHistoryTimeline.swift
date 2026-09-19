@@ -264,6 +264,7 @@ final class CameraTimelineModel: ObservableObject {
     }
     func close() {
         generation = UUID(); dragging = false
+        previews.removeAll() // Includes decrypted cloud images; never retain across authorization/background changes.
         fetchTask?.cancel(); fetchTask = nil
         let old = transport; transport = nil; anchor = nil
         if let old { Task { await old.close() } }
@@ -341,8 +342,10 @@ struct CameraHistoryTimeline: View {
     @State private var attempt = 0
     @State private var viewportWidth: CGFloat = 0
     @Namespace private var timelineSpace
-    private struct ConnectionKey: Hashable { let background: Bool; let attempt: Int }
+    struct Source: Equatable { let metadata: HBCameraPlaybackMetadata; let credentials: CameraS3Credentials? }
+    private struct ConnectionKey: Equatable { let background: Bool; let attempt: Int; let source: Source? }
     let makeTransport: () async -> any CameraThumbnailFetching
+    var source: Source? = nil
     let cameraID: String
     let timeZone: TimeZone
     let position: () -> CameraSwitchPosition
@@ -445,7 +448,8 @@ struct CameraHistoryTimeline: View {
                 do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
             }
         }
-        .task(id: ConnectionKey(background: !isActive || scenePhase == .background, attempt: attempt)) {
+        .task(id: ConnectionKey(background: !isActive || scenePhase == .background, attempt: attempt, source: source)) {
+            close()
             guard isActive, scenePhase != .background else { close(); return }
             let transport = await makeTransport()
             guard !Task.isCancelled else { await transport.close(); return }

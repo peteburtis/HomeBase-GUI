@@ -36,6 +36,12 @@ struct CameraAccessPresentation {
     let isAuthenticating: Bool
     let errorMessage: String?
 
+    /// Authentication is normally quick. Keep initial entry, in-flight retries,
+    /// and temporary system-UI concealment blank; offer recovery only on failure.
+    var showsUnlockRecovery: Bool {
+        !isAuthorized && !isAuthenticating && errorMessage != nil
+    }
+
     func unlock() {
         session?.unlock()
     }
@@ -82,15 +88,19 @@ private struct ObservedCameraAccessGate<Content: View>: View {
 }
 
 struct LockedCameraPreview: View {
+    let showsLock: Bool
+
     var body: some View {
         Color.black
             .aspectRatio(16 / 9, contentMode: .fit)
             .overlay {
-                Image(systemName: "lock.fill")
-                    .font(.title2)
-                    .foregroundStyle(.white)
+                if showsLock {
+                    Image(systemName: "lock.fill")
+                        .font(.title2)
+                        .foregroundStyle(.white)
+                }
             }
-            .accessibilityLabel("Camera locked")
+            .accessibilityLabel(showsLock ? "Camera locked" : "Camera preview hidden")
     }
 }
 
@@ -107,11 +117,11 @@ struct CameraProtectedPreview<Content: View>: View {
                 .allowsHitTesting(access.isUnlocked)
                 .overlay {
                     if !access.isUnlocked {
-                        LockedCameraPreview()
+                        LockedCameraPreview(showsLock: access.showsUnlockRecovery)
                     }
                 }
         } else {
-            LockedCameraPreview()
+            LockedCameraPreview(showsLock: access.showsUnlockRecovery)
         }
     }
 }
@@ -120,21 +130,19 @@ struct CameraUnlockButton: View {
     let access: CameraAccessPresentation
 
     var body: some View {
-        VStack(spacing: 8) {
-            Button("Unlock", systemImage: "lock.open") {
-                access.unlock()
-            }
-            .disabled(access.isAuthenticating)
-            .accessibilityIdentifier("camera.unlock")
+        if access.showsUnlockRecovery {
+            VStack(spacing: 8) {
+                Button("Unlock", systemImage: "lock.open") {
+                    access.unlock()
+                }
+                .accessibilityIdentifier("camera.unlock")
 
-            if access.isAuthenticating {
-                ProgressView()
-                    .accessibilityLabel("Unlocking cameras")
-            } else if let message = access.errorMessage {
-                Text(message)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+                if let message = access.errorMessage {
+                    Text(message)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
             }
         }
     }
@@ -146,13 +154,15 @@ struct CameraAccessLockedView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            VStack(spacing: 20) {
-                Image(systemName: "lock.fill")
-                    .font(.largeTitle)
-                    .foregroundStyle(.white)
-                CameraUnlockButton(access: access)
+            if access.showsUnlockRecovery {
+                VStack(spacing: 20) {
+                    Image(systemName: "lock.fill")
+                        .font(.largeTitle)
+                        .foregroundStyle(.white)
+                    CameraUnlockButton(access: access)
+                }
+                .padding()
             }
-            .padding()
         }
     }
 }

@@ -5,6 +5,26 @@ import LocalAuthentication
 
 @MainActor
 final class CameraAccessSessionTests: XCTestCase {
+    func testCameraLockSynchronouslyRevokesStreamsAndReentryGetsFreshAuthorization() async throws {
+        let fixture = Fixture()
+        let arbiter = CameraStreamArbiter { _, _ in throw CameraStreamError.ended }
+        XCTAssertThrowsError(try fixture.session.authorizeStreams(arbiter))
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        let first = try fixture.session.authorizeStreams(arbiter)
+        XCTAssertTrue(first.isValid)
+        fixture.session.lock()
+        XCTAssertFalse(first.isValid, "No async teardown window permits new frames/acquisitions")
+        XCTAssertThrowsError(try fixture.session.authorizeStreams(arbiter))
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        let second = try fixture.session.authorizeStreams(arbiter)
+        XCTAssertTrue(second.isValid)
+        XCTAssertFalse(first === second)
+        fixture.session.lock()
+        await arbiter.shutdown()
+    }
+
     func testMissingCredentialsAuthenticateWithoutKeychainDataRead() async {
         let fixture = Fixture()
         fixture.session.enter()
@@ -26,17 +46,19 @@ final class CameraAccessSessionTests: XCTestCase {
         XCTAssertTrue(fixture.store.loads.first === fixture.authenticator.attempts.first)
     }
 
-    func testNotAvailableAllowsOnlyOptionalBranch() async {
-        for presence in [CameraS3CredentialPresence.missing, .unprotected, .biometricProtected] {
+    func testNotAvailableAllowsCameraPageButNeverReadsProtectedCredentials() async {
+        for presence in [CameraS3CredentialPresence.missing, .unprotected, .biometricProtected, .authenticationRequired] {
             let fixture = Fixture(presence: presence)
             fixture.authenticator.failure = .biometryNotAvailable
             fixture.session.enter()
             await waitUntil { !fixture.session.isAuthenticating }
-            XCTAssertEqual(fixture.session.isUnlocked, presence != .biometricProtected)
+            XCTAssertTrue(fixture.session.isUnlocked)
             XCTAssertEqual(fixture.store.loads.count, presence == .unprotected ? 1 : 0)
-            if presence == .biometricProtected {
+            XCTAssertNil(fixture.session.errorMessage)
+            if presence == .biometricProtected || presence == .authenticationRequired {
                 XCTAssertNil(fixture.session.unlockedCredentials)
-                XCTAssertNotNil(fixture.session.errorMessage)
+                XCTAssertNotNil(fixture.session.credentialErrorMessage)
+                XCTAssertTrue(fixture.session.canRetrySavedCredentials)
             }
         }
     }
@@ -44,36 +66,188 @@ final class CameraAccessSessionTests: XCTestCase {
     func testCancellationFailureEnrollmentAndLockoutNeverPermitOptionalEntry() async {
         for error in [CameraAccessError.authenticationCancelled, .authenticationFailed,
                       .biometryNotEnrolled, .biometryLockout, .authenticationUnavailable] {
-            let fixture = Fixture()
-            fixture.authenticator.failure = error
-            fixture.session.enter()
-            await waitUntil { !fixture.session.isAuthenticating }
-            XCTAssertFalse(fixture.session.isUnlocked, "\(error)")
-            XCTAssertTrue(fixture.store.loads.isEmpty)
-            XCTAssertNotNil(fixture.session.errorMessage)
+            for presence in [CameraS3CredentialPresence.missing, .unprotected, .biometricProtected, .authenticationRequired] {
+                let fixture = Fixture(presence: presence)
+                fixture.authenticator.failure = error
+                fixture.session.enter()
+                await waitUntil { !fixture.session.isAuthenticating }
+                XCTAssertFalse(fixture.session.isUnlocked, "\(error), \(presence)")
+                XCTAssertTrue(fixture.store.loads.isEmpty)
+                XCTAssertEqual(fixture.authenticator.attempts.count, 1, "Never start a second prompt automatically")
+                XCTAssertNotNil(fixture.session.errorMessage)
+            }
         }
     }
 
-    func testInspectionErrorNeverBecomesMissingOrStartsAnOptionalPrompt() async {
+    func testInteractionNotAllowedPreflightReachesAuthenticationAndReadsExistingCredentials() async throws {
+        // Reproduce the physical-device response that the simulator's real
+        // Keychain fixture did not produce. Exercise the actual classifier.
+        let presence = try CameraKeychainCredentialStore.presence(status: errSecInteractionNotAllowed, attributes: nil)
+        let fixture = Fixture(presence: presence)
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        XCTAssertEqual(presence, .authenticationRequired)
+        XCTAssertTrue(fixture.session.isUnlocked)
+        XCTAssertEqual(fixture.session.unlockedCredentials, fixture.store.bundle)
+        XCTAssertEqual(fixture.authenticator.attempts.count, 1)
+        XCTAssertEqual(fixture.store.loads.count, 1)
+        XCTAssertTrue(fixture.store.loads.first === fixture.authenticator.attempts.first)
+        XCTAssertFalse(try XCTUnwrap(fixture.store.loads.first).context.interactionNotAllowed)
+        XCTAssertNil(fixture.session.errorMessage)
+        XCTAssertNil(fixture.session.credentialErrorMessage)
+        XCTAssertTrue(fixture.store.saved.isEmpty, "The existing credential is read, never replaced")
+    }
+
+    func testInspectionFailureStillRequiresUIAuthenticationAndKeepsS3Separate() async {
         let fixture = Fixture()
-        fixture.store.inspectionError = CameraAccessError.keychain(errSecInteractionNotAllowed)
+        fixture.store.inspectionError = CameraAccessError.keychain(errSecNotAvailable)
+        fixture.store.loadError = CameraAccessError.keychain(errSecNotAvailable)
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        XCTAssertTrue(fixture.session.isUnlocked)
+        XCTAssertEqual(fixture.authenticator.attempts.count, 1)
+        XCTAssertEqual(fixture.store.loads.count, 1)
+        XCTAssertNil(fixture.session.unlockedCredentials)
+        XCTAssertNil(fixture.session.errorMessage)
+        XCTAssertNotNil(fixture.session.credentialErrorMessage)
+        XCTAssertTrue(fixture.session.canRetrySavedCredentials)
+
+        fixture.session.lock()
+        fixture.authenticator.failure = .authenticationCancelled
         fixture.session.enter()
         await waitUntil { !fixture.session.isAuthenticating }
         XCTAssertFalse(fixture.session.isUnlocked)
-        XCTAssertTrue(fixture.authenticator.attempts.isEmpty)
-        XCTAssertTrue(fixture.store.loads.isEmpty)
-        XCTAssertNotNil(fixture.session.errorMessage)
+        XCTAssertEqual(fixture.authenticator.attempts.count, 2)
+        XCTAssertEqual(fixture.store.loads.count, 1, "A cancelled UI gate never attempts a credential read")
     }
 
-    func testProtectedReadFailureDoesNotFallBackEvenAfterAuthentication() async {
+    func testProtectedReadFailureRetainsSuccessfulUIAuthenticationWithoutAnotherPrompt() async {
         let fixture = Fixture(presence: .biometricProtected)
         fixture.store.loadError = CameraAccessError.keychain(errSecItemNotFound)
         fixture.session.enter()
         await waitUntil { !fixture.session.isAuthenticating }
-        XCTAssertFalse(fixture.session.isUnlocked)
+        XCTAssertTrue(fixture.session.isUnlocked)
         XCTAssertNil(fixture.session.unlockedCredentials)
         XCTAssertEqual(fixture.authenticator.attempts.count, 1)
-        XCTAssertNotNil(fixture.session.errorMessage)
+        XCTAssertNil(fixture.session.errorMessage)
+        XCTAssertNotNil(fixture.session.credentialErrorMessage)
+        XCTAssertFalse(fixture.session.credentialErrorMessage?.contains("Cameras remain locked") ?? true)
+        XCTAssertTrue(fixture.session.canRetrySavedCredentials)
+    }
+
+    func testSavedCredentialRetryUsesBiometricsWithoutRelockingCamerasOrWritingAnything() async throws {
+        let fixture = Fixture(presence: .authenticationRequired)
+        fixture.store.loadError = CameraAccessError.keychain(errSecInteractionNotAllowed)
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        XCTAssertTrue(fixture.session.canRetrySavedCredentials)
+        fixture.store.loadError = nil
+        try await fixture.session.unlockCredentials()
+        XCTAssertTrue(fixture.session.isUnlocked)
+        XCTAssertEqual(fixture.session.unlockedCredentials, fixture.store.bundle)
+        XCTAssertFalse(fixture.session.canRetrySavedCredentials)
+        XCTAssertNil(fixture.session.credentialErrorMessage)
+        XCTAssertEqual(fixture.authenticator.attempts.count, 2)
+        XCTAssertTrue(fixture.store.loads.last === fixture.authenticator.attempts.last)
+        XCTAssertFalse(fixture.authenticator.attempts[0] === fixture.authenticator.attempts[1])
+        XCTAssertTrue(fixture.store.saved.isEmpty)
+    }
+
+    func testCancelledOrUnavailableCredentialRetryDoesNotRevokeCameraAccessOrReadSecrets() async {
+        let fixture = Fixture(presence: .biometricProtected)
+        fixture.authenticator.failure = .biometryNotAvailable
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        for error in [CameraAccessError.biometryNotAvailable, .authenticationCancelled, .authenticationFailed] {
+            fixture.authenticator.failure = error
+            do { try await fixture.session.unlockCredentials(); XCTFail("S3 must still require biometrics") }
+            catch { XCTAssertEqual(error as? CameraAccessError, fixture.authenticator.failure) }
+            XCTAssertTrue(fixture.session.isUnlocked)
+            XCTAssertNil(fixture.session.unlockedCredentials)
+            XCTAssertTrue(fixture.store.loads.isEmpty)
+            XCTAssertNil(fixture.session.errorMessage)
+            XCTAssertNotNil(fixture.session.credentialErrorMessage)
+        }
+    }
+
+    func testLateCredentialReadCannotUnlockAfterBackgroundOrSectionExit() async {
+        let fixture = Fixture(presence: .authenticationRequired)
+        fixture.store.suspendsLoad = true
+        fixture.session.enter()
+        await waitUntil { fixture.store.pendingLoads.count == 1 }
+        fixture.session.lock()
+        fixture.store.finishLoad()
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertFalse(fixture.session.isUnlocked)
+        XCTAssertNil(fixture.session.unlockedCredentials)
+        XCTAssertNil(fixture.session.credentialErrorMessage)
+        XCTAssertNil(fixture.session.errorMessage)
+    }
+
+    func testLockDuringExplicitCredentialRetryDoesNotRepublishSecrets() async {
+        let fixture = Fixture(presence: .authenticationRequired)
+        fixture.authenticator.failure = .biometryNotAvailable
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        fixture.authenticator.failure = nil
+        fixture.store.suspendsLoad = true
+        let retry = Task { try await fixture.session.unlockCredentials() }
+        await waitUntil { fixture.store.pendingLoads.count == 1 }
+        fixture.session.lock()
+        fixture.store.finishLoad()
+        do { try await retry.value; XCTFail("Stale retry must not succeed") }
+        catch { XCTAssertEqual(error as? CameraAccessError, .sessionClosed) }
+        XCTAssertFalse(fixture.session.isUnlocked)
+        XCTAssertNil(fixture.session.unlockedCredentials)
+        XCTAssertNil(fixture.session.credentialErrorMessage)
+    }
+
+    func testConcurrentCredentialRetriesDoNotOverlapAuthentication() async throws {
+        let fixture = Fixture(presence: .authenticationRequired)
+        fixture.authenticator.failure = .biometryNotAvailable
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        fixture.authenticator.failure = nil
+        fixture.authenticator.suspends = true
+        let retry = Task { try await fixture.session.unlockCredentials() }
+        await waitUntil { fixture.authenticator.pending.count == 1 }
+        do { try await fixture.session.unlockCredentials(); XCTFail("Duplicate prompt") }
+        catch { XCTAssertEqual(error as? CameraAccessError, .authenticationInProgress) }
+        XCTAssertEqual(fixture.authenticator.attempts.count, 2)
+        fixture.authenticator.finishNext()
+        try await retry.value
+        XCTAssertEqual(fixture.store.loads.count, 1)
+    }
+
+    func testUnavailableUIWithUnknownKeychainStateNeverAttemptsCredentialRead() async {
+        let fixture = Fixture()
+        fixture.store.inspectionError = CameraAccessError.keychain(errSecNotAvailable)
+        fixture.authenticator.failure = .biometryNotAvailable
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        XCTAssertTrue(fixture.session.isUnlocked)
+        XCTAssertTrue(fixture.session.canRetrySavedCredentials)
+        XCTAssertNil(fixture.session.unlockedCredentials)
+        XCTAssertTrue(fixture.store.loads.isEmpty)
+        XCTAssertEqual(fixture.authenticator.attempts.count, 1)
+    }
+
+    func testCancellingCredentialRetryCannotPublishLateReadButKeepsUIUnlocked() async {
+        let fixture = Fixture(presence: .authenticationRequired)
+        fixture.authenticator.failure = .biometryNotAvailable
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        fixture.authenticator.failure = nil
+        fixture.store.suspendsLoad = true
+        let retry = Task { try await fixture.session.unlockCredentials() }
+        await waitUntil { fixture.store.pendingLoads.count == 1 }
+        retry.cancel()
+        fixture.store.finishLoad()
+        do { try await retry.value; XCTFail("Cancelled editor must not publish credentials") }
+        catch { XCTAssertEqual(error as? CameraAccessError, .sessionClosed) }
+        XCTAssertTrue(fixture.session.isUnlocked)
+        XCTAssertNil(fixture.session.unlockedCredentials)
+        XCTAssertFalse(fixture.session.isAuthenticating)
     }
 
     func testRepeatedEntryDoesNotRepeatCancelledPromptButUnlockDoes() async {
@@ -203,12 +377,15 @@ final class CameraAccessSessionTests: XCTestCase {
         let fixture = Fixture()
         fixture.store.inspectionError = NSError(domain: "test", code: 1,
             userInfo: [NSLocalizedDescriptionKey: "SECRET-ACCESS-KEY"])
+        fixture.store.loadError = fixture.store.inspectionError
         fixture.session.enter()
         await waitUntil { !fixture.session.isAuthenticating }
-        XCTAssertFalse(fixture.session.errorMessage?.contains("SECRET") ?? true)
+        XCTAssertTrue(fixture.session.isUnlocked)
+        XCTAssertNil(fixture.session.errorMessage)
+        XCTAssertFalse(fixture.session.credentialErrorMessage?.contains("SECRET") ?? true)
     }
 
-    func testUnknownMetadataAndAnyACLTakeMandatoryBranch() {
+    func testUnknownMetadataAndAnyACLRequireBiometricsForCredentials() {
         XCTAssertEqual(CameraKeychainCredentialStore.presence(for: [:]), .biometricProtected)
         XCTAssertEqual(CameraKeychainCredentialStore.presence(for: [kSecAttrGeneric as String: Data("future-format".utf8)]), .biometricProtected)
         let legacy: [String: Any] = [kSecAttrGeneric as String: CameraKeychainCredentialStore.unprotectedMarker]
@@ -263,6 +440,8 @@ private final class TestCredentialStore: CameraS3CredentialStoring {
     var inspectionError: Error?
     var loadError: Error?
     var loads: [CameraAuthenticationAttempt] = []
+    var suspendsLoad = false
+    var pendingLoads: [CheckedContinuation<Void, Never>] = []
     var saved: [CameraS3Credentials] = []
     var saveAttempts: [CameraAuthenticationAttempt] = []
     var suspendsSave = false
@@ -276,9 +455,11 @@ private final class TestCredentialStore: CameraS3CredentialStoring {
     }
     func load(using attempt: CameraAuthenticationAttempt) async throws -> CameraS3Credentials {
         loads.append(attempt)
+        if suspendsLoad { await withCheckedContinuation { pendingLoads.append($0) } }
         if let loadError { throw loadError }
         return bundle
     }
+    func finishLoad() { pendingLoads.removeFirst().resume() }
     func save(_ credentials: CameraS3Credentials, using attempt: CameraAuthenticationAttempt) async throws {
         saved.append(credentials)
         saveAttempts.append(attempt)

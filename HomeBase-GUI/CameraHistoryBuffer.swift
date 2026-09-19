@@ -46,7 +46,7 @@ nonisolated struct CameraHistoryBuffer {
             let expired = value.batch.gaps.filter { gap in
                 now - value.received >= (gap.end >= liveEdge - 60 ? 5 : 60)
             }
-            return value.batch.range.subtracting(expired)
+            return value.batch.range.subtracting(expired + value.batch.unresolved)
         })
     }
     func missing(_ range: CameraHistoryRange, now: Double, liveEdge: Double) -> [CameraHistoryRange] {
@@ -61,7 +61,7 @@ nonisolated struct CameraHistoryBuffer {
     func location(at position: Double, preferredPiece: UUID? = nil) -> Location? {
         var candidates: [Location] = []
         for value in batches.reversed() where value.batch.range.contains(position) {
-            guard !value.batch.gaps.contains(where: { $0.contains(position) }) else { continue }
+            guard !(value.batch.gaps + value.batch.unresolved).contains(where: { $0.contains(position) }) else { continue }
             for piece in value.batch.pieces where piece.segment.range.contains(position) {
                 guard let index = piece.samples.lastIndex(where: { $0.time(in: piece.segment) <= position + 0.000_001 }),
                       piece.samples[index].end(in: piece.segment) > position - 0.000_001 else { continue }

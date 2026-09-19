@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import HomeBaseProtocol
 import XCTest
 import SwiftUI
@@ -11,6 +12,60 @@ import AppKit
 /// recording intent, pairing, or server configuration, and never saves footage.
 @MainActor
 final class CameraLivePlaybackSmokeTests: XCTestCase {
+    func testStreamArbiterQualityHandoffKeepsPlayingThroughRealServer() async throws {
+        guard let url = ProcessInfo.processInfo.environment["HB_LIVE_PLAYBACK_SMOKE_URL"],
+              let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+            throw XCTSkip("Explicit live camera smoke opt-in required")
+        }
+        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        try await client.connect()
+        guard let camera = CameraVideoCatalog.cameras(in: try await client.listTopology().devices)
+            .first(where: { $0.capability.qualities.contains(.low) && $0.capability.qualities.contains(.high) }) else {
+            await client.disconnect(); throw XCTSkip("A camera with low and high streams is required")
+        }
+        let playback = CameraLivePlaybackController()
+        let model = CameraLiveVideoModel(deviceIdentifier: camera.device.addressableName, quality: .low,
+                                        client: client, playbackController: playback)
+        let stream = Task { await model.run() }
+        let preview = CameraLiveVideoModel(deviceIdentifier: camera.device.addressableName, quality: .low, client: client)
+        var previewTask: Task<Void, Never>?
+        var observer: AnyCancellable?
+        var interruptions: [CameraLiveVideoModel.State] = []
+        do {
+            try await eventually("Low-quality live stream becomes playable") {
+                model.state == .playing && playback.timeline.entries.count > 10
+            }
+            observer = model.$state.sink { if $0 != .playing { interruptions.append($0) } }
+            for quality in [HBCameraLiveQuality.high, .low] {
+                let epoch = playback.timeline.sourceEpoch
+                let bytes = playback.timeline.retainedBytes
+                await model.setQuality(quality)
+                try await eventually("Replacement quality reaches a keyframe") {
+                    playback.timeline.sourceEpoch > epoch && model.state == .playing && model.qualityWarning == nil
+                }
+                XCTAssertGreaterThan(playback.timeline.retainedBytes, bytes)
+                XCTAssertEqual(interruptions, [], "Quality switches must not show connecting/loading/black states")
+                XCTAssertNil(playback.errorMessage)
+            }
+            // Closing full screen then returning to a preview uses the warm
+            // subscription, not a second independently owned camera stream.
+            observer?.cancel(); observer = nil
+            stream.cancel(); await model.stop(); await stream.value
+            previewTask = Task { await preview.run() }
+            try await eventually("Preview joins the warm feed") { preview.state == .playing }
+            XCTAssertNotEqual(preview.renderer.layer.sampleBufferRenderer.status, .failed)
+            print("Stream arbiter smoke passed: low → high → low without playback interruption; warm preview handoff")
+        } catch {
+            print("Arbiter smoke diagnostics: state=\(model.state), warning=\(model.qualityWarning ?? "none"), frames=\(playback.timeline.entries.count), epoch=\(playback.timeline.sourceEpoch)")
+            observer?.cancel(); stream.cancel(); previewTask?.cancel()
+            await model.stop(); await preview.stop(); await stream.value; await previewTask?.value
+            playback.close(); await client.disconnect(); throw error
+        }
+        observer?.cancel(); stream.cancel(); previewTask?.cancel()
+        await model.stop(); await preview.stop(); await stream.value; await previewTask?.value
+        playback.close(); await client.disconnect()
+    }
+
     func testRealCameraFastPlaybackCatchesUpAtOneTimesWithoutGoingLive() async throws {
         guard let url = ProcessInfo.processInfo.environment["HB_LIVE_PLAYBACK_SMOKE_URL"],
               let endpoint = HomeBasePairingCode.endpoint(from: url) else {
@@ -87,7 +142,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
                             print("Preview visibility smoke: \(camera.device.displayName): \($0)")
                         })
                 }
-                // Independent lease: suspending previews must not suspend this player.
+                // Independent subscription: suspending previews must not suspend this player.
                 CameraLiveVideoPlayer(deviceIdentifier: fullScreenCamera.device.addressableName,
                     quality: fullScreenCamera.capability.fullScreenQuality, client: client,
                     allowsRetry: false, playbackController: playback,

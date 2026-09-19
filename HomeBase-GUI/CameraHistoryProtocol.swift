@@ -96,6 +96,9 @@ nonisolated struct CameraHistoryBatch: Sendable {
     let pieces: [CameraHistoryPiece]
     let gaps: [CameraHistoryRange]
     var neighbors: CameraHistoryNeighbors? = nil
+    /// Failed fallback is unknown coverage, not a confirmed recording gap.
+    var unresolved: [CameraHistoryRange] = []
+    var sourceWarning: String? = nil
     var bytes: Int { pieces.reduce(0) { $0 + $1.samples.reduce(0) { $0 + $1.data.count } } }
     var frameCount: Int { pieces.reduce(0) { $0 + $1.samples.count } }
 }

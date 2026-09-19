@@ -9,6 +9,35 @@ import UIKit
 
 @MainActor
 final class CameraAccessLifecycleTests: XCTestCase {
+    func testUnlockRecoveryAppearsOnlyAfterFailureAndHidesDuringRetry() async {
+        let auth = CameraPageTestAuthenticator(error: .authenticationCancelled)
+        let session = CameraAccessSession(credentials: CameraPageTestCredentials(), authenticator: auth)
+        func presentation() -> CameraAccessPresentation {
+            .init(session: session, isAuthorized: session.isUnlocked, isUnlocked: session.isUnlocked,
+                  isAuthenticating: session.isAuthenticating, errorMessage: session.errorMessage)
+        }
+        XCTAssertFalse(presentation().showsUnlockRecovery, "Initial entry is plain black")
+        session.enter()
+        XCTAssertFalse(presentation().showsUnlockRecovery, "No lock or retry while authenticating")
+        await settle(session)
+        XCTAssertTrue(presentation().showsUnlockRecovery, "Cancellation exposes recovery")
+        auth.error = nil
+        session.unlock()
+        XCTAssertFalse(presentation().showsUnlockRecovery, "Retry immediately hides lock and Unlock")
+        await settle(session)
+        XCTAssertTrue(session.isUnlocked)
+        XCTAssertFalse(presentation().showsUnlockRecovery)
+        session.lock()
+        XCTAssertFalse(presentation().showsUnlockRecovery, "A fresh locked session is not a failure")
+    }
+
+    func testTransientConcealmentAndStaleFailureNeverShowRecovery() {
+        XCTAssertFalse(CameraAccessPresentation(session: nil, isAuthorized: true, isUnlocked: false,
+            isAuthenticating: false, errorMessage: "Previous failure").showsUnlockRecovery)
+        XCTAssertFalse(CameraAccessPresentation(session: nil, isAuthorized: false, isUnlocked: false,
+            isAuthenticating: true, errorMessage: "Previous failure").showsUnlockRecovery)
+    }
+
     func testRepeatedAppearanceAndAdditionalCameraOwnersDoNotRepeatCancelledPrompt() async {
         let auth = CameraPageTestAuthenticator(error: .authenticationCancelled)
         let session = CameraAccessSession(credentials: CameraPageTestCredentials(), authenticator: auth)
@@ -106,11 +135,48 @@ final class CameraAccessLifecycleTests: XCTestCase {
     }
 
 #if os(iOS)
+    func testCameraOnlyUnlockOffersSavedCredentialRetry() async throws {
+        let auth = CameraPageTestAuthenticator(error: .biometryNotAvailable)
+        let session = CameraAccessSession(
+            credentials: CameraPageTestCredentials(presence: .biometricProtected), authenticator: auth)
+        session.enter()
+        await settle(session)
+        XCTAssertTrue(session.isUnlocked)
+        XCTAssertNil(session.unlockedCredentials)
+        XCTAssertTrue(session.canRetrySavedCredentials)
+        let destination = CameraS3Destination(store: .init(
+            id: "8EC120A6-5FF1-49E2-83CF-F7C2BCFF8A31", name: "Recording archive",
+            bucket: "example-recordings", region: "us-west-2", prefix: "hbnvr/example/"))
+        let host = UIHostingController(rootView: AnyView(
+            CameraS3CredentialsView(access: session, destination: destination)
+                .environment(\.scenePhase, .active).preferredColorScheme(.dark)))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        window.rootViewController = host
+        window.isHidden = false
+        defer {
+            host.rootView = AnyView(Color.clear)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        host.view.frame = window.bounds
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(200))
+        attachSnapshot(host, name: "Camera viewing unlocked with saved S3 credentials retry")
+        XCTAssertEqual(auth.calls, 1, "Opening the form must not automatically loop authentication")
+        host.rootView = AnyView(Color.clear)
+        host.view.layoutIfNeeded()
+        window.isHidden = true
+        window.rootViewController = nil
+        try await Task.sleep(for: .milliseconds(200))
+        withExtendedLifetime(session) { XCTAssertTrue(session.isUnlocked) }
+        withExtendedLifetime(auth) { XCTAssertEqual(auth.calls, 1) }
+    }
+
     func testLockedCameraChipsAndS3AccessNativePresentationSnapshots() async throws {
         let auth = CameraPageTestAuthenticator(error: .authenticationCancelled)
         let session = CameraAccessSession(credentials: CameraPageTestCredentials(), authenticator: auth)
-        session.enter()
-        await settle(session)
         let client = HomeBaseWebSocketClient(endpoint: try XCTUnwrap(
             HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1")))
         let cameras = CameraVideoCatalog.cameras(in: [
@@ -123,7 +189,7 @@ final class CameraAccessLifecycleTests: XCTestCase {
             VideoView(cameras: cameras, client: client)
                 .environment(\.cameraAccessSession, session)
                 .environment(\.scenePhase, .active)
-                .preferredColorScheme(.dark)))
+                .preferredColorScheme(.light)))
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
@@ -135,6 +201,12 @@ final class CameraAccessLifecycleTests: XCTestCase {
             window.rootViewController = nil
         }
         host.view.frame = window.bounds
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(auth.calls, 0)
+        attachSnapshot(host, name: "Initial camera chips are plain black without lock or Unlock")
+        session.enter()
+        await settle(session)
         host.view.layoutIfNeeded()
         try await Task.sleep(for: .milliseconds(200))
         XCTAssertFalse(session.isUnlocked)
@@ -242,7 +314,7 @@ final class CameraAccessLifecycleTests: XCTestCase {
 @MainActor
 private final class CameraPageTestAuthenticator: CameraBiometricAuthenticating {
     var calls = 0
-    let error: CameraAccessError?
+    var error: CameraAccessError?
     init(error: CameraAccessError? = nil) { self.error = error }
     func authenticate(using attempt: CameraAuthenticationAttempt) async throws {
         calls += 1

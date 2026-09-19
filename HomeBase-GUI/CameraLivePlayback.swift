@@ -13,8 +13,8 @@ enum CameraPlaybackHistoryAvailability {
     static func isAvailable(in metadata: [String: HBJSONValue]) -> Bool {
         guard let value = metadata[HBDeviceMetadataKeys.cameraPlayback],
               let history = try? value.decoded(HBCameraPlaybackMetadata.self) else { return false }
-        return history.available && history.provider == "hbnvr"
-            && !history.stores.isEmpty
+        return ((history.available && !history.stores.isEmpty) || history.s3Store?.playbackManifestVersion == 1)
+            && history.provider == "hbnvr"
             && UUID(uuidString: history.cameraID) != nil
             && history.transport == "websocket" && history.endpoint == "sameAsControl"
             && history.subprotocol == "homebase.v2"
@@ -309,6 +309,9 @@ final class CameraLivePlaybackController: ObservableObject {
     private var isClosed = false
     private var isSuspended = false
     private var historyIdentity: String?
+    private var historyCapability: HBCameraPlaybackMetadata?
+    private var historyCredentials: CameraS3Credentials?
+    private var historyGeneration = UUID()
     private var historyTransport: (any CameraHistoryFetching)?
     private var historyPreparation: Task<Void, Never>?
     private var historyPiece: UUID?
@@ -419,23 +422,31 @@ final class CameraLivePlaybackController: ObservableObject {
     }
 
     /// Called on screen entry and capability changes, before any rewind gesture.
-    func prepareHistory(metadata: [String: HBJSONValue], client: HomeBaseWebSocketClient) {
+    func prepareHistory(metadata: [String: HBJSONValue], client: HomeBaseWebSocketClient,
+                        credentials: CameraS3Credentials? = nil) {
         guard !isClosed, !isSuspended else { return }
         let capability = CameraPlaybackHistoryAvailability.metadata(in: metadata)
         setNVRHistoryAvailable(capability != nil)
         guard let capability else { return }
         let identity = capability.nvrInstanceID + "/" + capability.cameraID
-        guard identity != historyIdentity || (historyTransport == nil && historyPreparation == nil) else { return }
-        if identity != historyIdentity { history.close(); resetHistoryPresentation() }
+        guard identity != historyIdentity || capability != historyCapability || credentials != historyCredentials
+            || (historyTransport == nil && historyPreparation == nil) else { return }
+        let replacing = identity == historyIdentity
+        if !replacing { history.close(); resetHistoryPresentation() }
         historyIdentity = identity
+        historyCapability = capability; historyCredentials = credentials
+        let generation = UUID(); historyGeneration = generation
         historyPreparation?.cancel()
+        // Stop the previous authenticated reader before publishing a replacement.
+        history.disconnect(); historyTransport = nil
         historyPreparation = Task { [weak self] in
-            let transport = await client.makeHistoryTransport()
-            guard let self, !self.isClosed, !Task.isCancelled, self.historyIdentity == identity else {
+            let transport = await CameraHistorySources.make(metadata: capability, client: client, credentials: credentials)
+            guard let self, !self.isClosed, !Task.isCancelled, self.historyGeneration == generation else {
                 await transport.close(); return
             }
             self.historyTransport = transport
-            self.history.configure(cameraID: capability.cameraID, transport: transport)
+            if replacing { self.history.replaceSource(cameraID: capability.cameraID, transport: transport) }
+            else { self.history.configure(cameraID: capability.cameraID, transport: transport) }
             self.publishState()
             if self.mode == .playing {
                 self.lastTick = self.clock()
@@ -472,7 +483,18 @@ final class CameraLivePlaybackController: ObservableObject {
         pauseForInterruption()
         historyPreparation?.cancel(); historyPreparation = nil
         history.disconnect(); historyTransport = nil
+        historyCredentials = nil
         cancelTasks()
+    }
+
+    /// An authentication lock is stronger than a transient scene interruption.
+    /// Preserve only the paused cursor, never decrypted cloud samples or keys.
+    func revokeCameraAccess() {
+        suspend()
+        timeline.discardBuffer()
+        history.trimForMemoryPressure()
+        renderer.reset()
+        publishState()
     }
 
     /// Reconnect collection separately from playback. Non-live playback stays
@@ -486,11 +508,12 @@ final class CameraLivePlaybackController: ObservableObject {
 
     func configure(
         _ configuration: HBMediaStreamConfiguration,
-        ownerID: UUID
+        ownerID: UUID,
+        preservingDisplayedImage: Bool = false
     ) throws -> CMVideoFormatDescription {
         guard !isClosed else { throw CancellationError() }
         if !history.isActive { cancelTasks() }
-        let description = try renderer.configure(configuration, removingDisplayedImage: !isPaused,
+        let description = try renderer.configure(configuration, removingDisplayedImage: !isPaused && !preservingDisplayedImage,
                                                   updateRenderer: !history.isActive)
         self.ownerID = ownerID
         timeline.configure(
@@ -507,7 +530,7 @@ final class CameraLivePlaybackController: ObservableObject {
     }
 
     func receive(_ frame: HBMediaFrame, ownerID: UUID) throws -> CMSampleBuffer? {
-        guard self.ownerID == ownerID,
+        guard !isClosed, !isSuspended, self.ownerID == ownerID,
               frame.generation == timeline.generation else { return nil }
         guard CameraH264Renderer.isValidAVCCAccessUnit(frame.payload) else {
             throw CameraH264Renderer.RendererError.invalidAccessUnit
@@ -645,7 +668,7 @@ final class CameraLivePlaybackController: ObservableObject {
         isClosed = true
         cancelTasks()
         historyPreparation?.cancel(); historyPreparation = nil
-        history.close(); historyTransport = nil
+        history.close(); historyTransport = nil; historyCredentials = nil; historyCapability = nil
         followGroupSpeed(.normal)
         self.ownerID = nil
         timeline.reset()

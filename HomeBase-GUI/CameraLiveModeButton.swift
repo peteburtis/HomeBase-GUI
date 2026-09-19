@@ -2,6 +2,9 @@ import SwiftUI
 
 /// Native toolbar styling owns the glass, sizing, and foreground contrast.
 struct CameraLiveModeButton: View {
+#if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+#endif
     let isLive: Bool
     let action: () -> Void
 
@@ -22,16 +25,28 @@ struct CameraLiveModeButton: View {
 
     private var button: some View {
         Button(action: returnToLive) {
-            // Toolbars hide standard Label titles even with .titleAndIcon.
-            // Compose only the content; leave all button styling native.
-            HStack {
+            if showsTitle {
+                // iOS 26 toolbars hide Label titles even with .titleAndIcon.
+                // Compose only the regular-width label; sizing stays native.
+                HStack {
+                    Image(systemName: systemImage)
+                    Text("Live")
+                }
+            } else {
                 Image(systemName: systemImage)
-                Text("Live")
             }
         }
         .accessibilityLabel("Live")
         .accessibilityValue(isLive ? "Live" : "Not live")
         .accessibilityHint(isLive ? "Already playing live" : "Returns to live playback")
+    }
+
+    private var showsTitle: Bool {
+#if os(iOS)
+        horizontalSizeClass != .compact
+#else
+        true
+#endif
     }
 
     func returnToLive() {
@@ -40,13 +55,22 @@ struct CameraLiveModeButton: View {
     }
 }
 
-enum CameraPlaybackToolbarMetrics {
-    static let separation: CGFloat = 24
+/// Let the toolbar provide the dismissal button's label, sizing, and glass.
+struct CameraPlayerCloseButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(role: .close, action: action)
+            .accessibilityLabel("Close live video")
+            .accessibilityIdentifier("camera.close")
+    }
 }
 
-/// Timeline visibility never changes the leading playback controls. Native
-/// grouping gives the three shuttle buttons one shared glass capsule.
+/// Native toolbar items retain system sizing, glass, and adaptation.
 struct CameraPlaybackToolbar<Back: View, Pause: View, Forward: View, Speed: View>: ToolbarContent {
+#if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+#endif
     let isLive: Bool
     let playbackEnabled: Bool
     let close: () -> Void
@@ -56,6 +80,14 @@ struct CameraPlaybackToolbar<Back: View, Pause: View, Forward: View, Speed: View
     let forward: Forward
     let speed: Speed
 
+    private var usesCompactOverflow: Bool {
+#if os(iOS)
+        horizontalSizeClass == .compact
+#else
+        false
+#endif
+    }
+
     private var placement: ToolbarItemPlacement {
 #if os(iOS)
         .topBarLeading
@@ -64,24 +96,46 @@ struct CameraPlaybackToolbar<Back: View, Pause: View, Forward: View, Speed: View
 #endif
     }
 
+    private var speedPlacement: ToolbarItemPlacement {
+#if os(iOS)
+        usesCompactOverflow ? .topBarTrailing : placement
+#else
+        placement
+#endif
+    }
+
     @ToolbarContentBuilder var body: some ToolbarContent {
         ToolbarItem(placement: placement) {
-            CameraPlayerCloseButton(separatesPlayback: true, action: close)
-        }
-        .sharedBackgroundVisibility(.hidden)
-        ToolbarItemGroup(placement: placement) {
-            back.disabled(!playbackEnabled)
-            pause.disabled(!playbackEnabled)
-            forward.disabled(!playbackEnabled)
+            CameraPlayerCloseButton(action: close)
         }
         ToolbarSpacer(.fixed, placement: placement)
+        if usesCompactOverflow {
+            ToolbarItem(placement: placement) { pause.disabled(!playbackEnabled) }
+        } else {
+            ToolbarItemGroup(placement: placement) {
+                back.disabled(!playbackEnabled)
+                pause.disabled(!playbackEnabled)
+                forward.disabled(!playbackEnabled)
+            }
+        }
+        if !usesCompactOverflow { ToolbarSpacer(.fixed, placement: placement) }
         ToolbarItem(placement: placement) {
             CameraLiveModeButton(isLive: isLive, action: goLive)
                 .disabled(!playbackEnabled)
         }
         if !isLive {
-            ToolbarSpacer(.fixed, placement: placement)
-            ToolbarItem(placement: placement) { speed.disabled(!playbackEnabled) }
+            if !usesCompactOverflow { ToolbarSpacer(.fixed, placement: placement) }
+            ToolbarItem(placement: speedPlacement) { speed.disabled(!playbackEnabled) }
+        }
+        if usesCompactOverflow {
+            // iOS 26 compatibility: deliberately put the less-frequent actions
+            // in the system overflow menu in compact width. When adopting iOS 27,
+            // replace this size-class workaround with its toolbar overflow and
+            // visibility-priority APIs (and keep this fallback for iOS 26).
+            ToolbarItemGroup(placement: .secondaryAction) {
+                back.disabled(!playbackEnabled)
+                forward.disabled(!playbackEnabled)
+            }
         }
     }
 }

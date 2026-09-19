@@ -95,7 +95,7 @@ enum CameraLiveQualityPresentation {
     }
 }
 
-private nonisolated final class HomeBaseMediaConnection: @unchecked Sendable {
+nonisolated final class HomeBaseMediaConnection: @unchecked Sendable {
     enum ConnectionError: Error, LocalizedError {
         case invalidPort
         case invalidServerMessage(String)
@@ -533,7 +533,7 @@ final class CameraH264Renderer: ObservableObject {
         waitingForKeyframe = true
     }
 
-    static func isValidAVCCAccessUnit(_ data: Data) -> Bool {
+    nonisolated static func isValidAVCCAccessUnit(_ data: Data) -> Bool {
         guard data.count >= 5 else { return false }
         var offset = 0
         var nalCount = 0
@@ -566,17 +566,18 @@ final class CameraLiveVideoModel: ObservableObject {
 
     @Published private(set) var state: State = .idle
     @Published private(set) var aspectRatio: CGFloat = 16 / 9
+    @Published private(set) var qualityWarning: String?
 
     let renderer: CameraH264Renderer
 
     private let deviceIdentifier: String
-    private let quality: HBCameraLiveQuality
+    private var quality: HBCameraLiveQuality
     private let client: HomeBaseWebSocketClient
     private let recordingController: CameraLocalRecordingController?
     private let playbackController: CameraLivePlaybackController?
     private let recordingOwnerID = UUID()
-    private var mediaConnection: HomeBaseMediaConnection?
-    private var streamID: UUID?
+    private var arbiter: CameraStreamArbiter?
+    private var subscription: CameraStreamSubscription?
     private var runToken: UUID?
 
     init(
@@ -594,43 +595,46 @@ final class CameraLiveVideoModel: ObservableObject {
         self.renderer = playbackController?.renderer ?? CameraH264Renderer()
     }
 
-    func run() async {
+    func setQuality(_ quality: HBCameraLiveQuality) async {
+        self.quality = quality
+        if let arbiter, let subscription { await arbiter.update(subscription, quality: quality) }
+    }
+
+    func run(access: CameraAccessSession? = nil) async {
         guard state == .idle, !Task.isCancelled else { return }
         let token = UUID()
         runToken = token
         state = .connecting
-        var ownedConnection: HomeBaseMediaConnection?
-        var ownedStreamID: UUID?
+        qualityWarning = nil
+        var ownedArbiter: CameraStreamArbiter?
+        var ownedSubscription: CameraStreamSubscription?
 
         do {
             try await client.reactivate()
             try Task.checkCancellation()
             guard runToken == token else { throw CancellationError() }
-            let lease = try await client.openCameraLiveStream(
-                deviceIdentifier: deviceIdentifier,
-                quality: quality
-            )
-            // A preview can be covered while its lease is still opening.
-            // Do not abandon that lease, or let it replace a newer run's lease.
-            guard !Task.isCancelled, runToken == token else {
-                try? await client.closeCameraLiveStream(lease.opened.streamID)
-                throw CancellationError()
-            }
-            streamID = lease.opened.streamID
-            ownedStreamID = lease.opened.streamID
-
-            let connection = try HomeBaseMediaConnection(
-                host: lease.mediaHost,
-                port: lease.opened.mediaPort
-            )
-            mediaConnection = connection
-            ownedConnection = connection
-            let frames = try connection.frames(ticket: lease.opened.ticket)
-            for try await frame in frames {
+            let shared = await client.cameraStreamArbiter()
+            guard runToken == token else { throw CancellationError() }
+            let authorization = try access?.authorizeStreams(shared)
+            let acquired = try await shared.subscribe(camera: deviceIdentifier, quality: quality, authorization: authorization)
+            ownedArbiter = shared; ownedSubscription = acquired
+            try Task.checkCancellation()
+            guard runToken == token else { throw CancellationError() }
+            arbiter = shared; subscription = acquired
+            // A quality selection may have changed during the acquire.
+            await shared.update(acquired, quality: quality)
+            events: for try await event in acquired.events {
                 try Task.checkCancellation()
                 guard runToken == token else { break }
-                let shouldContinue = try await consume(frame)
-                if !shouldContinue { break }
+                guard authorization?.isValid != false else { throw CancellationError() }
+                switch event {
+                case .qualityWarning(let message): qualityWarning = message
+                case .frames(let frames):
+                    for frame in frames {
+                        guard runToken == token, !Task.isCancelled, authorization?.isValid != false else { break events }
+                        if try await !consume(frame) { break events }
+                    }
+                }
             }
             if !Task.isCancelled, runToken == token {
                 switch state {
@@ -648,10 +652,7 @@ final class CameraLiveVideoModel: ObservableObject {
             }
         }
 
-        await releaseLease(
-            connection: ownedConnection,
-            streamID: ownedStreamID
-        )
+        await releaseSubscription(ownedSubscription, from: ownedArbiter)
         if runToken == token {
             playbackController?.stop(ownerID: recordingOwnerID)
             runToken = nil
@@ -659,15 +660,14 @@ final class CameraLiveVideoModel: ObservableObject {
         }
     }
 
-    func stop() async {
+    func stop(immediately: Bool = false) async {
         runToken = nil
         playbackController?.stop(ownerID: recordingOwnerID)
         // Publish the stopped state before awaiting network cleanup, so an old
         // stop cannot overwrite a newer run after a quick dismissal/reopen.
         state = .idle
-        let connection = mediaConnection
-        let streamID = streamID
-        await releaseLease(connection: connection, streamID: streamID)
+        qualityWarning = nil
+        await releaseSubscription(subscription, from: arbiter, immediately: immediately)
         await recordingController?.streamDidEnd(ownerID: recordingOwnerID)
     }
 
@@ -678,7 +678,11 @@ final class CameraLiveVideoModel: ObservableObject {
                 HBMediaStreamStatus.self,
                 from: frame.payload
             )
-            state = .waiting(Self.statusText(status))
+            // Older servers can reconfigure their shared source even while a
+            // replacement is warming. Never blank a previously playing image.
+            if state != .playing || status.state != .reconfiguring {
+                state = .waiting(Self.statusText(status))
+            }
         case .streamConfiguration:
             let configuration = try JSONDecoder().decode(
                 HBMediaStreamConfiguration.self,
@@ -693,10 +697,10 @@ final class CameraLiveVideoModel: ObservableObject {
             let formatDescription: CMVideoFormatDescription
             if let playbackController {
                 formatDescription = try playbackController.configure(
-                    configuration, ownerID: recordingOwnerID
+                    configuration, ownerID: recordingOwnerID, preservingDisplayedImage: true
                 )
             } else {
-                formatDescription = try renderer.configure(configuration)
+                formatDescription = try renderer.configure(configuration, removingDisplayedImage: false)
             }
             await recordingController?.configure(
                 ownerID: recordingOwnerID,
@@ -707,7 +711,7 @@ final class CameraLiveVideoModel: ObservableObject {
                 aspectRatio = CGFloat(configuration.width)
                     / CGFloat(configuration.height)
             }
-            state = .waiting("Waiting for video…")
+            if state != .playing { state = .waiting("Waiting for video…") }
         case .videoAccessUnit:
             let sampleBuffer: CMSampleBuffer?
             if let playbackController {
@@ -742,15 +746,14 @@ final class CameraLiveVideoModel: ObservableObject {
         return true
     }
 
-    private func releaseLease(
-        connection: HomeBaseMediaConnection?,
-        streamID: UUID?
+    private func releaseSubscription(
+        _ owned: CameraStreamSubscription?,
+        from shared: CameraStreamArbiter?,
+        immediately: Bool = false
     ) async {
-        connection?.cancel()
-        if mediaConnection === connection { mediaConnection = nil }
-        guard let streamID, self.streamID == streamID else { return }
-        self.streamID = nil
-        try? await client.closeCameraLiveStream(streamID)
+        guard let owned, let shared else { return }
+        if subscription?.id == owned.id { subscription = nil; arbiter = nil }
+        await shared.unsubscribe(camera: owned.camera, id: owned.id, immediately: immediately)
     }
 
     private static func statusText(_ status: HBMediaStreamStatus) -> String {
@@ -799,12 +802,14 @@ enum CameraLiveVideoLifecycle {
 
 struct CameraLiveVideoPlayer: View {
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.cameraAccessSession) private var cameraAccessSession
     @StateObject private var model: CameraLiveVideoModel
     @State private var retryID = 0
     private let allowsRetry: Bool
     private let isStreamEnabled: Bool
     private let restartRequest: Int
     private let usesHistory: Bool
+    private let quality: HBCameraLiveQuality
     private let onStateChanged: ((CameraLiveVideoModel.State) -> Void)?
     private let onAspectRatioChanged: ((CGFloat) -> Void)?
 
@@ -832,6 +837,7 @@ struct CameraLiveVideoPlayer: View {
         self.isStreamEnabled = isStreamEnabled
         self.restartRequest = restartRequest
         self.usesHistory = usesHistory
+        self.quality = quality
         self.onStateChanged = onStateChanged
         self.onAspectRatioChanged = onAspectRatioChanged
     }
@@ -876,6 +882,16 @@ struct CameraLiveVideoPlayer: View {
         }
         .aspectRatio(model.aspectRatio, contentMode: .fit)
         .accessibilityLabel(usesHistory ? "Recorded camera video" : "Live camera video")
+        .overlay(alignment: .top) {
+            if !usesHistory, let warning = model.qualityWarning {
+                Text(warning).font(.caption).foregroundStyle(.white)
+                    .padding(6).background(.black.opacity(0.65), in: .rect(cornerRadius: 6))
+                    .padding().allowsHitTesting(false)
+            }
+        }
+        .onChange(of: quality, initial: true) { _, value in
+            Task { await model.setQuality(value) }
+        }
         .onChange(of: model.state, initial: true) { _, state in onStateChanged?(state) }
         .onChange(of: model.aspectRatio, initial: true) { _, ratio in onAspectRatioChanged?(ratio) }
         .task(id: CameraLiveVideoLifecycle.taskIdentity(
@@ -883,14 +899,14 @@ struct CameraLiveVideoPlayer: View {
             scenePhase: scenePhase,
             isStreamEnabled: isStreamEnabled
         )) {
-            // Presentation does not reliably remove the presenting view. Its
-            // preview must explicitly relinquish its independent media lease.
-            await model.stop()
+            // Covered previews relinquish their subscription; the arbiter
+            // keeps a short handoff grace period, except on background/lock.
+            await model.stop(immediately: scenePhase == .background)
             guard !Task.isCancelled,
                   !CameraLiveVideoLifecycle.isSuspended(
                     in: scenePhase, isStreamEnabled: isStreamEnabled
                   ) else { return }
-            await model.run()
+            await model.run(access: cameraAccessSession)
         }
         .onChange(of: restartRequest) { _, _ in
             guard isStreamEnabled, scenePhase == .active,
@@ -970,25 +986,6 @@ private struct CameraToolbarVisibility: ViewModifier {
 #else
         content
 #endif
-    }
-}
-
-/// Own the circular glass so trailing separation stays blank instead of
-/// stretching the toolbar's shared backing into an oversized Close pill.
-struct CameraPlayerCloseButton: View {
-    let separatesPlayback: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Label("Close Live Video", systemImage: "xmark")
-                .labelStyle(.iconOnly)
-                .frame(width: 44, height: 44)
-        }
-        .buttonStyle(.plain)
-        .cameraGlassBacker(in: Circle(), interactive: true)
-        .accessibilityLabel("Close live video")
-        .padding(.trailing, separatesPlayback ? CameraPlaybackToolbarMetrics.separation : 0)
     }
 }
 
@@ -1258,7 +1255,7 @@ struct CameraFullScreenLiveVideoView: View {
                 .toolbar {
                     if !access.isUnlocked {
                         ToolbarItem(placement: .cancellationAction) {
-                            Button("Close", systemImage: "xmark") { dismiss() }
+                            CameraPlayerCloseButton { dismiss() }
                         }
                     }
                 }
@@ -1271,6 +1268,9 @@ private struct CameraFullScreenCameraContent: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+#if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+#endif
 
     let client: HomeBaseWebSocketClient
     let access: CameraAccessPresentation
@@ -1341,7 +1341,7 @@ private struct CameraFullScreenCameraContent: View {
             ))
         .onAppear {
             if access.isAuthorized {
-                playbackController.prepareHistory(metadata: controlsModel.deviceMetadata, client: client)
+                playbackController.prepareHistory(metadata: controlsModel.deviceMetadata, client: client, credentials: access.session?.unlockedCredentials)
             } else { group.suspend() }
             applyInitialPositionIfAuthorized()
         }
@@ -1436,6 +1436,7 @@ private struct CameraFullScreenCameraContent: View {
         }
         .onChange(of: access.isAuthorized) { _, allowed in
             if !allowed {
+                group.sessions.forEach { $0.playback.revokeCameraAccess() }
                 s3Destination = nil
                 cameraPickerVisible = false
                 cameraSwitchTask?.cancel(); cameraSwitchTask = nil
@@ -1464,6 +1465,7 @@ private struct CameraFullScreenCameraContent: View {
             CameraGroupVideo(group: group, cameraControlsEnabled: cameraControlsEnabled,
                 controlsVisible: visiblePlayerControls,
                 isAccessAllowed: access.isAuthorized,
+                credentials: access.session?.unlockedCredentials,
                 onSingleTap: toggleControls)
 
             if visiblePlayerControls && panel == .ptz && panelAvailability.enablesPTZ {
@@ -1477,7 +1479,9 @@ private struct CameraFullScreenCameraContent: View {
                let metadata = CameraPlaybackHistoryAvailability.metadata(in: controlsModel.deviceMetadata) {
                 CameraTimelinePlacement(isMultiple: group.active) {
                     CameraTimelinePanel(isPresented: timelineVisible) {
-                        CameraHistoryTimeline(makeTransport: { await client.makeHistoryTransport() },
+                        CameraHistoryTimeline(makeTransport: {
+                            await CameraHistorySources.thumbnails(metadata: metadata, client: client, credentials: access.session?.unlockedCredentials)
+                        }, source: .init(metadata: metadata, credentials: access.session?.unlockedCredentials),
                             cameraID: metadata.cameraID, timeZone: playbackTimeZone,
                             position: { group.active ? group.positionForSwitch() : playbackController.positionForCameraSwitch(metadata: controlsModel.deviceMetadata) },
                             onBegin: {
@@ -1531,7 +1535,7 @@ private struct CameraFullScreenCameraContent: View {
         .animation(.snappy, value: controlsVisible)
         .animation(reduceMotion ? nil : .snappy, value: panel)
         .onChange(of: controlsModel.deviceMetadata, initial: true) { _, metadata in
-            if access.isAuthorized, !group.active { playbackController.prepareHistory(metadata: metadata, client: client) }
+            if access.isAuthorized, !group.active { playbackController.prepareHistory(metadata: metadata, client: client, credentials: access.session?.unlockedCredentials) }
         }
         .accessibilityActions {
             if isShowingVideo {
@@ -1544,27 +1548,40 @@ private struct CameraFullScreenCameraContent: View {
     @ToolbarContentBuilder
     private var cameraToolbar: some ToolbarContent {
         playbackToolbar
-        if !group.active {
+        // In compact width, playback speed takes Record's trailing place
+        // outside Live. Regular width still keeps the disabled Record button.
+        if !group.active, horizontalSizeClass != .compact || isLive {
             ToolbarItem(placement: .topBarTrailing) { recordingControl }
-            if hasLiveToolbarControls { ToolbarSpacer(.fixed, placement: .topBarTrailing) }
+            if horizontalSizeClass != .compact, hasLiveToolbarControls {
+                ToolbarSpacer(.fixed, placement: .topBarTrailing)
+            }
         }
         if showsQualityControl {
-            ToolbarItem(placement: .topBarTrailing) { qualityControl }
+            ToolbarItem(placement: cameraSettingsPlacement) { qualityControl }
         }
         if let dayNightModeControl {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItem(placement: cameraSettingsPlacement) {
                 dayNightModeControl
             }
         }
         if let privacyControl {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItem(placement: cameraSettingsPlacement) {
                 privacyControl
             }
         }
-        ToolbarSpacer(.fixed, placement: .topBarTrailing)
+        if horizontalSizeClass != .compact {
+            ToolbarSpacer(.fixed, placement: .topBarTrailing)
+        }
         ToolbarItem(placement: .topBarTrailing) {
             cameraPickerControl
         }
+    }
+
+    private var cameraSettingsPlacement: ToolbarItemPlacement {
+        // iOS 26 compact-width overflow policy, shared with the 30-second
+        // shuttles in CameraPlaybackToolbar. Record and camera selection stay
+        // primary. Adopt iOS 27's overflow/visibility-priority APIs when available.
+        horizontalSizeClass == .compact ? .secondaryAction : .topBarTrailing
     }
 #else
     @ToolbarContentBuilder
@@ -1600,7 +1617,7 @@ private struct CameraFullScreenCameraContent: View {
     private var cameraPickerControl: some View {
         Button { cameraPickerVisible = true } label: {
             if switchingCamera { ProgressView() }
-            else { Image(systemName: "list.bullet") }
+            else { Image(systemName: "rectangle.split.2x1") }
         }
         .accessibilityLabel("Choose camera")
         .accessibilityValue(group.active ? group.sessions.map { $0.camera.device.displayName }.joined(separator: ", ") : device.displayName)
@@ -1827,7 +1844,6 @@ private struct CameraFullScreenCameraContent: View {
             stopLiveCameraGestures()
             if group.active { group.seek(by: -30) } else { playbackController.seek(by: -30) }
         }
-        .labelStyle(.iconOnly)
         .disabled(group.active ? !group.canSeekBackward || group.resolvingTime : !playbackController.canSeekBackward)
     }
 
@@ -1846,7 +1862,6 @@ private struct CameraFullScreenCameraContent: View {
             guard playbackActionsEnabled else { return }
             if group.active { group.seek(by: 30) } else { playbackController.seek(by: 30) }
         }
-        .labelStyle(.iconOnly)
         .disabled(isLive || !canControlPlayback || group.resolvingTime)
     }
 
@@ -1899,7 +1914,7 @@ private struct CameraFullScreenCameraContent: View {
                 }
             }
         } label: {
-            Image(systemName: "slider.horizontal.3")
+            Label("Video quality", systemImage: "slider.horizontal.3")
         }
         .accessibilityLabel("Video quality")
         .accessibilityValue(

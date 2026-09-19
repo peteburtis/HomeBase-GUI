@@ -4,7 +4,7 @@ import SwiftUI
 
 /// Public destination metadata is not evidence that any recording exists.
 /// No AWS request is made by discovery, button presentation, or this editor.
-struct CameraS3Destination: Equatable, Identifiable {
+nonisolated struct CameraS3Destination: Equatable, Identifiable, Sendable {
     let store: HBCameraPlaybackMetadata.S3Store
 
     var id: String {
@@ -38,8 +38,11 @@ enum CameraS3AccessPolicy {
                             historyState: CameraHistoryPlayback.State,
                             resolvingTime: Bool, destination: CameraS3Destination?,
                             unlockedDestinationID: String?) -> Bool {
-        guard !isLive, !showsVideo, !resolvingTime, let destination,
-              destination.id != unlockedDestinationID else { return false }
+        guard !isLive, !showsVideo, !resolvingTime, let destination else { return false }
+        // A successful Keychain read is not proof AWS credentials/password work.
+        // Keep a route back to repair them when cloud playback reports an error.
+        if case .failed = historyState { return true }
+        guard destination.id != unlockedDestinationID else { return false }
         if case .loading = historyState { return false }
         // Includes confirmed gaps, local read errors and an exhausted live
         // buffer. None of these imply that S3 has (or lacks) the same footage.
@@ -63,8 +66,8 @@ struct CameraS3PadlockButton: View {
     }
 }
 
-/// Credential setup only. AWS reads/manifests are a later slice; don't claim
-/// that a successful Keychain save validated AWS permissions or found footage.
+/// Credential setup only. Reads happen after a local history miss, not as an
+/// editor side effect. Saving alone does not claim AWS access is valid.
 struct CameraS3CredentialsView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
@@ -75,12 +78,14 @@ struct CameraS3CredentialsView: View {
     @State private var encryptionPassword = ""
     @State private var errorMessage: String?
     @State private var saving = false
+    @State private var unlocking = false
     @State private var saved = false
     @State private var confirmingReplacement = false
     @State private var saveTask: Task<Void, Never>?
 
     private var canSave: Bool {
-        access.isUnlocked && !saving && !accessKeyID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        access.isUnlocked && !saving && !unlocking && !access.isAuthenticating
+            && !accessKeyID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !secretAccessKey.isEmpty
     }
 
@@ -95,11 +100,25 @@ struct CameraS3CredentialsView: View {
                 }
                 if saved {
                     Section {
-                        Label("Credentials saved on this device", systemImage: "checkmark.shield")
-                        Text("S3 video retrieval is not connected yet. Your AWS credentials have not been verified against S3, and no recording availability has been checked.")
+                        Label("S3 credentials unlocked", systemImage: "checkmark.shield")
+                        Text("S3 history will be tried when local video is unavailable. Saving credentials does not verify AWS access; playback reports any access or decryption errors.")
                             .foregroundStyle(.secondary)
                     }
                 } else {
+                    if access.canRetrySavedCredentials {
+                        Section("Saved credentials") {
+                            Text("Camera viewing is unlocked. You can retry your saved S3 credentials without entering them again.")
+                                .foregroundStyle(.secondary)
+                            if let message = access.credentialErrorMessage {
+                                Text(message).foregroundStyle(.secondary)
+                            }
+                            Button(unlocking ? "Unlocking…" : "Unlock saved credentials", systemImage: "lock.open") {
+                                unlockSavedCredentials()
+                            }
+                            .disabled(saving || unlocking || access.isAuthenticating)
+                            .accessibilityIdentifier("camera.s3.unlockSavedCredentials")
+                        }
+                    }
                     Section {
                         NavigationLink {
                             CameraS3IAMPolicyView(destination: destination)
@@ -118,9 +137,9 @@ struct CameraS3CredentialsView: View {
 #if os(iOS)
                     .textInputAutocapitalization(.never)
 #endif
-                    .disabled(saving)
+                    .disabled(saving || unlocking)
                     Section {
-                        Text("This step saves credentials securely. S3 playback and AWS credential validation are coming in a separate step.")
+                        Text("Playback reads the advertised store directly after trying local history. It does not upload your credentials to Homebase or HBNVR.")
                             .foregroundStyle(.secondary)
                     }
                     if let errorMessage {
@@ -136,7 +155,8 @@ struct CameraS3CredentialsView: View {
                 if !saved {
                     ToolbarItem(placement: .confirmationAction) {
                         Button(saving ? "Saving…" : "Save") {
-                            if let existing = access.unlockedCredentials, existing.destinationID != destination.id {
+                            if access.credentialPresence != .missing,
+                               access.unlockedCredentials?.destinationID != destination.id {
                                 confirmingReplacement = true
                             } else { save() }
                         }
@@ -163,6 +183,28 @@ struct CameraS3CredentialsView: View {
             if !unlocked { clear(); dismiss() }
         }
         .onDisappear(perform: clear)
+    }
+
+    private func unlockSavedCredentials() {
+        guard access.isUnlocked, !saving, !unlocking, !access.isAuthenticating else { return }
+        unlocking = true; errorMessage = nil
+        saveTask = Task {
+            do {
+                try await access.unlockCredentials()
+                try Task.checkCancellation()
+                if access.unlockedCredentials?.destinationID == destination.id {
+                    accessKeyID = ""; secretAccessKey = ""; encryptionPassword = ""
+                    saved = true
+                } else {
+                    errorMessage = "Your saved credentials belong to a different S3 store. You can replace them below."
+                }
+            } catch is CancellationError {
+            } catch {
+                // The session publishes a sanitized S3-specific error beside
+                // the retry action. Camera access stays authorized.
+            }
+            unlocking = false
+        }
     }
 
     private func save() {

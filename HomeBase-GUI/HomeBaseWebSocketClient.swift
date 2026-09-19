@@ -139,6 +139,7 @@ actor HomeBaseWebSocketClient {
     private var subscriptionSequences: [UUID: Int64] = [:]
     private var latestDeliverySequence: Int64 = 0
     private var acknowledgedDeliverySequence: Int64 = 0
+    private var liveStreamArbiter: CameraStreamArbiter?
 
     init(
         endpoint: HomeBaseEndpoint,
@@ -151,6 +152,8 @@ actor HomeBaseWebSocketClient {
     }
 
     deinit {
+        let arbiter = liveStreamArbiter
+        Task { await arbiter?.shutdown() }
         connectionAttempt?.cancel()
         receiveTask?.cancel()
         acknowledgementTask?.cancel()
@@ -159,6 +162,51 @@ actor HomeBaseWebSocketClient {
 
     func makeHistoryTransport() -> CameraHistoryTransport {
         CameraHistoryTransport(endpoint: endpoint, clientID: clientID, session: urlSession)
+    }
+
+    /// Call after reactivation so a failed old session cannot invalidate a new
+    /// subscription. All views on this client share these upstream leases.
+    func cameraStreamArbiter() -> CameraStreamArbiter {
+        if let liveStreamArbiter { return liveStreamArbiter }
+        let arbiter = CameraStreamArbiter { [weak self] camera, quality in
+            guard let self else { throw CameraStreamError.closed }
+            return try await self.openSharedCameraStream(camera, quality: quality)
+        }
+        liveStreamArbiter = arbiter
+        return arbiter
+    }
+
+    private func openSharedCameraStream(_ camera: String, quality: HBCameraLiveQuality) async throws -> CameraStreamUpstream {
+        try Task.checkCancellation()
+        let lease = try await openCameraLiveStream(deviceIdentifier: camera, quality: quality)
+        var connection: HomeBaseMediaConnection?
+        do {
+            try Task.checkCancellation()
+            let media = try HomeBaseMediaConnection(host: lease.mediaHost, port: lease.opened.mediaPort)
+            connection = media
+            let frames = try media.frames(ticket: lease.opened.ticket)
+            return CameraStreamUpstream(frames: frames, close: { [weak self] in
+                media.cancel()
+                await self?.releaseSharedCameraStream(lease.opened.streamID)
+            })
+        } catch {
+            connection?.cancel()
+            await releaseSharedCameraStream(lease.opened.streamID)
+            throw error
+        }
+    }
+
+    private func releaseSharedCameraStream(_ streamID: UUID) async {
+        // Retirement is normally cancelled. Cleanup needs an independent,
+        // bounded request lifetime; an absent acknowledgement must not occupy
+        // an arbiter slot forever. The media socket has already been closed.
+        let close = Task { try? await self.closeCameraLiveStream(streamID) }
+        let timeout = Task {
+            do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            close.cancel()
+        }
+        await close.value
+        timeout.cancel()
     }
 
     func connect() async throws {
@@ -937,7 +985,8 @@ actor HomeBaseWebSocketClient {
             operation: HBProtocolOperations.openCameraLiveStream,
             payload: HBCameraLiveOpenRequest(
                 deviceIdentifier: deviceIdentifier,
-                quality: quality
+                quality: quality,
+                isolatedQuality: true
             )
         )
         let response = try await sendRequest(request)
@@ -1867,6 +1916,9 @@ actor HomeBaseWebSocketClient {
         with error: Error,
         preservingSession requestedPreservation: Bool? = nil
     ) {
+        let oldArbiter = liveStreamArbiter
+        liveStreamArbiter = nil
+        Task { await oldArbiter?.shutdown() }
         let preserveSession = requestedPreservation
             ?? shouldPreserveSession(after: error)
         let hasResumeState = sessionID != nil

@@ -704,7 +704,7 @@ struct CameraPrivacyToolbarControl: View {
                 )
             }
         } label: {
-            Image(systemName:
+            Label("Privacy mode", systemImage:
                 CameraPrivacyButtonPresentation.systemImageName(
                     privacyEnabled: isOn
                 ))
@@ -754,7 +754,7 @@ struct CameraDayNightModeToolbarControl: View {
                 }
             }
         } label: {
-            Image(systemName: displayedMode.systemImageName)
+            Label("Day and night mode", systemImage: displayedMode.systemImageName)
         }
         .disabled(!isEnabled || target.control.isUpdating)
         .accessibilityLabel("Day and night mode")

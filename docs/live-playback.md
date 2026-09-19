@@ -7,17 +7,63 @@ setting remains authoritative.
 
 The full-screen camera player has a RAM-only live buffer. This is independent
 of NVR recording. A separate RAM cache retrieves local NVR history through
-HomeBase when playback leaves the live buffer. Neither cache uses media files or S3.
+HomeBase when playback leaves the live buffer, with direct S3 fallback when
+credentials are unlocked. Neither cache writes media files to disk.
 Buffering begins immediately when the full-screen player receives its first
 keyframe. It continues in Live, paused, and buffered-playback modes, retaining up
 to the most recent five minutes. It fills progressively; footage from before
-opening the player is not available in RAM. Grid previews do not retain a buffer.
+opening the player is generally not available in RAM, apart from the arbiter's
+small keyframe-led warm-join cache. Grid previews do not retain a playback buffer.
 
 Opening the full-screen player suspends all camera-grid preview streams (and
 the inline preview when opening from device details). Presentation state explicitly
-releases those previews' media leases even if SwiftUI keeps the covered views
-mounted. The full-screen player's own streams remain independent. Dismissing it
-reconnects the visible previews; backgrounded previews remain suspended.
+releases those previews' stream subscriptions even if SwiftUI keeps the covered
+views mounted. All live views on the same HomeBase client share a per-camera
+stream arbiter. The selected camera's full-screen player reuses its preview feed;
+on dismissal, that preview can immediately join the still-running feed. Cameras
+with no viewers close after **two seconds**. Backgrounded previews remain suspended.
+
+### Shared live connections and quality handoff
+
+The arbiter owns upstream media leases, with normally one connection per camera.
+Consumers have independent renderers, playback buffers, and Photos recording
+state; encoded frame data is shared. A new consumer is primed with configuration
+and the current complete keyframe-led GOP, bounded to **8 MiB / 150 frames**.
+If that GOP exceeds the bound, the new consumer waits for the next keyframe.
+There are no disk caches or new media-file writes. A stalled consumer has a
+bounded queue and is disconnected independently of healthy viewers.
+
+The highest quality requested by active consumers wins. Upgrades begin
+immediately; downgrades wait **two seconds** to avoid churn during presentation
+handoffs. A quality change warms a second connection while the current stream
+keeps playing, then switches at configuration plus keyframe without recreating
+the view or blanking its displayed image. Rapid selections supersede pending
+warm-ups; at most three workers overlap per camera, including a retiring one.
+Newer selections wait if all three slots are occupied. Failed warm-ups retain
+the playing stream, show a nonblocking warning, and retry with shared backoff
+(2, 4, 8, 16, then 30 seconds). Warm-up has a 20-second deadline.
+
+HomeBase's optional `openCameraLiveStream.isolatedQuality: true` creates a
+quality-specific upstream fanout so warming another quality does not restart
+the old camera feed. Same-camera/same-quality clients still share the server's
+upstream. Legacy requests omit the field and retain highest-viewer-quality
+behavior. Old servers ignore the optional field and remain usable, but cannot
+guarantee uninterrupted quality changes; deploy the updated HomeBase alongside
+this GUI feature. The server permits twelve viewer leases per session to cover
+four panes during rapid transitions; isolated upstreams stop once their final
+lease closes because the GUI already owns the handoff grace period.
+
+Opt-in `CameraLivePlaybackSmokeTests/testStreamArbiterQualityHandoffKeepsPlayingThroughRealServer`
+exercises low → high → low on a real camera, checks that playback never leaves
+its playing state and retained buffer is preserved, then joins a warm preview.
+Use `TEST_RUNNER_HB_LIVE_PLAYBACK_SMOKE_URL` with the existing smoke procedure
+below. It neither changes camera controls nor saves media.
+
+Backgrounding, biometric locking, leaving the camera section, and HomeBase
+disconnect bypass the warm-join grace. Authorization revocation also rejects
+late acquisitions, clears the arbiter's compressed-media cache, and closes
+pending replacement streams. Inactive system dialogs only conceal the existing
+camera UI; they retain the existing camera-section lifecycle policy.
 
 Backgrounding releases live video and history connections. Non-live playback
 (the live buffer or NVR history) pauses at its current position, including the
@@ -51,10 +97,29 @@ screen still ends its session and releases its buffers.
   guarantee of coverage for any requested time range.
 - Neither seeking nor playback can pass the newest received frame. Reaching that
   frame during ordinary playback does not automatically exit buffered mode.
-- The leading native toolbar always contains Close, the Back 30 / Play-Pause /
+- The leading native toolbar contains Close, the Back 30 / Play-Pause /
   Forward 30 group, and Live. The three shuttles share one system glass capsule;
-  Close retains its separation from playback. These are standard SwiftUI toolbar
-  items/groups, with system adaptation on narrow screens, not a custom toolbar.
+  Close uses iOS 26's native close button role; a standard toolbar spacer separates
+  it from playback. The toolbar owns
+  button sizing and glass, with no fixed button frame, custom backing, or padded
+  button content. These are standard SwiftUI toolbar items/groups, with system
+  adaptation on narrow screens, not a custom toolbar. Live/Record retain only
+  their state-dependent native prominence and tint.
+  In **compact horizontal size class**, Back 30, Forward 30, Video quality,
+  Day and night mode, and Privacy mode use `.secondaryAction` to intentionally
+  appear in the system overflow menu. Close, Play-Pause, and Live stay leading.
+  Camera selection stays trailing, alongside Record while live or playback speed
+  while buffered/in history. In compact width, speed moves from leading to
+  trailing and replaces Record rather than going into overflow.
+  Compact width makes Live icon-only and omits the extra spacers between the
+  playback actions and trailing actions; Close retains its own separation.
+  Regular width keeps the full toolbar. This uses size classes, not orientation
+  or screen-width thresholds. It is an iOS 26 compatibility policy; when adopting
+  iOS 27, use its explicit toolbar overflow and visibility-priority APIs while
+  retaining this fallback for iOS 26. Native adaptation still applies if even
+  the reduced primary controls cannot fit. Camera capability, recording, and
+  live/history availability rules are unchanged. The all-playback ControlGroup
+  experiment and temporary removal of the trailing controls have been reverted.
 - History lives in a floating bottom-trailing capsule alongside PTZ, not in the
   navigation bar. One selection controls three states: Off, History, and PTZ.
   Off shows History first, then PTZ when available, with neither panel open. Selecting either
@@ -79,12 +144,13 @@ screen still ends its session and releases its buffers.
   only one camera selected. Returning to Live restores the button, not the sliders.
   Leaving Live, entering Multiple, or losing the capability closes an open PTZ
   panel. Opening either panel never writes camera settings or changes playback.
-- Live is always alongside the shuttle controls and always shows
-  its icon and “Live” label. It uses native toolbar styling: prominent with red tint in Live mode,
+- Live is always alongside Play-Pause. It shows only its icon in compact width,
+  and its icon and “Live” label in regular width (and on macOS).
+  It uses native toolbar styling: prominent with red tint in Live mode,
   automatic during buffered/history playback. The toolbar supplies Liquid Glass,
   dimensions, padding, typography, and foreground contrast; no custom background,
   fixed button/icon dimensions, or foreground colors are applied. Its label is
-  always “Live”: `dot.radiowaves.left.and.right` while live, or
+  always “Live” for accessibility: `dot.radiowaves.left.and.right` while live, or
   `chevron.forward.dotted.chevron.forward` during buffered/history playback.
   It never uses the History icon. A composed icon/title label
   currently keeps the text visible: in the tested iOS 26.1 toolbar,
@@ -93,7 +159,8 @@ screen still ends its session and releases its buffers.
   layout does not customize button styling. Tapping Live resumes live playback
   without hiding shuttles or releasing the buffer. While already live, it is a
   no-op. Neither action changes timeline visibility.
-- A native speed menu after Live on the leading side shows the current
+- A native speed menu (trailing in compact width, after Live on the leading side
+  in regular width) shows the current
   **1×, 2×, or 4×** rate. It is hidden, not disabled, in Live mode; pause or
   rewind first to reveal it. Changing speed preserves pause, cursor, and timeline
   visibility. Multiple mode
@@ -109,8 +176,9 @@ screen still ends its session and releases its buffers.
 - Record to Photos is available only in Live mode. Shuttle/Live controls stay
   visible but disabled while requesting Photos authorization, starting/saving a
   recording, or recording. The status/timer is shown beneath the navigation bar.
-  Record remains in the trailing toolbar during buffered/history playback,
-  disabled rather than removed. Quality, day/night, and privacy are absent when
+  In regular width, Record remains in the trailing toolbar during buffered/history
+  playback, disabled rather than removed. In compact width it is hidden while
+  playback speed occupies that trailing space. Quality, day/night, and privacy are absent when
   unavailable, including outside Live; invalid/disconnected day/night and privacy
   controls are hidden, and quality is hidden while Photos recording locks stream
   configuration. Pending day/night or privacy writes retain their brief disabled
@@ -140,7 +208,8 @@ screen still ends its session and releases its buffers.
 
 ## Switching cameras
 
-The far-right list button stays in its own toolbar group in both Live and History.
+The far-right camera-selection button uses the side-by-side `rectangle.split.2x1`
+symbol and stays in its own toolbar group in both Live and History.
 Its popover lists the server's viewable cameras by display name, with a checkmark
 on the current camera. Selecting that camera is a no-op. The picker is disabled
 while requesting Photos access, recording, or saving. The underlying switch path
@@ -202,8 +271,8 @@ its mounted player, live connection, renderer, quality, five-minute buffer,
 history cache/request, and pause state. Adding/removing a camera opens/closes only
 that camera; leaving Multiple retains the first selected camera and expands its
 existing pane. No clock lookup or media reload is performed for that transition.
-Explicit quality changes still replace stream leases, retaining the screen's
-buffer across the resulting media epochs.
+Explicit quality changes use the make-before-break arbiter handoff, retaining
+the screen's buffer and paused position across the resulting media epochs.
 
 One playback clock drives every pane: all are Live, or all follow the same paused
 or playing cursor. Live-buffer mapping uses a shared monotonic receive clock;
@@ -397,15 +466,19 @@ The existing playback gap/error UI remains authoritative after a seek.
 
 Recent and missing previews refresh after a minute when visible; older images
 cache for an hour and errors retry after thirty seconds. Older Homebase/NVR
-versions without thumbnail capability show a quiet update hint while still
+versions without thumbnail capability and without an unlocked S3 preview source show a quiet update hint while still
 allowing ordinary history seeks. This is deliberately a coarse, fixed-scale
 first pass, without zoom, coverage bands, or automatic archive-wide scanning.
 
 ## Camera access and S3 credential setup
 
-The camera section opens with named chips containing solid black previews and a
-padlock. Locked chips do nothing when tapped and do not create preview streams.
-A separate Unlock action retries after a cancelled or failed attempt. The same
+The camera section opens with named chips containing plain black previews during
+authentication: no padlocks, progress spinners, or Unlock button. Only a cancelled
+or failed attempt reveals padlocks and an Unlock retry; retrying immediately
+returns to plain black until the attempt completes. The same quiet concealment
+applies in fullscreen, device details, and temporary system-UI interruptions.
+Unauthorized chips do nothing when tapped and do not create preview streams.
+The S3 setup padlock on missing footage is a separate action and is unchanged. The same
 gate covers camera video opened from device details; fullscreen players cannot
 bypass it. One session spans the camera list, fullscreen player, and camera
 switches. Leaving the section or backgrounding locks the session and releases
@@ -415,13 +488,23 @@ paused at its existing position after backgrounding, behind the lock.
 
 Authentication follows the system on every entry, without a saved consent flag:
 
-- Existing biometric-protected S3 credentials require both successful biometric
-  authentication and successful Keychain retrieval. Any failure stays locked.
-- Missing or explicitly legacy-unprotected credentials use a biometric UI gate.
-  Success opens the page. Only `biometryNotAvailable` also opens the page, whether
-  caused by missing hardware or denied/revoked Face ID permission. Cancellation,
-  lockout, unenrolled biometrics, unknown errors, and Keychain inspection failures
-  do not bypass the lock. There is no passcode fallback in this final policy.
+- Camera-page access and S3-credential access are independent. One successful
+  biometric prompt satisfies the UI lock and is reused for a protected Keychain
+  read. If the read fails, live/local camera viewing remains authorized; S3 stays
+  locked with a separate credential error. No second prompt is necessary.
+- The UI policy also allows entry on `biometryNotAvailable`, whether caused by
+  missing hardware or denied/revoked Face ID permission, even when saved S3
+  credentials exist. Protected or unknown credentials are never read through
+  that exception. Explicitly legacy-unprotected items can still be read.
+- Cancellation, lockout, unenrolled biometrics, and other authentication failures
+  leave the camera page locked. Cancellation never starts another prompt
+  automatically; Unlock retries. There is no passcode fallback in this policy.
+- A noninteractive Keychain inspection returning `errSecInteractionNotAllowed`
+  (-25308) means "authenticate before reading," not "missing credentials" and
+  not a fatal page-lock error. Other inspection failures also allow the UI gate
+  to run, but never authorize a credential read without successful biometrics.
+  This physical-device behavior is explicitly simulated by regression tests;
+  the simulator's real Keychain can return attributes without authentication.
 
 When video is missing and an S3 destination is advertised, a closed padlock at
 bottom leading offers credential setup, opposite and vertically aligned with
@@ -429,6 +512,11 @@ the History/PTZ capsule. It makes no claim that S3 has recordings. It is absent
 during Live, loading, or visible video, and absent once that destination's
 credentials are unlocked. Multi-camera mode offers it if any selected camera
 has a missing-video state with an advertised destination.
+If the credentials could not be unlocked, the form offers **Unlock saved
+credentials** to retry with a fresh biometric context without rewriting them.
+Failure or cancellation of this S3-only retry does not relock camera viewing.
+Backgrounding or leaving Cameras still invalidates attempts and clears both
+authorization and unlocked credentials, including late read completions.
 
 The native S3 form shows the advertised bucket, region, and prefix and accepts
 a **separate read-only** access key ID, secret access key, and optional encryption
@@ -449,19 +537,112 @@ without console access and no other policies. JSON generation rejects IAM
 wildcards/variables in advertised destinations instead of broadening access.
 An explicitly empty prefix grants reads throughout that bucket and is labeled so.
 
-The future reader must not interpret every HTTP 403 as invalid credentials:
+The reader does not interpret every HTTP 403 as invalid credentials:
 without `s3:ListBucket`, a missing object also returns 403, not 404. Predictable
 manifest names avoid listing, but do not remove that ambiguity. See the
 [AWS GetObject permission rules](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html).
 
-This increment adds the authentication boundary and credential setup only:
-**there are no AWS reads, AWS credential validation, S3 manifests, or S3 playback
-yet**. The editor explicitly reports this, rather than claiming a successful
-Keychain save validated AWS permissions or found footage. Saving credentials
-does not redirect playback or broaden recorder permissions. Older servers without
-an S3 advertisement retain local-only behavior. Homebase/HBNVR's additive S3
-advertisement contains destination metadata only and caps advertised stores at
-one of each type; HBNVR 0.15.1 also pins local reads to the selected local store.
+Saving credentials only verifies the Keychain save, not AWS access. Once saved
+or unlocked, the current history cursor is retried using the same buffer and
+pause state. Older servers without `playbackManifestVersion: 1` retain local-only
+behavior. Homebase advertises at most one local and one S3 store; HBNVR pins local
+reads to that selected first local store. Reader credentials remain bound to one
+exact S3 destination, never tried against other stores.
+
+### Local-first S3 playback
+
+The existing history buffer, one-minute initial window, 30-second refills and
+20-second runway are unchanged. Each retrieval first tries local NVR history.
+Only missing intervals or failed local reads go to S3, directly from the app over
+HTTPS. Local frames win in overlaps, including S3 keyframe preroll.
+
+Timeline previews use the same local-first policy with a separate, serial thumbnail
+connection. A missing/failed local preview falls back directly to the advertised S3
+store only when matching credentials are already unlocked. No additional prompt,
+bucket listing, manifest fetch, video download, or IAM permission is required for a
+preview. Without matching unlocked credentials, behavior remains local-only.
+
+S3 previews use predictable UTC `:10/:30/:50` midpoint keys under
+`<prefix>.hbnvr/playback/v1/<lowercase-camera-UUID>/thumbnails/YYYY-MM-DD/HH-mm.jpg`,
+with `.hbnvr` appended for encrypted images. An encrypted store requires the encrypted
+object and never downgrades to plaintext. A currently plaintext store tries `.jpg`,
+then an older encrypted `.jpg.hbnvr` only for missing/denied GETs.
+Without `ListBucket`, absent objects may return 403: an all-denied result remains an
+error, never proof of missing footage. Decryption or validation failures do not fall
+through to an alternate plaintext object. Future midpoint slots are not requested.
+
+The optional HBNVR-PBE envelope is authenticated/decrypted in RAM. The JPEG's embedded
+IPTC caption must identify the expected store, camera and UTC slot, with a frame time
+at or before that slot and at most 120 seconds earlier. Reads are bounded to 8 MiB plus
+envelope overhead; JPEG dimensions are bounded to the recorder's 1280×720 maximum.
+ImageIO downsamples to the requested bounding box without upscaling before the existing
+48-image RAM cache. Hiding the timeline, backgrounding, changing camera/destination or
+changing unlocked credentials cancels obsolete work and clears previews. No decrypted
+image is written to disk. Missing previews retain the existing "No preview" appearance;
+their absence says nothing about the availability of video in the surrounding interval.
+
+HBNVR 0.16.0 begins publishing prospective, per-camera playback indexes under
+`<prefix>.hbnvr/playback/v1/<lowercase-camera-UUID>/`. `catalog.json` names known
+UTC days; `days/YYYY-MM-DD.json` indexes the open day, while
+`months/YYYY-MM.json` contains complete shard entries for closed days. Today is
+excluded from the monthly aggregate. Late backlog uploads update the affected
+day and month. The phone uses monthly entries for older footage, not a rolling
+24-hour/30-day window. Catalog publication follows the referenced period updates;
+short session caches are refreshed to discover late uploads.
+
+Only confirmed video uploads enter the recorder's durable private metadata
+journal. Cloud publication is serialized, coalesced, retryable and independent
+of video upload success. Shards crossing UTC midnight appear in both relevant
+days and are deduplicated by identity. Indexes are encrypted with the same
+HBNVR-PBE format when client encryption is enabled. Losing the recorder's journal
+loses its previous searchable cloud history; neither app nor recorder lists the
+bucket or reconstructs old indexes. **Already uploaded, unindexed recordings are
+not automatically backfilled.** Old spool entries without timing remain safely
+uploadable but cannot enter this new index.
+
+The app verifies each object's frozen size and SHA-256, authenticates the entire
+AES-GCM envelope (PBKDF2-HMAC-SHA256, exactly 600,000 iterations), then demuxes
+compressed H.264/H.265 samples in RAM. Embedded timing/identity must match the
+index. There are no temporary MP4s, decrypted disk caches, AWS environment
+credentials, reads through Homebase, or additional IAM permissions. The AWS SDK
+for Swift is pinned to 1.7.78. Requests have a 45-second deadline, bounded bodies,
+no automatic retries or redirects, and sanitized diagnostics.
+
+Playback limits: catalog 4 MiB, individual period manifest 64 MiB / 100,000
+entries, individual shard 256 MiB, response 64 MiB / 30,000 samples. Very dense
+monthly indexes or unusually large/long shards may exceed these mobile bounds
+and produce an explicit error. The existing five-minute history-buffer bound
+still applies. One decrypted shard of at most 16 MiB may be retained for adjacent
+refills; closing or authorization loss cancels readers and clears keys, object
+caches and media buffers. Backgrounding preserves the paused cursor, not cloud
+credentials. Transient system UI concealment does not restart authentication.
+
+An AWS error is not evidence of a recording gap. Missing/expired objects, a
+missing initial catalog, bad credentials, wrong passwords and corrupt objects
+report retrieval errors. Successfully read local intervals remain usable while
+failed cloud intervals remain unknown and retryable. S3 Access remains reachable
+from an error state for credential repair. Only successful index reads can
+establish that no indexed footage covers a requested time. Indexes may refer to
+objects already expired by bucket lifecycle; the recorder does not delete cloud
+objects or claim authoritative expiration knowledge.
+
+Relative Live-minus requests still resolve on the NVR; the latest S3 upload is
+never treated as Live. An absolute seek can fall back with NVR offline: its
+selected UTC timestamp and embedded frame timing remain exact, while the phone
+wall clock supplies only an approximate forward-play ceiling until a server
+anchor is available. This does not synchronize unrelated live camera feeds.
+
+Opt-in real-AWS smoke (use an explicitly designated test store; no permissions
+are broadened): install HBNVR 0.16.0 and the updated Homebase, then the app. Record
+new synthetic/test-camera footage and wait for manifest publication. Unlock a
+separate GetObject-only reader key in the app. Seek to a time outside the first
+local store but present in S3; verify video, timestamp, pause, refills and camera
+switching. For a mixed local/cloud window verify local pictures are preserved.
+Repeat with network interruption, incorrect password and denied object access;
+expect retryable errors, not fabricated gaps. Restore credentials, retry, then
+background/relock and ensure no cloud read resumes until camera access is
+authorized. Administrative/read tooling may separately verify manifests and
+objects; never add ListBucket or GetObject to the recorder's write-only key.
 
 On-device authentication smoke checks:
 
@@ -472,12 +653,24 @@ On-device authentication smoke checks:
 - With HBNVR 0.15.1 advertising S3, seek to missing local video. Check the leading
   padlock and credential sheet. Cancel must save nothing. Saving a test reader
   key requires biometrics and reports only a Keychain save, not AWS validation.
-- After saving protected credentials, cancel authentication or revoke Face ID
-  access in Settings: the camera page must remain locked. Restore permission to
-  regain access. Without protected credentials, revoked/unavailable biometry
-  instead permits entry under the optional UI-lock policy.
+- After saving credentials, leave and re-enter Cameras. Face ID should appear
+  instead of immediately repeating a Keychain -25308 error. Success should
+  unlock both the page and readable credentials without deleting/re-entering them.
+- Cancel the entry prompt: the page stays locked. Revoke Face ID access in
+  Settings: the normal unavailable-biometry UI policy permits camera viewing,
+  but protected S3 credentials stay locked. Restore permission and use Unlock
+  saved credentials from the S3 padlock. A failed retry must not lock cameras.
+- Injected tests cover Keychain inspection/read failures after successful Face
+  ID: local camera access remains available, with S3 still locked and retryable.
 
 ## Verification
+
+The S3 tests cover scoped SDK-signed GETs, bounded/cancellable responses,
+authenticated decryption (including an independent known-answer fixture),
+synthetic H.264/H.265 MP4 demuxing, daily/monthly index selection, local-first
+gap filling, offline absolute seeks, credential replacement, and clearing media
+on authorization loss. These are synthetic tests, not a real-AWS validation;
+use the opt-in smoke procedure above for an explicitly designated bucket.
 
 `CameraLivePlaybackTests` exercises timing, limits, eviction, pause/seek semantics,
 decoder preroll, lifecycle, and separation from Photos using synthetic H.264.
@@ -486,11 +679,13 @@ live-edge slowdown without switching modes, shared multi-camera pacing, and
 speed-aware bounded history refills versus ordinary cache exhaustion.
 It needs no server, camera, or saved footage. Run the full `HomeBase-GUI` scheme's
 tests on macOS and an iOS simulator.
-`CameraLivePlaybackPresentationTests` also checks the separate History and Live
-symbols, the collapsed non-live History indicator, Live's no-op action while live,
-its always-visible label, and the production toolbar's expanded/collapsed order
-and symmetric conditional separation inside a real toolbar, plus the native camera
-gesture recognizers' availability on iOS.
+`CameraLivePlaybackPresentationTests` also checks History and Live symbols,
+Live's no-op action while live and its size-class-dependent label, native shuttle
+grouping and separation, and Close sizing against an unmodified system button.
+It verifies UIKit's secondary item groups and captures compact- and regular-width
+toolbar adaptation in both Live and History, including wide windows with compact
+traits to avoid orientation-based assumptions, and checks
+the native camera gesture recognizers' availability on iOS.
 `CameraHistoryTests` adds cache/refill, paused seeks, stale responses, stable time
 anchoring, protocol bounds, H.264/HEVC decoding, metadata ordering, WebSocket reuse,
 timeouts and cancellation tests with injected transports.
@@ -519,8 +714,11 @@ The history smoke suite requires HBNVR 0.14.0 and the corresponding Homebase rel
 It also checks both archive boundaries and a paused jump from an empty date to the
 first retained recording, including actual frame rendering at the returned target.
 
-Manual phone check: open a camera. Close, one shuttle capsule, and Live are
-present immediately; speed, the timeline, and PTZ sliders are absent. At bottom
+Manual phone check: open a camera. Close, Play-Pause, and Live are present
+immediately; speed, the timeline, and PTZ sliders are absent. In regular width,
+the two 30-second shuttles share the Play-Pause capsule and Live has its title.
+In compact width, the shuttles and camera settings are in the system overflow,
+Live is icon-only, and Record and camera selection remain trailing. At bottom
 right, History precedes PTZ in one neutral glass capsule. Tap PTZ: only its tinted
 icon remains, supported sliders appear together, and no camera setting changes.
 Tap again: both icons return. Tap History: only its tinted icon remains and the
@@ -535,7 +733,8 @@ playing, confirming no playback state changes. In portrait, allow the system's
 native navigation-bar adaptation; there is no bespoke row layout.
 Seek to an empty time and use the gap arrows to find the preceding/following
 recording; missing directions are absent and paused jumps remain paused.
-Pause: speed appears beside Live; Record stays visible but disabled, while quality,
+Pause: in compact width, speed replaces Record on the trailing side. In regular
+width, speed appears beside Live and Record stays visible but disabled. Quality,
 day/night, privacy, and PTZ controls disappear. Camera gestures do not move the camera. Camera
 switching remains usable. After five seconds, Forward 30 should show the newest
 frame but remain paused as new frames arrive. Play, then Forward 30: this resumes
