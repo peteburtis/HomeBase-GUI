@@ -32,38 +32,58 @@ struct DeviceDetailView: View {
     }
 
     var body: some View {
+        CameraAccessGate { access in
+            detail(access: access)
+        }
+        .cameraAccessScope(
+            isActive: cameraCapability != nil,
+            isPresentingCamera: isShowingFullScreenVideo
+        )
+    }
+
+    private func detail(access: CameraAccessPresentation) -> some View {
         List {
             if let cameraCapability {
                 Section {
-                    CameraLiveVideoPlayer(
-                        deviceIdentifier: device.addressableName,
-                        quality: cameraCapability.previewQuality,
-                        client: client,
-                        allowsRetry: false,
-                        isStreamEnabled: !isShowingFullScreenVideo,
-                        restartRequest: videoRestartRequest
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                    .overlay(alignment: .bottomTrailing) {
-                        Image(systemName: "arrow.up.left.and.arrow.down.right")
-                            .font(.callout.weight(.semibold))
-                            .foregroundStyle(.white)
-                            .padding(9)
-                            .cameraGlassBacker(
-                                in: Circle(),
-                                interactive: true
-                            )
-                            .padding(10)
+                    CameraProtectedPreview(access: access) {
+                        CameraLiveVideoPlayer(
+                            deviceIdentifier: device.addressableName,
+                            quality: cameraCapability.previewQuality,
+                            client: client,
+                            allowsRetry: false,
+                            isStreamEnabled: !isShowingFullScreenVideo,
+                            restartRequest: videoRestartRequest
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .overlay(alignment: .bottomTrailing) {
+                            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(9)
+                                .cameraGlassBacker(
+                                    in: Circle(),
+                                    interactive: true
+                                )
+                                .padding(10)
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            guard access.isUnlocked else { return }
+                            isShowingFullScreenVideo = true
+                        }
+                        .accessibilityAddTraits(.isButton)
+                        .accessibilityHint("Opens higher-quality live video")
                     }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        isShowingFullScreenVideo = true
-                    }
-                    .accessibilityAddTraits(.isButton)
-                    .accessibilityHint("Opens higher-quality live video")
                 }
                 .listRowInsets(EdgeInsets())
                 .listRowBackground(Color.black)
+
+                if !access.isUnlocked {
+                    Section {
+                        CameraUnlockButton(access: access)
+                            .frame(maxWidth: .infinity)
+                    }
+                }
             }
 
             LiveDeviceControlSections(

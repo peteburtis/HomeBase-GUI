@@ -11,6 +11,8 @@
 	<string>Connect to HomeBase servers on your local network.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Save camera recordings to your photo library.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Unlock your cameras and protected S3 recording credentials.</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>

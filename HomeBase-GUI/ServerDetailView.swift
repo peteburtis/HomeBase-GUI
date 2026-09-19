@@ -8,11 +8,14 @@ import HomeBaseProtocol
 import SwiftUI
 
 struct ServerDetailView: View {
+    private enum Tab: Hashable { case home, cameras, scenes, triggers }
     @Environment(\.scenePhase) private var scenePhase
 
     let server: PairedServer
     let showServers: () -> Void
     @StateObject private var connection: ServerConnectionModel
+    @State private var selectedTab: Tab = .home
+    @State private var isShowingCamera = false
 
     init(
         server: PairedServer,
@@ -30,7 +33,7 @@ struct ServerDetailView: View {
             in: connection.topology.devices
         )
 
-        TabView {
+        TabView(selection: $selectedTab) {
             NavigationStack {
                 homeView
                     .toolbar {
@@ -44,15 +47,18 @@ struct ServerDetailView: View {
                 .tabItem {
                     Label("Home", systemImage: "house")
                 }
+                .tag(Tab.home)
 
             if !cameras.isEmpty {
                 VideoView(
                     cameras: cameras,
-                    client: connection.client
+                    client: connection.client,
+                    onPresentationChanged: { isShowingCamera = $0 }
                 )
                 .tabItem {
                     Label("Cameras", systemImage: "video")
                 }
+                .tag(Tab.cameras)
             }
 
             NavigationStack {
@@ -63,6 +69,7 @@ struct ServerDetailView: View {
                 .tabItem {
                     Label("Scenes", systemImage: "sparkles")
                 }
+                .tag(Tab.scenes)
 
             NavigationStack {
                 TriggersView(
@@ -72,6 +79,16 @@ struct ServerDetailView: View {
                 .tabItem {
                     Label("Triggers", systemImage: "bolt")
                 }
+                .tag(Tab.triggers)
+        }
+        .cameraAccessScope(
+            isActive: selectedTab == .cameras,
+            isPresentingCamera: isShowingCamera
+        )
+        .onChange(of: cameras.isEmpty) { _, isEmpty in
+            if isEmpty && selectedTab == .cameras {
+                selectedTab = .home
+            }
         }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }

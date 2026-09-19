@@ -401,6 +401,82 @@ versions without thumbnail capability show a quiet update hint while still
 allowing ordinary history seeks. This is deliberately a coarse, fixed-scale
 first pass, without zoom, coverage bands, or automatic archive-wide scanning.
 
+## Camera access and S3 credential setup
+
+The camera section opens with named chips containing solid black previews and a
+padlock. Locked chips do nothing when tapped and do not create preview streams.
+A separate Unlock action retries after a cancelled or failed attempt. The same
+gate covers camera video opened from device details; fullscreen players cannot
+bypass it. One session spans the camera list, fullscreen player, and camera
+switches. Leaving the section or backgrounding locks the session and releases
+its credential references. Inactive transitions conceal imagery for system
+snapshots, but do not cancel the authentication prompt itself. History stays
+paused at its existing position after backgrounding, behind the lock.
+
+Authentication follows the system on every entry, without a saved consent flag:
+
+- Existing biometric-protected S3 credentials require both successful biometric
+  authentication and successful Keychain retrieval. Any failure stays locked.
+- Missing or explicitly legacy-unprotected credentials use a biometric UI gate.
+  Success opens the page. Only `biometryNotAvailable` also opens the page, whether
+  caused by missing hardware or denied/revoked Face ID permission. Cancellation,
+  lockout, unenrolled biometrics, unknown errors, and Keychain inspection failures
+  do not bypass the lock. There is no passcode fallback in this final policy.
+
+When video is missing and an S3 destination is advertised, a closed padlock at
+bottom leading offers credential setup, opposite and vertically aligned with
+the History/PTZ capsule. It makes no claim that S3 has recordings. It is absent
+during Live, loading, or visible video, and absent once that destination's
+credentials are unlocked. Multi-camera mode offers it if any selected camera
+has a missing-video state with an advertised destination.
+
+The native S3 form shows the advertised bucket, region, and prefix and accepts
+a **separate read-only** access key ID, secret access key, and optional encryption
+password. It never pre-fills secrets or sends them to Homebase/NVR. Explicit Save
+requires biometrics even if the camera page was admitted without authentication.
+The single client-wide Keychain bundle uses device-only accessibility, biometric
+access control, and no iCloud synchronization. Replacing another store requires
+confirmation. Credentials bind to store ID and exact destination, not camera
+names, daemon process IDs, or encryption toggles. Password text is preserved
+verbatim. Neither an app preference nor credential metadata contains the secrets.
+
+The form links to a suggested IAM identity policy with selectable JSON, Copy JSON,
+and Share JSON actions. It grants only `s3:GetObject` on the advertised bucket and
+exact prefix (including future predictable manifest objects). It does not grant
+bucket listing, writes, deletes, lifecycle changes, or KMS access; the supported
+recorder uses SSE-S3 and optional app-side encryption. Use a dedicated IAM user
+without console access and no other policies. JSON generation rejects IAM
+wildcards/variables in advertised destinations instead of broadening access.
+An explicitly empty prefix grants reads throughout that bucket and is labeled so.
+
+The future reader must not interpret every HTTP 403 as invalid credentials:
+without `s3:ListBucket`, a missing object also returns 403, not 404. Predictable
+manifest names avoid listing, but do not remove that ambiguity. See the
+[AWS GetObject permission rules](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html).
+
+This increment adds the authentication boundary and credential setup only:
+**there are no AWS reads, AWS credential validation, S3 manifests, or S3 playback
+yet**. The editor explicitly reports this, rather than claiming a successful
+Keychain save validated AWS permissions or found footage. Saving credentials
+does not redirect playback or broaden recorder permissions. Older servers without
+an S3 advertisement retain local-only behavior. Homebase/HBNVR's additive S3
+advertisement contains destination metadata only and caps advertised stores at
+one of each type; HBNVR 0.15.1 also pins local reads to the selected local store.
+
+On-device authentication smoke checks:
+
+- With no saved S3 credentials, enter Cameras: chips stay black until the system
+  authentication decision. Cancel should leave them locked; Unlock retries.
+- Background and return, and leave/re-enter Cameras. Each starts a fresh lock
+  session. Opening fullscreen and switching cameras should not ask again.
+- With HBNVR 0.15.1 advertising S3, seek to missing local video. Check the leading
+  padlock and credential sheet. Cancel must save nothing. Saving a test reader
+  key requires biometrics and reports only a Keychain save, not AWS validation.
+- After saving protected credentials, cancel authentication or revoke Face ID
+  access in Settings: the camera page must remain locked. Restore permission to
+  regain access. Without protected credentials, revoked/unavailable biometry
+  instead permits entry under the optional UI-lock policy.
+
 ## Verification
 
 `CameraLivePlaybackTests` exercises timing, limits, eviction, pause/seek semantics,

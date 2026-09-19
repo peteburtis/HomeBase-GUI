@@ -98,6 +98,7 @@ struct CameraPlayerPanelPlacement<Content: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let panel: CameraPlayerPanel
     let timelineBounds: Anchor<CGRect>?
+    var leading = false
     @ViewBuilder let content: () -> Content
 
     var body: some View {
@@ -110,9 +111,9 @@ struct CameraPlayerPanelPlacement<Content: View>: View {
                     full.size.height - full[$0].midY - CameraPTZOverlayMetrics.buttonSize / 2
                 } ?? restingBottom : restingBottom
                 content()
-                    .padding(.trailing, CameraPTZOverlayMetrics.inset)
+                    .padding(leading ? .leading : .trailing, CameraPTZOverlayMetrics.inset)
                     .padding(.bottom, bottom)
-                    .frame(width: safeBounds.width, height: full.size.height, alignment: .bottomTrailing)
+                    .frame(width: safeBounds.width, height: full.size.height, alignment: leading ? .bottomLeading : .bottomTrailing)
                     .position(x: safeBounds.midX, y: full.size.height / 2)
                     .animation(reduceMotion ? nil : .snappy, value: bottom)
             }

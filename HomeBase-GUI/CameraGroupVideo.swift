@@ -115,6 +115,7 @@ struct CameraGroupVideo: View {
     @ObservedObject var group: CameraGroupPlayback
     let cameraControlsEnabled: Bool
     let controlsVisible: Bool
+    var isAccessAllowed = true
     let onSingleTap: () -> Void
 
     var body: some View {
@@ -127,6 +128,7 @@ struct CameraGroupVideo: View {
                     if cells.indices.contains(index) {
                         CameraGroupPane(session: session, group: group, cameraControlsEnabled: cameraControlsEnabled,
                             controlsVisible: controlsVisible,
+                            isAccessAllowed: isAccessAllowed,
                             safeBounds: safeBounds.offsetBy(dx: -cells[index].minX, dy: -cells[index].minY),
                             labelBelowVideo: CameraGroupLayout.labelsBelowVideo(count: group.sessions.count, arrangement: arrangement),
                             onSingleTap: onSingleTap)
@@ -151,12 +153,14 @@ private struct CameraGroupPane: View {
     @State private var aspectRatio: CGFloat = 16 / 9
     let cameraControlsEnabled: Bool
     let controlsVisible: Bool
+    let isAccessAllowed: Bool
     let safeBounds: CGRect
     let labelBelowVideo: Bool
     let onSingleTap: () -> Void
 
     init(session: CameraGroupSession, group: CameraGroupPlayback, cameraControlsEnabled: Bool,
          controlsVisible: Bool,
+         isAccessAllowed: Bool,
          safeBounds: CGRect, labelBelowVideo: Bool,
          onSingleTap: @escaping () -> Void) {
         self.session = session; self.group = group
@@ -164,6 +168,7 @@ private struct CameraGroupPane: View {
         _controls = ObservedObject(wrappedValue: session.controls)
         self.cameraControlsEnabled = cameraControlsEnabled
         self.controlsVisible = controlsVisible
+        self.isAccessAllowed = isAccessAllowed
         self.safeBounds = safeBounds; self.labelBelowVideo = labelBelowVideo
         self.onSingleTap = onSingleTap
     }
@@ -173,7 +178,7 @@ private struct CameraGroupPane: View {
     private var isLive: Bool { group.active ? group.isLive : playback.isLive }
     private var isHistory: Bool { group.active ? group.source == .history : playback.isUsingHistory }
     private var gesturesEnabled: Bool {
-        cameraControlsEnabled && group.showsVideo(session) && !CameraLiveVideoLifecycle.isSuspended(in: scenePhase)
+        isAccessAllowed && cameraControlsEnabled && group.showsVideo(session) && !CameraLiveVideoLifecycle.isSuspended(in: scenePhase)
     }
     private var panTiltTarget: CameraPanTiltGestureTarget? { CameraPanTiltGestureTarget(controls: controls.controls) }
     private var zoomTarget: CameraZoomGestureTarget? { CameraZoomGestureTarget(controls: controls.controls) }
@@ -185,7 +190,8 @@ private struct CameraGroupPane: View {
     var body: some View {
         ZStack {
             CameraLiveVideoPlayer(deviceIdentifier: session.camera.device.addressableName, quality: session.quality,
-                client: group.client, allowsRetry: true, restartRequest: restartRequest,
+                client: group.client, allowsRetry: true, isStreamEnabled: isAccessAllowed,
+                restartRequest: restartRequest,
                 recordingController: session.videoRecordingController, playbackController: playback,
                 usesHistory: !isLive, onStateChanged: { session.liveState = $0 },
                 onAspectRatioChanged: { aspectRatio = $0 })
@@ -226,7 +232,9 @@ private struct CameraGroupPane: View {
                 .transition(.opacity)
             }
         }
-        .onChange(of: controls.deviceMetadata, initial: true) { _, metadata in playback.prepareHistory(metadata: metadata, client: group.client) }
+        .onChange(of: controls.deviceMetadata, initial: true) { _, metadata in
+            if isAccessAllowed { playback.prepareHistory(metadata: metadata, client: group.client) }
+        }
         .onChange(of: gesturesEnabled, initial: true) { _, enabled in session.gestures.update(enabled: enabled) }
         .onChange(of: panTiltTarget?.observedPosition, initial: true) { _, _ in session.gestures.update(enabled: gesturesEnabled) }
         .onChange(of: controls.state) { _, _ in session.gestures.update(enabled: gesturesEnabled) }
@@ -236,8 +244,8 @@ private struct CameraGroupPane: View {
         .onChange(of: privacy) { old, new in
             if CameraPrivacyStreamRecovery.shouldRequestRestart(from: old, to: new) { restartRequest &+= 1 }
         }
-        .task(id: CameraLiveVideoLifecycle.isSuspended(in: scenePhase)) {
-            if CameraLiveVideoLifecycle.isSuspended(in: scenePhase) {
+        .task(id: CameraLiveVideoLifecycle.isSuspended(in: scenePhase, isStreamEnabled: isAccessAllowed)) {
+            if CameraLiveVideoLifecycle.isSuspended(in: scenePhase, isStreamEnabled: isAccessAllowed) {
                 playback.suspend(); await controls.stop()
             } else {
                 playback.resume()

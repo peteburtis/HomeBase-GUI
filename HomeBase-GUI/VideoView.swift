@@ -11,16 +11,24 @@ struct VideoView: View {
 
     let cameras: [CameraVideoDevice]
     let client: HomeBaseWebSocketClient
+    var onPresentationChanged: (Bool) -> Void = { _ in }
     @State private var selectedCamera: CameraVideoDevice?
 
     var body: some View {
-        ScrollView {
-            LazyVGrid(columns: columns, spacing: gridSpacing) {
-                ForEach(cameras) { camera in
-                    cameraButton(camera)
+        CameraAccessGate { access in
+            ScrollView {
+                LazyVGrid(columns: columns, spacing: gridSpacing) {
+                    ForEach(cameras) { camera in
+                        cameraButton(camera, access: access)
+                    }
+                }
+                .padding(gridSpacing)
+
+                if !access.isUnlocked {
+                    CameraUnlockButton(access: access)
+                        .padding()
                 }
             }
-            .padding(gridSpacing)
         }
 #if os(iOS)
         .fullScreenCover(item: $selectedCamera) { camera in
@@ -31,6 +39,9 @@ struct VideoView: View {
             fullScreenVideo(for: camera)
         }
 #endif
+        .onChange(of: selectedCamera?.id) { _, identifier in
+            onPresentationChanged(identifier != nil)
+        }
     }
 
     private var gridSpacing: CGFloat { 12 }
@@ -52,20 +63,29 @@ struct VideoView: View {
         ]
     }
 
-    private func cameraButton(_ camera: CameraVideoDevice) -> some View {
+    private func cameraButton(
+        _ camera: CameraVideoDevice,
+        access: CameraAccessPresentation
+    ) -> some View {
         Button {
+            guard access.isUnlocked else { return }
+            // Retain the camera-section lease before presentation can obscure
+            // its parent; don't depend on onChange/onDisappear callback order.
+            onPresentationChanged(true)
             selectedCamera = camera
         } label: {
             VStack(alignment: .leading, spacing: 0) {
-                CameraLiveVideoPlayer(
-                    deviceIdentifier: camera.device.addressableName,
-                    quality: camera.capability.previewQuality,
-                    client: client,
-                    allowsRetry: false,
-                    isStreamEnabled: selectedCamera == nil
-                )
-                .frame(maxWidth: .infinity)
-                .background(Color.black)
+                CameraProtectedPreview(access: access) {
+                    CameraLiveVideoPlayer(
+                        deviceIdentifier: camera.device.addressableName,
+                        quality: camera.capability.previewQuality,
+                        client: client,
+                        allowsRetry: false,
+                        isStreamEnabled: selectedCamera == nil
+                    )
+                    .frame(maxWidth: .infinity)
+                    .background(Color.black)
+                }
 
                 Text(camera.device.displayName)
                     .font(.headline)
@@ -83,8 +103,11 @@ struct VideoView: View {
             .contentShape(RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(.plain)
+        .disabled(!access.isUnlocked)
         .accessibilityLabel(camera.device.displayName)
-        .accessibilityHint("Opens camera controls and full-screen video")
+        .accessibilityHint(access.isUnlocked
+            ? "Opens camera controls and full-screen video"
+            : "Locked. Use Unlock to authenticate.")
     }
 
     private func fullScreenVideo(

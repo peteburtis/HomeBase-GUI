@@ -1220,6 +1220,7 @@ struct CameraLiveGestureSurface: View {
 #endif
 
 struct CameraFullScreenLiveVideoView: View {
+    @Environment(\.dismiss) private var dismiss
     let client: HomeBaseWebSocketClient
     @StateObject private var selection: CameraScreenSelection
     @StateObject private var cameraPicker: CameraPickerModel
@@ -1239,14 +1240,29 @@ struct CameraFullScreenLiveVideoView: View {
         // The presentation and navigation container survive camera changes. Only
         // camera-scoped resources are replaced, preventing stale callbacks or
         // buffers from one camera being attached to another camera's renderer.
-        NavigationStack {
-            CameraFullScreenCameraContent(device: selection.session.device,
+        CameraAccessGate { access in
+            NavigationStack {
+                CameraFullScreenCameraContent(device: selection.session.device,
                 quality: selection.session.quality, client: client,
+                access: access,
                 initialPosition: selection.session.position, cameraPicker: cameraPicker,
                 panel: $panel, controlsVisible: $controlsVisible,
                 selectCamera: { selection.select($0, position: $1) },
                 retainCamera: { selection.retain($0, quality: $1) })
                 .id(selection.session.id)
+                .allowsHitTesting(access.isUnlocked)
+                .accessibilityHidden(!access.isUnlocked)
+                .overlay {
+                    if !access.isUnlocked { CameraAccessLockedView(access: access) }
+                }
+                .toolbar {
+                    if !access.isUnlocked {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Close", systemImage: "xmark") { dismiss() }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1257,6 +1273,7 @@ private struct CameraFullScreenCameraContent: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let client: HomeBaseWebSocketClient
+    let access: CameraAccessPresentation
     @StateObject private var initialSession: CameraGroupSession
     @StateObject private var group: CameraGroupPlayback
     private var primary: CameraGroupSession { group.sessions.first ?? initialSession }
@@ -1280,6 +1297,7 @@ private struct CameraFullScreenCameraContent: View {
     @State private var cameraSwitchError: String?
     private var liveVideoState: CameraLiveVideoModel.State { primary.liveState }
     @State private var timelineResumeAfterSeek = false
+    @State private var s3Destination: CameraS3Destination?
 #if os(iOS)
     private var recordingController: CameraLocalRecordingController { primary.recordingController }
     @State private var savedConfirmationVisible = false
@@ -1289,6 +1307,7 @@ private struct CameraFullScreenCameraContent: View {
         device: HBTopologyDeviceDescriptor,
         quality: HBCameraLiveQuality,
         client: HomeBaseWebSocketClient,
+        access: CameraAccessPresentation,
         initialPosition: CameraSwitchPosition,
         cameraPicker: CameraPickerModel,
         panel: Binding<CameraPlayerPanel>,
@@ -1297,6 +1316,7 @@ private struct CameraFullScreenCameraContent: View {
         retainCamera: @escaping (CameraVideoDevice, HBCameraLiveQuality) -> Void
     ) {
         self.client = client
+        self.access = access
         self.initialPosition = initialPosition
         self.cameraPicker = cameraPicker
         self.selectCamera = selectCamera
@@ -1313,18 +1333,17 @@ private struct CameraFullScreenCameraContent: View {
     private var cameraPresentation: some View {
         liveVideo
             .toolbar {
-                cameraToolbar
+                if access.isUnlocked { cameraToolbar }
             }
             .modifier(CameraTransparentToolbar())
             .modifier(CameraToolbarVisibility(
-                isVisible: visiblePlayerControls
+                isVisible: !access.isUnlocked || visiblePlayerControls
             ))
         .onAppear {
-            playbackController.prepareHistory(metadata: controlsModel.deviceMetadata, client: client)
-            if !initialPositionApplied {
-                initialPositionApplied = true
-                playbackController.applyCameraSwitch(initialPosition)
-            }
+            if access.isAuthorized {
+                playbackController.prepareHistory(metadata: controlsModel.deviceMetadata, client: client)
+            } else { group.suspend() }
+            applyInitialPositionIfAuthorized()
         }
         .onDisappear {
             cameraSwitchTask?.cancel(); cameraSwitchTask = nil
@@ -1343,8 +1362,8 @@ private struct CameraFullScreenCameraContent: View {
                 stopLiveCameraGestures()
             }
         }
-        .task(id: CameraLiveVideoLifecycle.isSuspended(in: scenePhase)) {
-            if CameraLiveVideoLifecycle.isSuspended(in: scenePhase) {
+        .task(id: CameraLiveVideoLifecycle.isSuspended(in: scenePhase, isStreamEnabled: access.isAuthorized)) {
+            if CameraLiveVideoLifecycle.isSuspended(in: scenePhase, isStreamEnabled: access.isAuthorized) {
                 group.suspend()
             } else { group.resume() }
         }
@@ -1410,8 +1429,21 @@ private struct CameraFullScreenCameraContent: View {
 
     var body: some View {
         recordingPresentation
+        .sheet(item: $s3Destination) { destination in
+            if let session = access.session {
+                CameraS3CredentialsView(access: session, destination: destination)
+            }
+        }
+        .onChange(of: access.isAuthorized) { _, allowed in
+            if !allowed {
+                s3Destination = nil
+                cameraPickerVisible = false
+                cameraSwitchTask?.cancel(); cameraSwitchTask = nil
+                switchingCamera = false
+            } else { applyInitialPositionIfAuthorized() }
+        }
         .alert("Playback Unavailable", isPresented: Binding(
-            get: { playbackController.errorMessage != nil },
+            get: { access.isUnlocked && playbackController.errorMessage != nil },
             set: { if !$0 { playbackController.dismissError() } }
         )) {
             Button("OK") { playbackController.dismissError() }
@@ -1419,7 +1451,7 @@ private struct CameraFullScreenCameraContent: View {
             Text(playbackController.errorMessage ?? "Unknown error")
         }
         .alert(cameraSwitchError != nil ? "Could Not Switch Camera" : "Camera Control Failed", isPresented: Binding(
-            get: { cameraSwitchError != nil || group.error != nil }, set: { if !$0 { cameraSwitchError = nil; group.error = nil } }
+            get: { access.isUnlocked && (cameraSwitchError != nil || group.error != nil) }, set: { if !$0 { cameraSwitchError = nil; group.error = nil } }
         )) {
             Button("OK") { cameraSwitchError = nil; group.error = nil }
         } message: {
@@ -1431,6 +1463,7 @@ private struct CameraFullScreenCameraContent: View {
         ZStack {
             CameraGroupVideo(group: group, cameraControlsEnabled: cameraControlsEnabled,
                 controlsVisible: visiblePlayerControls,
+                isAccessAllowed: access.isAuthorized,
                 onSingleTap: toggleControls)
 
             if visiblePlayerControls && panel == .ptz && panelAvailability.enablesPTZ {
@@ -1479,6 +1512,11 @@ private struct CameraFullScreenCameraContent: View {
                 CameraPlayerPanelPlacement(panel: panel, timelineBounds: timelineBounds) {
                     CameraPlayerPanelPicker(selection: $panel, availability: panelAvailability)
                 }
+                if let destination = lockedS3Destination, access.session != nil {
+                    CameraPlayerPanelPlacement(panel: panel, timelineBounds: timelineBounds, leading: true) {
+                        CameraS3PadlockButton { s3Destination = destination }
+                    }
+                }
             }
         }
 #if os(iOS)
@@ -1493,7 +1531,7 @@ private struct CameraFullScreenCameraContent: View {
         .animation(.snappy, value: controlsVisible)
         .animation(reduceMotion ? nil : .snappy, value: panel)
         .onChange(of: controlsModel.deviceMetadata, initial: true) { _, metadata in
-            if !group.active { playbackController.prepareHistory(metadata: metadata, client: client) }
+            if access.isAuthorized, !group.active { playbackController.prepareHistory(metadata: metadata, client: client) }
         }
         .accessibilityActions {
             if isShowingVideo {
@@ -1575,13 +1613,16 @@ private struct CameraFullScreenCameraContent: View {
                 selectedIDs: Set(group.active ? group.sessions.map(\.id) : [device.identifier]),
                 multiple: group.active, toggleMultiple: setMultiple,
                 canSelect: { !group.active || group.canToggle($0) },
-                select: { if group.active { stopLiveCameraGestures(); group.toggle($0) } else { switchCamera($0) } })
+                select: {
+                    guard access.isUnlocked else { return }
+                    if group.active { stopLiveCameraGestures(); group.toggle($0) } else { switchCamera($0) }
+                })
                 .disabled(switchingCamera || group.resolvingTime)
         }
     }
 
     private func setMultiple(_ enabled: Bool) {
-        guard enabled != group.active, !switchingCamera else { return }
+        guard access.isUnlocked, enabled != group.active, !switchingCamera else { return }
 #if os(iOS)
         guard !recordingController.locksStreamConfiguration else { return }
 #endif
@@ -1592,7 +1633,7 @@ private struct CameraFullScreenCameraContent: View {
 
     private func switchCamera(_ camera: CameraVideoDevice) {
         cameraPickerVisible = false
-        guard camera.id != device.identifier, !switchingCamera else { return }
+        guard access.isUnlocked, camera.id != device.identifier, !switchingCamera else { return }
         let departure = CameraPlaybackHistoryAvailability.isAvailable(in: camera.device.metadata)
             ? playbackController.positionForCameraSwitch(metadata: controlsModel.deviceMetadata) : .live
         stopLiveCameraGestures()
@@ -1614,6 +1655,7 @@ private struct CameraFullScreenCameraContent: View {
                     await transport.close()
                 } else { destination = departure }
                 try Task.checkCancellation()
+                guard access.session?.isUnlocked != false else { return }
                 selectCamera(camera, destination)
             } catch is CancellationError {} catch {
                 cameraSwitchError = error.localizedDescription
@@ -1699,7 +1741,7 @@ private struct CameraFullScreenCameraContent: View {
 
     private var recordingErrorIsPresented: Binding<Bool> {
         Binding(
-            get: { recordingController.errorMessage != nil },
+            get: { access.isUnlocked && recordingController.errorMessage != nil },
             set: { isPresented in
                 if !isPresented { recordingController.dismissError() }
             }
@@ -1722,18 +1764,24 @@ private struct CameraFullScreenCameraContent: View {
         if group.active { group.goLive() } else { playbackController.goLive() }
     }
 
+    private func applyInitialPositionIfAuthorized() {
+        guard access.isAuthorized, !initialPositionApplied else { return }
+        initialPositionApplied = true
+        playbackController.applyCameraSwitch(initialPosition)
+    }
+
     private var playbackControlsPresentation: CameraPlaybackControlsPresentation {
         CameraPlaybackControlsPresentation(isLive: isLive,
             timelineVisible: timelineVisible)
     }
 
-    private var cameraControlsEnabled: Bool { !switchingCamera && playbackControlsPresentation.cameraControlsEnabled }
+    private var cameraControlsEnabled: Bool { access.isUnlocked && !switchingCamera && playbackControlsPresentation.cameraControlsEnabled }
 
     private var playbackActionsEnabled: Bool {
 #if os(iOS)
-        !switchingCamera && !recordingController.locksStreamConfiguration
+        access.isUnlocked && !switchingCamera && !recordingController.locksStreamConfiguration
 #else
-        !switchingCamera
+        access.isUnlocked && !switchingCamera
 #endif
     }
 
@@ -1742,7 +1790,20 @@ private struct CameraFullScreenCameraContent: View {
     private var canControlPlayback: Bool { group.active ? group.canControlPlayback : playbackController.canControlPlayback }
     private var activeControls: LiveDeviceControlsModel { group.active ? group.sharedControls : controlsModel }
     private var isShowingVideo: Bool { group.active ? group.allPanesShowVideo : interactionPresentation.showsVideo }
-    private var visiblePlayerControls: Bool { !isShowingVideo || controlsVisible }
+    private var visiblePlayerControls: Bool { access.isUnlocked && (!isShowingVideo || controlsVisible) }
+
+    private var lockedS3Destination: CameraS3Destination? {
+        for session in group.sessions {
+            let destination = CameraS3Destination.advertised(in: session.controls.deviceMetadata)
+            if CameraS3AccessPolicy.showsPadlock(isLive: isLive,
+                showsVideo: group.showsVideo(session), historyState: session.playback.historyState,
+                resolvingTime: group.resolvingTime, destination: destination,
+                unlockedDestinationID: access.session?.unlockedCredentials?.destinationID) {
+                return destination
+            }
+        }
+        return nil
+    }
 
     private var playbackTimeZone: TimeZone {
         CameraHistoryTimestamp.timeZone(in: group.active ? (group.sessions.first?.controls.deviceMetadata ?? [:]) : controlsModel.deviceMetadata)
