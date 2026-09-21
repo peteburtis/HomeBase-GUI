@@ -590,15 +590,15 @@ final class CameraTimelineTests: XCTestCase {
         let referenceSize = thumbnailSize
         for (count, multiple) in [(1, false), (1, true), (3, true), (4, true), (2, true)] {
             layout.count = count; layout.multiple = multiple
-            let expectedSize = multiple ? referenceSize : CameraTimelineSizing.standard
+            let expectedSize = count > 1 ? referenceSize : CameraTimelineSizing.standard
             // Geometry and ScrollPosition updates settle across separate layout
             // passes. Wait for the result, not an arbitrary 150 ms deadline.
             try await wait {
                 thumbnailSize == expectedSize && abs(scroll.contentOffset.x + scroll.adjustedContentInset.left -
                     CameraTimelineScale.offset(time: oldTarget, start: oldStart, cellWidth: expectedSize.width)) < 2
             }
-            XCTAssertEqual(thumbnailSize, multiple ? referenceSize : CameraTimelineSizing.standard,
-                "Only ordinary single-camera mode opts out of compact sizing; \(count) cameras, Multiple=\(multiple)")
+            XCTAssertEqual(thumbnailSize, expectedSize,
+                "One camera always uses full sizing, independent of picker mode; \(count) cameras, Multiple=\(multiple)")
             XCTAssertEqual(scroll.contentOffset.x + scroll.adjustedContentInset.left,
                 CameraTimelineScale.offset(time: oldTarget, start: oldStart, cellWidth: thumbnailSize.width), accuracy: 2,
                 "Changing Multiple mode preserves the instant under the playhead")
@@ -747,7 +747,7 @@ private struct TimelineTestPlacement<Content: View>: View {
     @ObservedObject var layout: TimelineTestLayout
     @ViewBuilder let content: () -> Content
     var body: some View {
-        CameraTimelinePlacement(isMultiple: layout.multiple, content: content)
+        CameraTimelinePlacement(isMultiple: layout.count > 1, content: content)
     }
 }
 
@@ -780,7 +780,7 @@ private struct TimelineTestCanvas: View {
                         Rectangle().fill(index.isMultiple(of: 2) ? Color.blue.opacity(0.4) : Color.teal.opacity(0.4))
                             .frame(width: video.width, height: video.height)
                             .position(x: video.midX, y: video.midY)
-                        if layout.multiple && layout.controlsVisible {
+                        if layout.count > 1 && layout.controlsVisible {
                             CameraGroupLabelLayout(safeBounds: safe.offsetBy(dx: -cell.minX, dy: -cell.minY),
                                 aspectRatio: 16 / 9,
                                 belowVideo: CameraGroupLayout.labelsBelowVideo(count: layout.count, arrangement: arrangement)) {

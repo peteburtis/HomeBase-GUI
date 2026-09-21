@@ -228,7 +228,7 @@ private struct CameraGroupPane: View {
         }
         .background(Color.black)
         .overlay {
-            if group.active && controlsVisible {
+            if group.hasMultipleCameras && controlsVisible {
                 CameraGroupLabelLayout(safeBounds: safeBounds, aspectRatio: aspectRatio, belowVideo: labelBelowVideo) {
                     CameraGroupCameraLabel(name: session.camera.device.displayName)
                 }

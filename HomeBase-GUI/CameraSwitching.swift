@@ -127,9 +127,9 @@ struct CameraPickerPopover: View {
             }
             .frame(maxHeight: CGFloat(min(max(model.cameras.count, 1), 5)) * 48)
             HStack {
+                Spacer()
                 Toggle("Multiple", isOn: Binding(get: { multiple }, set: toggleMultiple))
                     .toggleStyle(.button)
-                Spacer()
             }
         }
         .padding(20)

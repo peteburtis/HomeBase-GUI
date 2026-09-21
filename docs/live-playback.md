@@ -140,9 +140,10 @@ screen still ends its session and releases its buffers.
   to the button baseline and up to the top of the tilt slider; pan remains below
   tilt, to the left of the capsule. Zoom-only cameras also support this panel.
   The PTZ button is shown only for a supported camera in single-camera Live mode.
-  It is absent during buffered/history playback and in Multiple mode, even with
-  only one camera selected. Returning to Live restores the button, not the sliders.
-  Leaving Live, entering Multiple, or losing the capability closes an open PTZ
+  It is absent during buffered/history playback and when two or more cameras are
+  selected. One selected camera retains PTZ even with Multiple enabled in the picker.
+  Returning to Live restores the button, not the sliders.
+  Leaving Live, adding a second camera, or losing the capability closes an open PTZ
   panel. Opening either panel never writes camera settings or changes playback.
 - Live is always alongside Play-Pause. It shows only its icon in compact width,
   and its icon and “Live” label in regular width (and on macOS).
@@ -183,7 +184,7 @@ screen still ends its session and releases its buffers.
   controls are hidden, and quality is hidden while Photos recording locks stream
   configuration. Pending day/night or privacy writes retain their brief disabled
   state to prevent duplicate actions without making the button disappear mid-use.
-  Capability-based omissions still apply, including no Photos recording in Multiple mode.
+  Capability-based omissions still apply, including no Photos recording with two or more cameras selected.
   Camera switching remains available in history. PTZ sliders and their button are hidden outside
   Live; pan, pinch, and recenter gestures are disabled there,
   including the recenter accessibility action, and pending writes are cancelled.
@@ -232,21 +233,31 @@ missing footage on the destination uses the existing gap-navigation UI.
 
 ## Multiple cameras
 
-The camera picker has a highlighted **Multiple** toggle at the bottom left.
+The camera picker has a highlighted **Multiple** toggle at the bottom trailing edge.
 It uses the native button-toggle appearance: tinted text while off and a tinted
 background while on, without a forced button border.
-Turning it on starts with the current camera checked; the picker stays open for
-selection. Choose one through four cameras. The last selected camera cannot be
+It defaults to selected every time the picker opens, with the current cameras
+checked. Opening the picker or toggling Multiple with one camera changes only
+the selection UI: it does not change clock ownership, controls, or playback.
+Choose one through four cameras; the picker stays open for selection. The last selected camera cannot be
 deselected. Turning Multiple off keeps the first selected camera and the current
 playback instant/pause state. If the group was in NVR history but the surviving
 camera has no NVR, it returns Live without restarting its connection.
+
+There is only one single-camera presentation: one selected camera has no camera
+label, full-size timeline thumbnails, and the normal recording, quality, day/night,
+privacy, and PTZ controls subject to their usual live/capability/recording rules.
+The synchronized group clock starts only when a second camera is added. Removing
+either camera from a pair returns the survivor to its own playback clock and full
+single-camera controls without replacing its session, renderer, or buffers.
+Multiple remains selected in the picker so another camera can be added directly.
 
 Quality starts at **High** (or the camera's highest supported quality) and its
 toolbar control remains available in Multiple mode. A quality change applies to
 all selected cameras; cameras added later open directly at the selected quality.
 The menu offers qualities supported by every selected camera. Adding a camera
 that cannot use the selected quality reports that incompatibility instead of
-silently changing the existing cameras. Multiple mode hides Photos recording
+silently changing the existing cameras. Two or more selected cameras hide Photos recording
 controls. In compact width with non-compact height, two, three, or four cameras
 form a single centered vertical column, in selection order. The 16:9 panes touch
 edge to edge. They use the full width when the whole column fits; otherwise the
@@ -263,7 +274,7 @@ side-by-side two-up they touch the bottom of the actual video rectangle from imm
 below it; in the column and four-up grid they sit inside the video's bottom-left corner.
 If there is too little space below a two-up video, the label moves inside rather
 than overlapping the home indicator or rounded corners.
-Labels hide and reappear with the player controls on a single tap; they remain
+Labels appear only with two or more selected cameras. They hide and reappear with the player controls on a single tap; they remain
 visible with the controls on loading, gap, and error screens.
 
 Toggling Multiple is only a selection/layout change. The surviving camera keeps
@@ -286,7 +297,7 @@ connections and caches; the existing buffer limits below apply **per camera**.
 
 Privacy and day/night controls are shown only when every selected
 camera advertises the corresponding valid, writable capability. PTZ buttons and
-sliders are hidden in Multiple mode. Drag, pinch, and two-finger recenter operate
+sliders are hidden with two or more selected cameras. Drag, pinch, and two-finger recenter operate
 only on the touched pane's camera, according to that camera's capabilities; they
 do not require support from the other cameras. Each pane remembers its own initial
 recenter position and cancels pending gestures on removal, backgrounding, or leaving
@@ -404,18 +415,18 @@ for the current playback timestamp and thumbnail interval times.
 The toolbar and camera-label safe areas are unchanged. The
 past is left, future is right. Each thumbnail cell
 represents 20 minutes, but scrolling seeks continuously, not in 20-minute steps.
-Thumbnail frames are 16:9, normally 112×63 points. Ordinary single-camera mode
-always uses that full size, including in compact height. In Multiple mode with
+Thumbnail frames are 16:9, normally 112×63 points. One selected camera
+always uses that full size, including in compact height and with Multiple selected in the picker. With two or more cameras and
 compact height, reserve the
 space below a hypothetical full-canvas two-up 16:9 video and its camera-label row,
 then subtract the time-label row and a two-point gap. Clamp thumbnail height to
 36…63 points (width 64…112). Both label rows use their actual font metrics, including
 Dynamic Type for camera names. The minimum keeps the strip usable in unusually
 short windows even when there is insufficient room to guarantee label clearance.
-This same reference determines the size in Multiple-with-one, two-up, three-up,
-and four-up views, in Live and History. Within Multiple mode, camera selection, aspect ratio,
+This same reference determines the size in two-up, three-up,
+and four-up views, in Live and History. While two or more cameras are selected, camera selection, aspect ratio,
 and toolbar visibility cannot resize it; window/size-class and font-metric changes
-can; leaving Multiple mode restores full size. Resizing preserves the centered timestamp without seeking, and all scroll,
+can; returning to one camera restores full size. Resizing preserves the centered timestamp without seeking, and all scroll,
 snap, haptic, and visible-thumbnail calculations use the resulting cell width.
 Images proportionally fill the frame,
 cropping overflow from other aspect ratios instead of letterboxing or stretching.
@@ -727,8 +738,12 @@ center without changing its horizontal anchor. Tap History again to hide it and
 animate the capsule back to its bottom safe-area anchor in the same panel transition.
 There is no separate handle or vertical show/hide gesture. Top-bar camera
 controls and gestures remain usable while Live. Horizontal timeline scrubbing
-still seeks. Verify full-size thumbnails in ordinary single-camera mode and
-compact sizing in Multiple mode, even with one selected camera. Toggle visibility while paused and
+still seeks. Verify full-size thumbnails with one camera, whether Multiple is on
+or off, and compact sizing with two or more cameras. Open the picker: Multiple
+starts selected at the trailing edge without changing the one-camera controls
+or adding a label. Add a second camera, then remove either one: the survivor's
+full controls return with no stream reload or lost pause/cursor/buffer state.
+Toggle visibility while paused and
 playing, confirming no playback state changes. In portrait, allow the system's
 native navigation-bar adaptation; there is no bespoke row layout.
 Seek to an empty time and use the gap arrows to find the preceding/following

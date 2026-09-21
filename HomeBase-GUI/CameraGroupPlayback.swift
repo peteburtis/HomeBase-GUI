@@ -63,6 +63,9 @@ final class CameraGroupSession: ObservableObject, Identifiable {
 final class CameraGroupPlayback: ObservableObject {
     enum Source: Equatable { case live, buffer, history }
     @Published private(set) var active = false
+    // Picker selection style is independent of playback/layout. One selected
+    // camera remains an ordinary single-camera player even with this enabled.
+    @Published private(set) var multipleSelectionEnabled = true
     @Published private(set) var quality: HBCameraLiveQuality
     @Published private(set) var sessions: [CameraGroupSession] = []
     @Published private(set) var source: Source = .live
@@ -106,6 +109,7 @@ final class CameraGroupPlayback: ObservableObject {
     }
 
     var isLive: Bool { source == .live }
+    var hasMultipleCameras: Bool { sessions.count > 1 }
     var hasHistory: Bool { sessions.contains { $0.historyAvailable } }
     var playbackDate: Date? { source == .history ? cursor.map(Date.init(timeIntervalSince1970:)) : nil }
     var liveEdge: Double? { edgeAnchor.map { $0.canonical + max(0, clock() - $0.host) } }
@@ -149,8 +153,19 @@ final class CameraGroupPlayback: ObservableObject {
         drive(seeking: true); refreshControls(); resume()
     }
 
-    /// Multiple is a selection/layout mode, not a camera switch. Keep the
-    /// surviving session, renderer, stream view, buffers, and history request.
+    func beginCameraSelection() {
+        multipleSelectionEnabled = true
+    }
+
+    func setMultipleSelection(_ enabled: Bool) {
+        guard !resolvingTime else { return }
+        multipleSelectionEnabled = enabled
+        if !enabled { setMultiple(false) }
+    }
+
+    /// Transfer clock ownership without replacing the surviving session,
+    /// renderer, stream view, buffers, or history request. Merely enabling
+    /// multiple selection does not require a shared playback clock.
     func setMultiple(_ enabled: Bool) {
         guard enabled != active, let first = sessions.first, !resolvingTime else { return }
         if enabled {
@@ -192,6 +207,7 @@ final class CameraGroupPlayback: ObservableObject {
             error = "\(camera.device.displayName) does not support \(quality.rawValue) quality. Select a supported quality before adding it."
             return
         }
+        if !active { setMultiple(true) }
         selection?.toggle(camera.id)
         if let old = sessions.first(where: { $0.id == camera.id }) {
             sessions.removeAll { $0.id == camera.id }
@@ -203,7 +219,13 @@ final class CameraGroupPlayback: ObservableObject {
             sessions.append(session)
             drive(session, seeking: true)
         }
-        refreshControls(); refreshPresentation()
+        if hasMultipleCameras {
+            refreshControls(); refreshPresentation()
+        } else {
+            // Removing either camera from a pair restores full single-camera
+            // behavior, regardless of the picker's Multiple toggle.
+            setMultiple(false)
+        }
     }
 
     private func makeSession(_ camera: CameraVideoDevice) -> CameraGroupSession {

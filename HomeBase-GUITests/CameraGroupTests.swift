@@ -5,6 +5,97 @@ import XCTest
 
 @MainActor
 final class CameraGroupTests: XCTestCase {
+    func testPickerDefaultsToMultipleWithoutChangingSingleCameraPlayback() async throws {
+        let client = try makeClient()
+        let session = CameraGroupSession(camera: try camera("A"), client: client, quality: .high)
+        let group = CameraGroupPlayback(client: client, initialSession: session)
+        defer { group.deactivate() }
+        session.playback.setNVRHistoryAvailable(true)
+        session.playback.history.configure(cameraID: "A", transport: GroupHistoryFetcher())
+        session.playback.seek(to: Date(timeIntervalSince1970: 500), paused: true)
+        try await settled(session.playback.history)
+        let batches = session.playback.history.buffer.batches.map(\.batch.id)
+        let renderer = session.playback.renderer
+        XCTAssertTrue(group.multipleSelectionEnabled)
+        for _ in 0..<3 {
+            group.setMultipleSelection(false)
+            XCTAssertFalse(group.multipleSelectionEnabled)
+            group.beginCameraSelection()
+            XCTAssertTrue(group.multipleSelectionEnabled, "Every opening defaults to multiple selection")
+            XCTAssertFalse(group.active, "Opening the picker must not change clock ownership")
+            XCTAssertFalse(group.hasMultipleCameras, "One camera keeps its controls and hides its label")
+            XCTAssertFalse(session.playback.externallyClocked)
+            XCTAssertTrue(group.sessions[0] === session)
+            XCTAssertTrue(session.playback.renderer === renderer)
+            XCTAssertTrue(session.playback.isPaused)
+            XCTAssertEqual(session.playback.history.position, 500)
+            XCTAssertEqual(session.quality, .high)
+            XCTAssertEqual(session.playback.history.buffer.batches.map(\.batch.id), batches)
+        }
+    }
+
+    func testAddingSecondCameraStartsSharedClockAndRemovingEitherRestoresSingleCamera() async throws {
+        for removeOriginal in [false, true] {
+            let client = try makeClient(), a = try camera("A"), b = try camera("B")
+            let original = CameraGroupSession(camera: a, client: client, quality: .medium)
+            let group = CameraGroupPlayback(client: client, initialSession: original)
+            defer { group.deactivate() }
+            original.playback.setNVRHistoryAvailable(true)
+            original.playback.history.configure(cameraID: "A", transport: GroupHistoryFetcher())
+            original.playback.seek(to: Date(timeIntervalSince1970: 500), paused: true)
+            try await settled(original.playback.history)
+            original.playback.setPlaybackSpeed(.double)
+            group.toggle(b)
+            XCTAssertTrue(group.active)
+            XCTAssertTrue(group.hasMultipleCameras)
+            XCTAssertEqual(group.cursor, 500)
+            XCTAssertTrue(group.isPaused)
+            XCTAssertEqual(group.sessions.map(\.quality), [.medium, .medium])
+            let survivor = group.sessions[removeOriginal ? 1 : 0]
+            survivor.playback.history.configure(cameraID: survivor.id, transport: GroupHistoryFetcher())
+            try await settled(survivor.playback.history)
+            let renderer = survivor.playback.renderer
+            let batches = survivor.playback.history.buffer.batches.map(\.batch.id)
+            group.toggle(removeOriginal ? a : b)
+            XCTAssertTrue(group.multipleSelectionEnabled)
+            XCTAssertFalse(group.hasMultipleCameras)
+            XCTAssertFalse(group.active)
+            XCTAssertTrue(group.sessions[0] === survivor)
+            XCTAssertTrue(survivor.playback.renderer === renderer)
+            XCTAssertFalse(survivor.playback.externallyClocked)
+            XCTAssertTrue(survivor.playback.isPaused)
+            XCTAssertEqual(survivor.playback.history.position, 500)
+            XCTAssertEqual(survivor.playback.playbackSpeed, .double)
+            XCTAssertEqual(survivor.playback.history.buffer.batches.map(\.batch.id), batches)
+            XCTAssertTrue(CameraPlayerPanelAvailability(historyAvailable: true, ptzSupported: true,
+                isLive: true, isMultiple: group.hasMultipleCameras).showsPTZ)
+        }
+    }
+
+    func testPickerCanCollapseAGroupAndReopenWithoutRestartingItsSurvivor() async throws {
+        let client = try makeClient(), a = try camera("A"), b = try camera("B")
+        let original = CameraGroupSession(camera: a, client: client)
+        let group = CameraGroupPlayback(client: client, initialSession: original)
+        defer { group.deactivate() }
+        group.toggle(b)
+        XCTAssertTrue(group.active)
+        group.setMultipleSelection(false)
+        XCTAssertFalse(group.multipleSelectionEnabled)
+        XCTAssertFalse(group.active)
+        XCTAssertEqual(group.sessions.map(\.id), [a.id])
+        group.beginCameraSelection()
+        XCTAssertTrue(group.multipleSelectionEnabled)
+        XCTAssertFalse(group.active)
+        XCTAssertTrue(group.sessions[0] === original)
+        group.toggle(a)
+        XCTAssertEqual(group.sessions.count, 1, "The final camera cannot be deselected")
+        let unsupported = CameraVideoDevice(device: b.device, capability: .init(qualities: [.low]))
+        group.toggle(unsupported)
+        XCTAssertFalse(group.active, "A rejected selection must not start a shared clock")
+        XCTAssertEqual(group.sessions.count, 1)
+        XCTAssertNotNil(group.error)
+    }
+
     func testSharedSpeedKeepsEveryHistoryPaneInLockstepAndSurvivesMultipleToggle() async throws {
         var now = 100.0
         let group = try makeGroup(clock: { now })

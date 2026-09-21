@@ -1477,7 +1477,7 @@ private struct CameraFullScreenCameraContent: View {
         .overlay(alignment: .bottom) {
             if visiblePlayerControls, panel != .ptz,
                let metadata = CameraPlaybackHistoryAvailability.metadata(in: controlsModel.deviceMetadata) {
-                CameraTimelinePlacement(isMultiple: group.active) {
+                CameraTimelinePlacement(isMultiple: group.hasMultipleCameras) {
                     CameraTimelinePanel(isPresented: timelineVisible) {
                         CameraHistoryTimeline(makeTransport: {
                             await CameraHistorySources.thumbnails(metadata: metadata, client: client, credentials: access.session?.unlockedCredentials)
@@ -1525,7 +1525,7 @@ private struct CameraFullScreenCameraContent: View {
         }
 #if os(iOS)
         .overlay(alignment: .top) {
-            if visiblePlayerControls, !group.active,
+            if visiblePlayerControls, !group.hasMultipleCameras,
                recordingController.locksStreamConfiguration || savedConfirmationVisible {
                 cameraStatusMessage.fixedSize().padding(.top, 8).allowsHitTesting(false)
             }
@@ -1550,7 +1550,7 @@ private struct CameraFullScreenCameraContent: View {
         playbackToolbar
         // In compact width, playback speed takes Record's trailing place
         // outside Live. Regular width still keeps the disabled Record button.
-        if !group.active, horizontalSizeClass != .compact || isLive {
+        if !group.hasMultipleCameras, horizontalSizeClass != .compact || isLive {
             ToolbarItem(placement: .topBarTrailing) { recordingControl }
             if horizontalSizeClass != .compact, hasLiveToolbarControls {
                 ToolbarSpacer(.fixed, placement: .topBarTrailing)
@@ -1615,7 +1615,10 @@ private struct CameraFullScreenCameraContent: View {
     }
 
     private var cameraPickerControl: some View {
-        Button { cameraPickerVisible = true } label: {
+        Button {
+            group.beginCameraSelection()
+            cameraPickerVisible = true
+        } label: {
             if switchingCamera { ProgressView() }
             else { Image(systemName: "rectangle.grid.3x3.fill") }
         }
@@ -1628,23 +1631,27 @@ private struct CameraFullScreenCameraContent: View {
         .popover(isPresented: $cameraPickerVisible, attachmentAnchor: .rect(.bounds)) {
             CameraPickerPopover(model: cameraPicker,
                 selectedIDs: Set(group.active ? group.sessions.map(\.id) : [device.identifier]),
-                multiple: group.active, toggleMultiple: setMultiple,
-                canSelect: { !group.active || group.canToggle($0) },
+                multiple: group.multipleSelectionEnabled, toggleMultiple: setMultiple,
+                canSelect: { !group.multipleSelectionEnabled || group.canToggle($0) },
                 select: {
-                    guard access.isUnlocked else { return }
-                    if group.active { stopLiveCameraGestures(); group.toggle($0) } else { switchCamera($0) }
+                    guard playbackActionsEnabled else { return }
+                    if group.multipleSelectionEnabled {
+                        stopLiveCameraGestures()
+                        group.toggle($0)
+                        if !group.hasMultipleCameras { retainCamera(primary.camera, primary.quality) }
+                    } else { switchCamera($0) }
                 })
                 .disabled(switchingCamera || group.resolvingTime)
         }
     }
 
     private func setMultiple(_ enabled: Bool) {
-        guard access.isUnlocked, enabled != group.active, !switchingCamera else { return }
+        guard access.isUnlocked, enabled != group.multipleSelectionEnabled, !switchingCamera else { return }
 #if os(iOS)
         guard !recordingController.locksStreamConfiguration else { return }
 #endif
         stopLiveCameraGestures()
-        withAnimation(.snappy) { group.setMultiple(enabled) }
+        withAnimation(.snappy) { group.setMultipleSelection(enabled) }
         if !group.active { retainCamera(primary.camera, primary.quality) }
     }
 
@@ -1770,7 +1777,7 @@ private struct CameraFullScreenCameraContent: View {
         CameraPlayerPanelAvailability(
             historyAvailable: CameraPlaybackHistoryAvailability.isAvailable(in: controlsModel.deviceMetadata),
             ptzSupported: CameraDetailControlSet(controls: controlsModel.controls).hasPTZ,
-            isLive: cameraControlsEnabled, isMultiple: group.active)
+            isLive: cameraControlsEnabled, isMultiple: group.hasMultipleCameras)
     }
 
     private var timelineVisible: Bool { panel == .history }
@@ -1805,7 +1812,7 @@ private struct CameraFullScreenCameraContent: View {
     private var isLive: Bool { group.active ? group.isLive : playbackController.isLive }
     private var isPaused: Bool { group.active ? group.isPaused : playbackController.isPaused }
     private var canControlPlayback: Bool { group.active ? group.canControlPlayback : playbackController.canControlPlayback }
-    private var activeControls: LiveDeviceControlsModel { group.active ? group.sharedControls : controlsModel }
+    private var activeControls: LiveDeviceControlsModel { group.hasMultipleCameras ? group.sharedControls : controlsModel }
     private var isShowingVideo: Bool { group.active ? group.allPanesShowVideo : interactionPresentation.showsVideo }
     private var visiblePlayerControls: Bool { access.isUnlocked && (!isShowingVideo || controlsVisible) }
 
@@ -1886,7 +1893,7 @@ private struct CameraFullScreenCameraContent: View {
         return CameraDayNightModeToolbarControl(
             target: target,
             model: activeControls,
-            appliesRepeatedSelections: group.active
+            appliesRepeatedSelections: group.hasMultipleCameras
         )
     }
 
