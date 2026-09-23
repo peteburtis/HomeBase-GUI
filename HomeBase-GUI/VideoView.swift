@@ -8,18 +8,38 @@ import SwiftUI
 
 struct VideoView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.scenePhase) private var scenePhase
 
     let cameras: [CameraVideoDevice]
     let client: HomeBaseWebSocketClient
     var onPresentationChanged: (Bool) -> Void = { _ in }
+    @StateObject private var previews: CameraGridPreviewModel
     @State private var selectedCamera: CameraVideoDevice?
+
+    init(
+        cameras: [CameraVideoDevice],
+        client: HomeBaseWebSocketClient,
+        onPresentationChanged: @escaping (Bool) -> Void = { _ in }
+    ) {
+        self.cameras = cameras
+        self.client = client
+        self.onPresentationChanged = onPresentationChanged
+        _previews = StateObject(wrappedValue: CameraGridPreviewModel(client: client))
+    }
 
     var body: some View {
         CameraAccessGate { access in
+            let previewsActive = access.isAuthorized
+                && scenePhase == .active
+                && selectedCamera == nil
             ScrollView {
                 LazyVGrid(columns: columns, spacing: gridSpacing) {
                     ForEach(cameras) { camera in
-                        cameraButton(camera, access: access)
+                        cameraButton(
+                            camera,
+                            access: access,
+                            previewsActive: previewsActive
+                        )
                     }
                 }
                 .padding(gridSpacing)
@@ -28,6 +48,10 @@ struct VideoView: View {
                     CameraUnlockButton(access: access)
                         .padding()
                 }
+            }
+            .task(id: previewTaskIdentity(isActive: previewsActive)) {
+                guard previewsActive else { return }
+                await previews.run(cameras: cameras)
             }
         }
 #if os(iOS)
@@ -65,7 +89,8 @@ struct VideoView: View {
 
     private func cameraButton(
         _ camera: CameraVideoDevice,
-        access: CameraAccessPresentation
+        access: CameraAccessPresentation,
+        previewsActive: Bool
     ) -> some View {
         Button {
             guard access.isUnlocked, access.session?.isUnlocked != false else { return }
@@ -76,15 +101,12 @@ struct VideoView: View {
         } label: {
             VStack(alignment: .leading, spacing: 0) {
                 CameraProtectedPreview(access: access) {
-                    CameraLiveVideoPlayer(
-                        deviceIdentifier: camera.device.addressableName,
-                        quality: camera.capability.previewQuality,
+                    CameraGridPreview(
+                        camera: camera,
+                        preview: previews.preview(for: camera.id),
                         client: client,
-                        allowsRetry: false,
-                        isStreamEnabled: selectedCamera == nil
+                        isActive: previewsActive
                     )
-                    .frame(maxWidth: .infinity)
-                    .background(Color.black)
                 }
 
                 Text(camera.device.displayName)
@@ -115,6 +137,19 @@ struct VideoView: View {
             : (access.showsUnlockRecovery ? "Locked. Use Unlock to authenticate." : "Camera preview hidden during authentication."))
     }
 
+    private func previewTaskIdentity(
+        isActive: Bool
+    ) -> CameraGridPreviewTaskIdentity {
+        CameraGridPreviewTaskIdentity(
+            cameras: cameras.map { camera in
+                let playbackCameraID = CameraPlaybackHistoryAvailability
+                    .metadata(in: camera.device.metadata)?.cameraID ?? ""
+                return "\(camera.id):\(playbackCameraID)"
+            },
+            isActive: isActive
+        )
+    }
+
     private func fullScreenVideo(
         for camera: CameraVideoDevice
     ) -> some View {
@@ -124,4 +159,9 @@ struct VideoView: View {
             client: client
         )
     }
+}
+
+private struct CameraGridPreviewTaskIdentity: Hashable {
+    let cameras: [String]
+    let isActive: Bool
 }

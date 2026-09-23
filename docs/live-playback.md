@@ -13,15 +13,18 @@ Buffering begins immediately when the full-screen player receives its first
 keyframe. It continues in Live, paused, and buffered-playback modes, retaining up
 to the most recent five minutes. It fills progressively; footage from before
 opening the player is generally not available in RAM, apart from the arbiter's
-small keyframe-led warm-join cache. Grid previews do not retain a playback buffer.
+small keyframe-led warm-join cache. Camera-grid previews prefer a current HBNVR
+JPEG thumbnail and refresh each camera every ten seconds over one serial media
+connection. Cameras without thumbnail support or current recording coverage
+fall back to their lowest advertised live quality. Thumbnail and live fallback
+are mutually exclusive, and grid previews do not retain a playback buffer.
 
-Opening the full-screen player suspends all camera-grid preview streams (and
+Opening the full-screen player suspends all camera-grid preview work (and
 the inline preview when opening from device details). Presentation state explicitly
-releases those previews' stream subscriptions even if SwiftUI keeps the covered
-views mounted. All live views on the same HomeBase client share a per-camera
-stream arbiter. The selected camera's full-screen player reuses its preview feed;
-on dismissal, that preview can immediately join the still-running feed. Cameras
-with no viewers close after **two seconds**. Backgrounded previews remain suspended.
+releases thumbnail polling and any fallback stream subscriptions even if SwiftUI
+keeps the covered views mounted. All live views on the same HomeBase client share
+a per-camera stream arbiter. Fallback cameras with no viewers close after **two
+seconds**. Backgrounded previews remain suspended.
 
 ### Shared live connections and quality handoff
 

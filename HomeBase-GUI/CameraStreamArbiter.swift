@@ -1,6 +1,45 @@
 import Foundation
 import HomeBaseProtocol
 
+/// A user's live-video choice. `automatic` preserves the protocol's omitted
+/// quality request, allowing HomeBase to select its shared/default source.
+nonisolated enum CameraLiveQualitySelection: String, CaseIterable, Comparable, Sendable {
+    case automatic
+    case low
+    case medium
+    case high
+
+    init(_ quality: HBCameraLiveQuality) {
+        switch quality {
+        case .low: self = .low
+        case .medium: self = .medium
+        case .high: self = .high
+        }
+    }
+
+    var requestedQuality: HBCameraLiveQuality? {
+        switch self {
+        case .automatic: nil
+        case .low: .low
+        case .medium: .medium
+        case .high: .high
+        }
+    }
+
+    private var priority: Int {
+        switch self {
+        case .low: 0
+        case .medium: 1
+        case .high: 2
+        case .automatic: 3
+        }
+    }
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        lhs.priority < rhs.priority
+    }
+}
+
 /// Invalidated synchronously by the camera lock, including during an acquire.
 nonisolated final class CameraStreamAuthorization: @unchecked Sendable {
     private let lock = NSLock()
@@ -39,7 +78,7 @@ nonisolated enum CameraStreamError: Error, LocalizedError, Equatable {
 /// One arbiter per Homebase client/session. This shares encoded media, not view
 /// renderers, five-minute playback buffers, Photos writers, or history readers.
 actor CameraStreamArbiter {
-    typealias Open = @Sendable (String, HBCameraLiveQuality) async throws -> CameraStreamUpstream
+    typealias Open = @Sendable (String, CameraLiveQualitySelection) async throws -> CameraStreamUpstream
     typealias Sleep = @Sendable (Double) async throws -> Void
     struct Policy: Sendable {
         var idleGrace = 2.0
@@ -50,16 +89,16 @@ actor CameraStreamArbiter {
         var consumerQueue = 120
     }
     private final class Consumer {
-        var quality: HBCameraLiveQuality
+        var quality: CameraLiveQualitySelection
         let continuation: AsyncThrowingStream<CameraStreamEvent, Error>.Continuation
         var joinedGeneration: UInt32?
-        init(_ quality: HBCameraLiveQuality, _ continuation: AsyncThrowingStream<CameraStreamEvent, Error>.Continuation) {
+        init(_ quality: CameraLiveQualitySelection, _ continuation: AsyncThrowingStream<CameraStreamEvent, Error>.Continuation) {
             self.quality = quality; self.continuation = continuation
         }
     }
     private final class Worker {
         let id = UUID()
-        let quality: HBCameraLiveQuality
+        let quality: CameraLiveQualitySelection
         var task: Task<Void, Never>?
         var deadline: Task<Void, Never>?
         var configuration: HBMediaFrame?
@@ -68,7 +107,7 @@ actor CameraStreamArbiter {
         var gop: [HBMediaFrame] = []
         var bytes = 0
         var retiring = false
-        init(_ quality: HBCameraLiveQuality) { self.quality = quality }
+        init(_ quality: CameraLiveQualitySelection) { self.quality = quality }
     }
     private final class Entry {
         let authorization: CameraStreamAuthorization?
@@ -81,7 +120,7 @@ actor CameraStreamArbiter {
         var delayed: Task<Void, Never>?
         var delayToken: UUID?
         var retryCount = 0
-        var requested: HBCameraLiveQuality?
+        var requested: CameraLiveQualitySelection?
         init(_ authorization: CameraStreamAuthorization?) { self.authorization = authorization }
     }
     private let open: Open
@@ -95,7 +134,7 @@ actor CameraStreamArbiter {
         self.policy = policy; self.sleep = sleep; self.open = open
     }
 
-    func subscribe(camera: String, quality: HBCameraLiveQuality, authorization: CameraStreamAuthorization? = nil) throws -> CameraStreamSubscription {
+    func subscribe(camera: String, quality: CameraLiveQualitySelection, authorization: CameraStreamAuthorization? = nil) throws -> CameraStreamSubscription {
         try Task.checkCancellation()
         // Keep the advertised address intact: the server's initial device
         // lookup is case-sensitive even though its internal fanout key is not.
@@ -114,7 +153,7 @@ actor CameraStreamArbiter {
         return .init(id: id, camera: camera, events: pair.stream)
     }
 
-    func update(_ subscription: CameraStreamSubscription, quality: HBCameraLiveQuality) {
+    func update(_ subscription: CameraStreamSubscription, quality: CameraLiveQualitySelection) {
         guard let entry = entries[subscription.camera], let consumer = entry.consumers[subscription.id] else { return }
         consumer.quality = quality
         reconcile(subscription.camera, entry)
@@ -194,7 +233,7 @@ actor CameraStreamArbiter {
         entry.delayed = nil; entry.delayToken = nil
         reconcile(camera, entry, allowDowngrade: true)
     }
-    private func start(_ camera: String, _ entry: Entry, quality: HBCameraLiveQuality) {
+    private func start(_ camera: String, _ entry: Entry, quality: CameraLiveQualitySelection) {
         let worker = Worker(quality)
         entry.workers[worker.id] = worker; entry.candidate = worker.id
         worker.task = Task { [weak self, open] in

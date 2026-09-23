@@ -48,7 +48,7 @@ struct DeviceDetailView: View {
                     CameraProtectedPreview(access: access) {
                         CameraLiveVideoPlayer(
                             deviceIdentifier: device.addressableName,
-                            quality: cameraCapability.previewQuality,
+                            quality: CameraLiveQualitySelection(cameraCapability.previewQuality),
                             client: client,
                             allowsRetry: false,
                             isStreamEnabled: !isShowingFullScreenVideo,

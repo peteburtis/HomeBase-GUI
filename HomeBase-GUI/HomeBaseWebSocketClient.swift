@@ -176,7 +176,7 @@ actor HomeBaseWebSocketClient {
         return arbiter
     }
 
-    private func openSharedCameraStream(_ camera: String, quality: HBCameraLiveQuality) async throws -> CameraStreamUpstream {
+    private func openSharedCameraStream(_ camera: String, quality: CameraLiveQualitySelection) async throws -> CameraStreamUpstream {
         try Task.checkCancellation()
         let lease = try await openCameraLiveStream(deviceIdentifier: camera, quality: quality)
         var connection: HomeBaseMediaConnection?
@@ -979,13 +979,13 @@ actor HomeBaseWebSocketClient {
 
     func openCameraLiveStream(
         deviceIdentifier: String,
-        quality: HBCameraLiveQuality
+        quality: CameraLiveQualitySelection
     ) async throws -> CameraLiveLease {
         let request = try sessionRequest(
             operation: HBProtocolOperations.openCameraLiveStream,
             payload: HBCameraLiveOpenRequest(
                 deviceIdentifier: deviceIdentifier,
-                quality: quality,
+                quality: quality.requestedQuality,
                 isolatedQuality: true
             )
         )
@@ -994,7 +994,7 @@ actor HomeBaseWebSocketClient {
         let opened = try body.decodedResult(
             as: HBCameraLiveOpenResult.self
         )
-        guard opened.requestedQuality == quality,
+        guard quality.requestedQuality.map({ opened.requestedQuality == $0 }) ?? true,
               opened.mediaPort > 0,
               !opened.deviceIdentifier.isEmpty,
               !opened.ticket.isEmpty else {

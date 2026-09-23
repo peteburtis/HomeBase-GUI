@@ -284,7 +284,7 @@ final class CameraStreamArbiterTests: XCTestCase {
             let wire = wire, clock = clock
             arbiter = CameraStreamArbiter(policy: policy, sleep: { try await clock.sleep($0) }, open: { try await wire.open($0, $1) })
         }
-        func join(_ camera: String, _ quality: HBCameraLiveQuality) async throws -> Collector {
+        func join(_ camera: String, _ quality: CameraLiveQualitySelection) async throws -> Collector {
             Collector(try await arbiter.subscribe(camera: camera, quality: quality))
         }
         func leave(_ c: Collector) async { await arbiter.unsubscribe(camera: c.subscription.camera, id: c.subscription.id) }
@@ -322,7 +322,7 @@ final class CameraStreamArbiterTests: XCTestCase {
 
 private actor Wire {
     private var outputs: [AsyncThrowingStream<HBMediaFrame, Error>.Continuation] = []
-    private(set) var qualities: [HBCameraLiveQuality] = []
+    private(set) var qualities: [CameraLiveQualitySelection] = []
     private(set) var cameras: [String] = []
     private(set) var closed: Set<Int> = []
     private(set) var closing: Set<Int> = []
@@ -335,7 +335,7 @@ private actor Wire {
     func releaseOpen() { holdsOpen = false; openWaiter?.resume(); openWaiter = nil }
     func holdClose(_ index: Int) { heldCloses.insert(index) }
     func releaseClose(_ index: Int) { heldCloses.remove(index); closeWaiters.removeValue(forKey: index)?.resume() }
-    func open(_ camera: String, _ quality: HBCameraLiveQuality) async throws -> CameraStreamUpstream {
+    func open(_ camera: String, _ quality: CameraLiveQualitySelection) async throws -> CameraStreamUpstream {
         let pair = AsyncThrowingStream<HBMediaFrame, Error>.makeStream()
         let index = outputs.count
         outputs.append(pair.continuation); qualities.append(quality); cameras.append(camera)
@@ -348,7 +348,7 @@ private actor Wire {
         closed.insert(index); outputs[index].finish()
     }
     func configuration(_ index: Int) {
-        let config = HBMediaStreamConfiguration(generation: 1, quality: qualities[index], width: 640, height: 360,
+        let config = HBMediaStreamConfiguration(generation: 1, quality: qualities[index].requestedQuality ?? .medium, width: 640, height: 360,
                                                 sequenceParameterSet: Data([0x67, 0x64]).base64EncodedString(),
                                                 pictureParameterSet: Data([0x68, 0x01]).base64EncodedString())
         outputs[index].yield(HBMediaFrame(type: .streamConfiguration, generation: 1, payload: try! JSONEncoder().encode(config)))

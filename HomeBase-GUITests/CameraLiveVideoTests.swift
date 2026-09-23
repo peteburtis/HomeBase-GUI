@@ -58,6 +58,18 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertEqual(capability?.fullScreenQuality, .high)
     }
 
+    func testCapabilityUsesDefaultOnlyWhenServerAdvertisesStreamPolicy() {
+        let capability = CameraLiveVideoCapability(metadata: [
+            CameraLiveVideoCapability.availableMetadataKey: .bool(true),
+            CameraLiveVideoCapability.streamPolicyMetadataKey: .object([
+                "version": .integer(1),
+            ]),
+        ])
+
+        XCTAssertTrue(capability?.supportsDefaultQuality == true)
+        XCTAssertEqual(capability?.fullScreenQuality, .automatic)
+    }
+
     func testVideoCatalogIncludesOnlyLiveH264CamerasInTopologyOrder() {
         let devices = [
             HBTopologyDeviceDescriptor(
@@ -110,10 +122,24 @@ final class CameraLiveVideoTests: XCTestCase {
         )
     }
 
-    func testQualityMenuShowsOnlyAvailableTiersFromHighestToLowest() {
+    func testQualityMenuShowsDefaultBeforeAvailableTiersFromHighestToLowest() {
         XCTAssertEqual(
-            CameraLiveQualityPresentation.options(in: [.low, .high]),
+            CameraLiveQualityPresentation.options(
+                in: [.low, .high],
+                includesDefault: true
+            ),
+            [.automatic, .high, .low]
+        )
+        XCTAssertEqual(
+            CameraLiveQualityPresentation.options(
+                in: [.low, .high],
+                includesDefault: false
+            ),
             [.high, .low]
+        )
+        XCTAssertEqual(
+            CameraLiveQualityPresentation.title(for: .automatic),
+            "Default"
         )
         XCTAssertEqual(
             CameraLiveQualityPresentation.title(for: .low),
@@ -127,6 +153,13 @@ final class CameraLiveVideoTests: XCTestCase {
             CameraLiveQualityPresentation.title(for: .high),
             "High"
         )
+    }
+
+    func testDefaultQualityOmitsConcreteProtocolQuality() {
+        XCTAssertNil(CameraLiveQualitySelection.automatic.requestedQuality)
+        XCTAssertEqual(CameraLiveQualitySelection.low.requestedQuality, .low)
+        XCTAssertEqual(CameraLiveQualitySelection.medium.requestedQuality, .medium)
+        XCTAssertEqual(CameraLiveQualitySelection.high.requestedQuality, .high)
     }
 
     func testAVCCValidationAcceptsRepeatedLengthPrefixedNALUnits() {

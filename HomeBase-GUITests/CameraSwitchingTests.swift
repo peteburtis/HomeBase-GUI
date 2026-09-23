@@ -18,7 +18,7 @@ final class CameraSwitchingTests: XCTestCase {
     // Keep actor-owned model teardown inside a Swift task, as in the existing
     // playback tests. iOS 26.1's isolated-deinit runtime crashes when nested
     // model deinits are invoked through XCTest's synchronous ObjC entry point.
-    func testSameCameraKeepsSessionAndDifferentCameraStartsFreshLive() async throws {
+    func testSameCameraKeepsSessionAndDifferentCameraStartsFreshLiveAtDefaultQuality() async throws {
         let first = try camera("First")
         let second = try camera("Second", qualities: ["low", "medium"])
         let selection = CameraScreenSelection(device: first.device, quality: .low)
@@ -29,7 +29,7 @@ final class CameraSwitchingTests: XCTestCase {
         selection.select(second, position: .live)
         XCTAssertNotEqual(selection.session.id, original)
         XCTAssertEqual(selection.session.device.identifier, second.id)
-        XCTAssertEqual(selection.session.quality, .medium)
+        XCTAssertEqual(selection.session.quality, .automatic)
         XCTAssertEqual(selection.session.position, .live)
     }
 
@@ -136,7 +136,8 @@ final class CameraSwitchingTests: XCTestCase {
 
     private func camera(_ name: String, history: Bool = true, qualities: [String] = ["low", "high"]) throws -> CameraVideoDevice {
         var metadata: [String: HBJSONValue] = [CameraLiveVideoCapability.availableMetadataKey: .bool(true),
-            CameraLiveVideoCapability.qualitiesMetadataKey: .array(qualities.map(HBJSONValue.string))]
+            CameraLiveVideoCapability.qualitiesMetadataKey: .array(qualities.map(HBJSONValue.string)),
+            CameraLiveVideoCapability.streamPolicyMetadataKey: .object(["version": .integer(1)])]
         if history {
             metadata[HBDeviceMetadataKeys.cameraPlayback] = try HBJSONValue(encoding:
                 HBCameraPlaybackMetadata(nvrInstanceID: "nvr", cameraID: UUID().uuidString,

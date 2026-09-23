@@ -22,7 +22,7 @@ final class CameraGroupSession: ObservableObject, Identifiable {
     let gestures: CameraPaneGestures
     @Published var liveState: CameraLiveVideoModel.State = .idle
     private(set) var hostOrigin: Double?
-    @Published var quality: HBCameraLiveQuality
+    @Published var quality: CameraLiveQualitySelection
 #if os(iOS)
     let recordingController = CameraLocalRecordingController(destination: CameraPhotoLibraryRecordingDestination())
 #endif
@@ -35,9 +35,9 @@ final class CameraGroupSession: ObservableObject, Identifiable {
     }
     var historyAvailable: Bool { CameraPlaybackHistoryAvailability.isAvailable(in: controls.deviceMetadata) }
 
-    init(camera: CameraVideoDevice, client: HomeBaseWebSocketClient, quality: HBCameraLiveQuality = .high) {
+    init(camera: CameraVideoDevice, client: HomeBaseWebSocketClient, quality: CameraLiveQualitySelection? = nil) {
         self.camera = camera
-        self.quality = quality
+        self.quality = quality ?? camera.capability.fullScreenQuality
         let controls = LiveDeviceControlsModel(device: camera.device, client: client)
         self.controls = controls
         gestures = CameraPaneGestures(model: controls)
@@ -66,7 +66,7 @@ final class CameraGroupPlayback: ObservableObject {
     // Picker selection style is independent of playback/layout. One selected
     // camera remains an ordinary single-camera player even with this enabled.
     @Published private(set) var multipleSelectionEnabled = true
-    @Published private(set) var quality: HBCameraLiveQuality
+    @Published private(set) var quality: CameraLiveQualitySelection
     @Published private(set) var sessions: [CameraGroupSession] = []
     @Published private(set) var source: Source = .live
     @Published private(set) var isPaused = false
@@ -93,7 +93,7 @@ final class CameraGroupPlayback: ObservableObject {
     init(client: HomeBaseWebSocketClient, initialSession: CameraGroupSession? = nil,
          clock: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }) {
         self.client = client; self.clock = clock
-        quality = initialSession?.quality ?? .high
+        quality = initialSession?.quality ?? .automatic
         sharedControls = LiveDeviceControlsModel(device: nil, client: client)
         sharedControls.installWriteRouting(value: { [weak self] value, control, _ in
             guard let self else { throw CancellationError() }
@@ -114,13 +114,26 @@ final class CameraGroupPlayback: ObservableObject {
     var playbackDate: Date? { source == .history ? cursor.map(Date.init(timeIntervalSince1970:)) : nil }
     var liveEdge: Double? { edgeAnchor.map { $0.canonical + max(0, clock() - $0.host) } }
 
-    var availableQualities: Set<HBCameraLiveQuality> {
+    var availableConcreteQualities: Set<HBCameraLiveQuality> {
         sessions.reduce(Set(HBCameraLiveQuality.allCases)) { result, session in
             result.intersection(CameraLiveVideoCapability(metadata: session.controls.deviceMetadata)?.qualities ?? session.camera.capability.qualities)
         }
     }
 
-    func setQuality(_ value: HBCameraLiveQuality) {
+    var supportsDefaultQuality: Bool {
+        !sessions.isEmpty && sessions.allSatisfy { session in
+            (CameraLiveVideoCapability(metadata: session.controls.deviceMetadata)
+                ?? session.camera.capability).supportsDefaultQuality
+        }
+    }
+
+    var availableQualities: Set<CameraLiveQualitySelection> {
+        var result = Set(availableConcreteQualities.map(CameraLiveQualitySelection.init))
+        if supportsDefaultQuality { result.insert(.automatic) }
+        return result
+    }
+
+    func setQuality(_ value: CameraLiveQualitySelection) {
         guard value != quality else { return }
         guard availableQualities.contains(value) else {
             error = "This video quality is not supported by every selected camera."
@@ -143,6 +156,7 @@ final class CameraGroupPlayback: ObservableObject {
 
     func activate(camera: CameraVideoDevice, position: CameraSwitchPosition) {
         deactivate()
+        quality = camera.capability.fullScreenQuality
         selection = CameraMultipleSelection(first: camera.id)
         sessions = [makeSession(camera)]
         sessions[0].playback.useGroupClock()
@@ -203,8 +217,9 @@ final class CameraGroupPlayback: ObservableObject {
     func canToggle(_ camera: CameraVideoDevice) -> Bool { selection?.canToggle(camera.id) == true && !resolvingTime }
     func toggle(_ camera: CameraVideoDevice) {
         guard canToggle(camera) else { return }
-        if !sessions.contains(where: { $0.id == camera.id }), !camera.capability.qualities.contains(quality) {
-            error = "\(camera.device.displayName) does not support \(quality.rawValue) quality. Select a supported quality before adding it."
+        if !sessions.contains(where: { $0.id == camera.id }),
+           !supports(quality, on: camera.capability) {
+            error = "\(camera.device.displayName) does not support \(CameraLiveQualityPresentation.title(for: quality)) quality. Select a supported quality before adding it."
             return
         }
         if !active { setMultiple(true) }
@@ -226,6 +241,16 @@ final class CameraGroupPlayback: ObservableObject {
             // behavior, regardless of the picker's Multiple toggle.
             setMultiple(false)
         }
+    }
+
+    private func supports(
+        _ selection: CameraLiveQualitySelection,
+        on capability: CameraLiveVideoCapability
+    ) -> Bool {
+        if let requestedQuality = selection.requestedQuality {
+            return capability.qualities.contains(requestedQuality)
+        }
+        return capability.supportsDefaultQuality
     }
 
     private func makeSession(_ camera: CameraVideoDevice) -> CameraGroupSession {

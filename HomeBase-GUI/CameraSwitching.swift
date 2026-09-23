@@ -34,14 +34,14 @@ final class CameraScreenSelection: ObservableObject {
     struct Session {
         let id: UUID
         let device: HBTopologyDeviceDescriptor
-        let quality: HBCameraLiveQuality
+        let quality: CameraLiveQualitySelection
         let position: CameraSwitchPosition
-        init(id: UUID = UUID(), device: HBTopologyDeviceDescriptor, quality: HBCameraLiveQuality, position: CameraSwitchPosition) {
+        init(id: UUID = UUID(), device: HBTopologyDeviceDescriptor, quality: CameraLiveQualitySelection, position: CameraSwitchPosition) {
             self.id = id; self.device = device; self.quality = quality; self.position = position
         }
     }
     @Published private(set) var session: Session
-    init(device: HBTopologyDeviceDescriptor, quality: HBCameraLiveQuality) {
+    init(device: HBTopologyDeviceDescriptor, quality: CameraLiveQualitySelection) {
         session = Session(device: device, quality: quality, position: .live)
     }
     func select(_ camera: CameraVideoDevice, position: CameraSwitchPosition) {
@@ -50,7 +50,7 @@ final class CameraScreenSelection: ObservableObject {
             position: CameraPlaybackHistoryAvailability.isAvailable(in: camera.device.metadata) ? position : .live)
     }
 
-    func retain(_ camera: CameraVideoDevice, quality: HBCameraLiveQuality) {
+    func retain(_ camera: CameraVideoDevice, quality: CameraLiveQualitySelection) {
         guard camera.id != session.device.identifier || quality != session.quality else { return }
         session = Session(id: session.id, device: camera.device, quality: quality, position: session.position)
     }

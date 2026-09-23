@@ -21,10 +21,18 @@ struct CameraLiveVideoCapability: Equatable, Sendable {
     static let availableMetadataKey = "cameraLiveVideo"
     static let codecsMetadataKey = "cameraVideoCodecs"
     static let qualitiesMetadataKey = "cameraVideoQualities"
+    static let streamPolicyMetadataKey = "cameraLiveStream"
 
     let qualities: Set<HBCameraLiveQuality>
+    let supportsDefaultQuality: Bool
 
-    init(qualities: Set<HBCameraLiveQuality>) { self.qualities = qualities }
+    init(
+        qualities: Set<HBCameraLiveQuality>,
+        supportsDefaultQuality: Bool = false
+    ) {
+        self.qualities = qualities
+        self.supportsDefaultQuality = supportsDefaultQuality
+    }
 
     init?(metadata: [String: HBJSONValue]) {
         guard metadata[Self.availableMetadataKey]?.boolValue == true else {
@@ -45,14 +53,18 @@ struct CameraLiveVideoCapability: Equatable, Sendable {
         self.qualities = qualities.isEmpty
             ? Set(HBCameraLiveQuality.allCases)
             : qualities
+        supportsDefaultQuality = metadata[Self.streamPolicyMetadataKey]?
+            .objectValue?["version"]?.numberValue.map { $0 >= 1 } ?? false
     }
 
     var previewQuality: HBCameraLiveQuality {
         qualities.min() ?? .low
     }
 
-    var fullScreenQuality: HBCameraLiveQuality {
-        qualities.max() ?? .high
+    var fullScreenQuality: CameraLiveQualitySelection {
+        supportsDefaultQuality
+            ? .automatic
+            : CameraLiveQualitySelection(qualities.max() ?? .high)
     }
 }
 
@@ -81,13 +93,16 @@ enum CameraVideoCatalog {
 
 enum CameraLiveQualityPresentation {
     static func options(
-        in qualities: Set<HBCameraLiveQuality>
-    ) -> [HBCameraLiveQuality] {
-        qualities.sorted(by: >)
+        in qualities: Set<HBCameraLiveQuality>,
+        includesDefault: Bool
+    ) -> [CameraLiveQualitySelection] {
+        (includesDefault ? [.automatic] : [])
+            + qualities.sorted(by: >).map(CameraLiveQualitySelection.init)
     }
 
-    static func title(for quality: HBCameraLiveQuality) -> String {
+    static func title(for quality: CameraLiveQualitySelection) -> String {
         switch quality {
+        case .automatic: return "Default"
         case .low: return "Low"
         case .medium: return "Medium"
         case .high: return "High"
@@ -571,7 +586,7 @@ final class CameraLiveVideoModel: ObservableObject {
     let renderer: CameraH264Renderer
 
     private let deviceIdentifier: String
-    private var quality: HBCameraLiveQuality
+    private var quality: CameraLiveQualitySelection
     private let client: HomeBaseWebSocketClient
     private let recordingController: CameraLocalRecordingController?
     private let playbackController: CameraLivePlaybackController?
@@ -582,7 +597,7 @@ final class CameraLiveVideoModel: ObservableObject {
 
     init(
         deviceIdentifier: String,
-        quality: HBCameraLiveQuality,
+        quality: CameraLiveQualitySelection,
         client: HomeBaseWebSocketClient,
         recordingController: CameraLocalRecordingController? = nil,
         playbackController: CameraLivePlaybackController? = nil
@@ -595,7 +610,7 @@ final class CameraLiveVideoModel: ObservableObject {
         self.renderer = playbackController?.renderer ?? CameraH264Renderer()
     }
 
-    func setQuality(_ quality: HBCameraLiveQuality) async {
+    func setQuality(_ quality: CameraLiveQualitySelection) async {
         self.quality = quality
         if let arbiter, let subscription { await arbiter.update(subscription, quality: quality) }
     }
@@ -809,13 +824,13 @@ struct CameraLiveVideoPlayer: View {
     private let isStreamEnabled: Bool
     private let restartRequest: Int
     private let usesHistory: Bool
-    private let quality: HBCameraLiveQuality
+    private let quality: CameraLiveQualitySelection
     private let onStateChanged: ((CameraLiveVideoModel.State) -> Void)?
     private let onAspectRatioChanged: ((CGFloat) -> Void)?
 
     init(
         deviceIdentifier: String,
-        quality: HBCameraLiveQuality,
+        quality: CameraLiveQualitySelection,
         client: HomeBaseWebSocketClient,
         allowsRetry: Bool,
         isStreamEnabled: Bool = true,
@@ -1224,7 +1239,7 @@ struct CameraFullScreenLiveVideoView: View {
     @State private var panel = CameraPlayerPanel.off
     @State private var controlsVisible = true
 
-    init(device: HBTopologyDeviceDescriptor, quality: HBCameraLiveQuality, client: HomeBaseWebSocketClient) {
+    init(device: HBTopologyDeviceDescriptor, quality: CameraLiveQualitySelection, client: HomeBaseWebSocketClient) {
         self.client = client
         _selection = StateObject(wrappedValue: CameraScreenSelection(device: device, quality: quality))
         _cameraPicker = StateObject(wrappedValue: CameraPickerModel {
@@ -1280,7 +1295,7 @@ private struct CameraFullScreenCameraContent: View {
     private var device: HBTopologyDeviceDescriptor { primary.camera.device }
     private var controlsModel: LiveDeviceControlsModel { primary.controls }
     private var playbackController: CameraLivePlaybackController { primary.playback }
-    private var selectedQuality: HBCameraLiveQuality {
+    private var selectedQuality: CameraLiveQualitySelection {
         get { group.quality }
         nonmutating set { group.setQuality(newValue) }
     }
@@ -1289,7 +1304,7 @@ private struct CameraFullScreenCameraContent: View {
     let initialPosition: CameraSwitchPosition
     let cameraPicker: CameraPickerModel
     let selectCamera: (CameraVideoDevice, CameraSwitchPosition) -> Void
-    let retainCamera: (CameraVideoDevice, HBCameraLiveQuality) -> Void
+    let retainCamera: (CameraVideoDevice, CameraLiveQualitySelection) -> Void
     @State private var initialPositionApplied = false
     @State private var cameraPickerVisible = false
     @State private var switchingCamera = false
@@ -1305,7 +1320,7 @@ private struct CameraFullScreenCameraContent: View {
 
     init(
         device: HBTopologyDeviceDescriptor,
-        quality: HBCameraLiveQuality,
+        quality: CameraLiveQualitySelection,
         client: HomeBaseWebSocketClient,
         access: CameraAccessPresentation,
         initialPosition: CameraSwitchPosition,
@@ -1313,7 +1328,7 @@ private struct CameraFullScreenCameraContent: View {
         panel: Binding<CameraPlayerPanel>,
         controlsVisible: Binding<Bool>,
         selectCamera: @escaping (CameraVideoDevice, CameraSwitchPosition) -> Void,
-        retainCamera: @escaping (CameraVideoDevice, HBCameraLiveQuality) -> Void
+        retainCamera: @escaping (CameraVideoDevice, CameraLiveQualitySelection) -> Void
     ) {
         self.client = client
         self.access = access
@@ -1323,8 +1338,13 @@ private struct CameraFullScreenCameraContent: View {
         self.retainCamera = retainCamera
         _panel = panel
         _controlsVisible = controlsVisible
+        let fallbackQualities = quality.requestedQuality.map { Set([$0]) }
+            ?? Set(HBCameraLiveQuality.allCases)
         let camera = CameraVideoDevice(device: device,
-            capability: CameraLiveVideoCapability(metadata: device.metadata) ?? .init(qualities: [quality]))
+            capability: CameraLiveVideoCapability(metadata: device.metadata) ?? .init(
+                qualities: fallbackQualities,
+                supportsDefaultQuality: quality == .automatic
+            ))
         let session = CameraGroupSession(camera: camera, client: client, quality: quality)
         _initialSession = StateObject(wrappedValue: session)
         _group = StateObject(wrappedValue: CameraGroupPlayback(client: client, initialSession: session))
@@ -1933,8 +1953,11 @@ private struct CameraFullScreenCameraContent: View {
 #endif
     }
 
-    private var availableQualities: [HBCameraLiveQuality] {
-        CameraLiveQualityPresentation.options(in: group.availableQualities)
+    private var availableQualities: [CameraLiveQualitySelection] {
+        CameraLiveQualityPresentation.options(
+            in: group.availableConcreteQualities,
+            includesDefault: group.supportsDefaultQuality
+        )
     }
 
     private func toggleControls() {

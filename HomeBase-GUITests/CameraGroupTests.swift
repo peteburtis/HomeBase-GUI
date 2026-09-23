@@ -385,12 +385,12 @@ final class CameraGroupTests: XCTestCase {
         XCTAssertFalse(CameraGroupLayout.labelsBelowVideo(count: 4, arrangement: .grid))
     }
 
-    func testAllSessionsStartHighAndSelectionPreservesSharedCursorAndPause() async throws {
+    func testAllSessionsStartWithDefaultQualityAndSelectionPreservesSharedCursorAndPause() async throws {
         let group = try makeGroup()
         defer { group.deactivate() }
         group.activate(camera: try camera("A"), position: .canonical(500, paused: true))
         group.toggle(try camera("B")); group.toggle(try camera("C", history: false))
-        XCTAssertEqual(group.sessions.map(\.quality), [.high, .high, .high])
+        XCTAssertEqual(group.sessions.map(\.quality), [.automatic, .automatic, .automatic])
         XCTAssertTrue(group.sessions.allSatisfy { $0.playback.externallyClocked })
         XCTAssertEqual(group.cursor, 500)
         XCTAssertTrue(group.isPaused)
@@ -409,7 +409,7 @@ final class CameraGroupTests: XCTestCase {
         defer { group.deactivate() }
         group.activate(camera: try camera("A"), position: .live)
         group.toggle(try camera("B"))
-        XCTAssertEqual(group.quality, .high)
+        XCTAssertEqual(group.quality, .automatic)
         let first = group.sessions[0]
         group.setQuality(.medium)
         XCTAssertEqual(group.sessions.map(\.quality), [.medium, .medium])
@@ -428,6 +428,7 @@ final class CameraGroupTests: XCTestCase {
         let group = try makeGroup()
         defer { group.deactivate() }
         group.activate(camera: try camera("A"), position: .live)
+        group.setQuality(.high)
         let low = CameraVideoDevice(device: try camera("Low-only").device,
             capability: CameraLiveVideoCapability(qualities: [.low]))
         group.toggle(low)
@@ -685,7 +686,8 @@ final class CameraGroupTests: XCTestCase {
     }
     private func camera(_ name: String, history: Bool = true) throws -> CameraVideoDevice {
         var metadata: [String: HBJSONValue] = [CameraLiveVideoCapability.availableMetadataKey: .bool(true),
-            CameraLiveVideoCapability.qualitiesMetadataKey: .array([.string("medium"), .string("high")])]
+            CameraLiveVideoCapability.qualitiesMetadataKey: .array([.string("medium"), .string("high")]),
+            CameraLiveVideoCapability.streamPolicyMetadataKey: .object(["version": .integer(1)])]
         if history { metadata[HBDeviceMetadataKeys.cameraPlayback] = try HBJSONValue(encoding:
             HBCameraPlaybackMetadata(nvrInstanceID: "nvr", cameraID: UUID().uuidString, stores: [.init(id: "local", name: "Local")])) }
         return try XCTUnwrap(CameraVideoCatalog.cameras(in: [.init(identifier: name, addressableName: name, displayName: name, metadata: metadata)]).first)
