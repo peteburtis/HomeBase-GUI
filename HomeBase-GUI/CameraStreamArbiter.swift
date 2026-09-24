@@ -174,6 +174,14 @@ actor CameraStreamArbiter {
             }
         } else { reconcile(camera, entry) }
     }
+
+    /// Upgrade an ordinary handoff release to an immediate shutdown. This is
+    /// intentionally a no-op while another consumer still owns the camera.
+    func stopIdleStreamImmediately(camera: String) {
+        guard let entry = entries[camera], entry.consumers.isEmpty else { return }
+        remove(camera, error: CancellationError())
+    }
+
     private func expire(_ camera: String, entry: Entry, token: UUID) {
         guard entries[camera] === entry, entry.idleToken == token, entry.consumers.isEmpty else { return }
         remove(camera, error: CancellationError())

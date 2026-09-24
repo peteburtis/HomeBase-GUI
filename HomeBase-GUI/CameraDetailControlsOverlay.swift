@@ -694,21 +694,13 @@ struct CameraPrivacyToolbarControl: View {
     @ObservedObject var model: LiveDeviceControlsModel
 
     var body: some View {
-        Button {
-            let requestedValue = !isOn
-            Task {
-                try? await model.setPresentedValue(
-                    control.cameraOverlayBooleanWireValue(requestedValue),
-                    for: control,
-                    origin: .inline
-                )
-            }
-        } label: {
+        Toggle(isOn: selection) {
             Label("Privacy mode", systemImage:
                 CameraPrivacyButtonPresentation.systemImageName(
                     privacyEnabled: isOn
                 ))
         }
+        .toggleStyle(.button)
         .disabled(!isEnabled || control.isUpdating)
         .accessibilityLabel("Privacy mode")
         .accessibilityValue(isOn ? "On" : "Off")
@@ -719,6 +711,22 @@ struct CameraPrivacyToolbarControl: View {
 
     private var isOn: Bool {
         control.cameraOverlayBooleanValue ?? false
+    }
+
+    private var selection: Binding<Bool> {
+        Binding(
+            get: { isOn },
+            set: { requestedValue in
+                guard requestedValue != isOn else { return }
+                Task {
+                    try? await model.setPresentedValue(
+                        control.cameraOverlayBooleanWireValue(requestedValue),
+                        for: control,
+                        origin: .inline
+                    )
+                }
+            }
+        )
     }
 
     private var isEnabled: Bool {
@@ -734,28 +742,18 @@ struct CameraDayNightModeToolbarControl: View {
     var appliesRepeatedSelections = false
 
     var body: some View {
-        Menu {
-            if appliesRepeatedSelections {
-                ForEach(target.choices) { choice in
-                    Button { apply(choice.mode) } label: {
-                        if target.selectedMode == choice.mode { Label(choice.mode.title, systemImage: "checkmark") }
-                        else { Label(choice.mode.title, systemImage: choice.mode.systemImageName) }
-                    }
-                }
-            } else {
-                Picker("Day and night mode", selection: selection) {
-                    ForEach(target.choices) { choice in
-                        Label(
-                            choice.mode.title,
-                            systemImage: choice.mode.systemImageName
-                        )
-                        .tag(Optional(choice.mode))
-                    }
-                }
+        Picker(selection: selection) {
+            ForEach(target.choices) { choice in
+                Label(
+                    choice.mode.title,
+                    systemImage: choice.mode.systemImageName
+                )
+                .tag(Optional(choice.mode))
             }
         } label: {
             Label("Day and night mode", systemImage: displayedMode.systemImageName)
         }
+        .pickerStyle(.menu)
         .disabled(!isEnabled || target.control.isUpdating)
         .accessibilityLabel("Day and night mode")
         .accessibilityValue(target.selectedMode?.title ?? "Unavailable")
@@ -776,7 +774,8 @@ struct CameraDayNightModeToolbarControl: View {
             get: { target.selectedMode },
             set: { mode in
                 guard let mode,
-                      mode != target.selectedMode else {
+                      appliesRepeatedSelections
+                        || mode != target.selectedMode else {
                     return
                 }
                 apply(mode)

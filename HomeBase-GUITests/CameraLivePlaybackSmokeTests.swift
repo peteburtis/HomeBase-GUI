@@ -209,6 +209,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
         guard cameras.count >= 2 else { await client.disconnect(); throw XCTSkip("Two NVR cameras required") }
         let first = CameraGroupSession(camera: cameras[0], client: client)
         let group = CameraGroupPlayback(client: client, initialSession: first)
+        group.activateResources(access: nil)
         let host = NSHostingView(rootView: CameraGroupVideo(group: group,
             cameraControlsEnabled: false, controlsVisible: true, onSingleTap: {}).environment(\.scenePhase, .active))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 852, height: 393),
@@ -216,6 +217,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
         window.contentView = host; window.orderFront(nil)
         func background() async throws {
             group.suspend()
+            group.suspendResources(stopImmediately: true)
             host.rootView = CameraGroupVideo(group: group, cameraControlsEnabled: false,
                 controlsVisible: true, onSingleTap: {}).environment(\.scenePhase, .background)
             try await eventually("Background unloads mounted streams") { group.sessions.allSatisfy { $0.liveState == .idle } }
@@ -223,6 +225,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
         func foreground() async throws {
             let epochs = group.sessions.map { $0.playback.timeline.sourceEpoch }
             group.resume()
+            group.activateResources(access: nil)
             host.rootView = CameraGroupVideo(group: group, cameraControlsEnabled: false,
                 controlsVisible: true, onSingleTap: {}).environment(\.scenePhase, .active)
             try await eventually("Foreground reconnects mounted streams") {
@@ -286,6 +289,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
         guard cameras.count >= 2 else { await client.disconnect(); throw XCTSkip("Two cameras required") }
         let original = CameraGroupSession(camera: cameras[0], client: client, quality: .medium)
         let group = CameraGroupPlayback(client: client, initialSession: original)
+        group.activateResources(access: nil)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 852, height: 393),
             styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentView = NSHostingView(rootView: CameraGroupVideo(group: group,

@@ -268,8 +268,44 @@ final class CameraStreamArbiterTests: XCTestCase {
         let new = try await f.join("a", .low)
         await eventually { await f.wire.count == 2 }
         XCTAssertTrue(new.video.isEmpty, "No bootstrap survives immediate teardown")
-        await f.end()
+        await f.wire.ready(1)
+        await eventually { new.video.count == 1 }
+
+        // Background/access revocation can race just behind an ordinary
+        // handoff. It must still be able to upgrade the already-idle entry
+        // instead of waiting for the grace clock.
+        await f.arbiter.unsubscribe(
+            camera: "a",
+            id: new.subscription.id
+        )
+        let closedBeforeUpgrade = await f.wire.closed
+        XCTAssertFalse(closedBeforeUpgrade.contains(1))
+        await f.arbiter.stopIdleStreamImmediately(camera: "a")
         await eventually { await f.wire.closed.contains(1) }
+
+        let afterUpgrade = try await f.join("a", .low)
+        await eventually { await f.wire.count == 3 }
+        XCTAssertTrue(
+            afterUpgrade.video.isEmpty,
+            "An upgraded idle release must discard the old bootstrap"
+        )
+        await f.wire.ready(2)
+        await eventually { afterUpgrade.video.count == 1 }
+        let sharedConsumer = try await f.join("a", .low)
+        await eventually { sharedConsumer.video.count == 1 }
+        await f.arbiter.stopIdleStreamImmediately(camera: "a")
+        let closedWithActiveConsumers = await f.wire.closed
+        XCTAssertFalse(
+            closedWithActiveConsumers.contains(2),
+            "An idle upgrade must not disturb active shared consumers"
+        )
+        await f.wire.video(2, sequence: 2)
+        await eventually {
+            afterUpgrade.video.last?.sequence == 2
+                && sharedConsumer.video.last?.sequence == 2
+        }
+        await f.end()
+        await eventually { await f.wire.closed.contains(2) }
         do {
             _ = try await f.arbiter.subscribe(camera: "a", quality: .low)
             XCTFail("Disconnected session was reused")

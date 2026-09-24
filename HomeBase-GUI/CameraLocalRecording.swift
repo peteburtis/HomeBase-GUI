@@ -91,9 +91,17 @@ final class CameraLocalRecordingController: ObservableObject {
     private var outputURL: URL?
     private var recordingCreationDate: Date?
     private var authorizationOperation = UUID()
+    private var streamConfigurationRevision = 0
+    private var pendingStreamOwnerID: UUID?
+    private let configurationInstallationBarrier: (() async -> Void)?
 
-    init(destination: any CameraRecordingDestination) {
+    init(
+        destination: any CameraRecordingDestination,
+        configurationInstallationBarrier: (() async -> Void)? = nil
+    ) {
         self.destination = destination
+        self.configurationInstallationBarrier =
+            configurationInstallationBarrier
     }
 
     var isRecording: Bool {
@@ -154,15 +162,29 @@ final class CameraLocalRecordingController: ObservableObject {
         }
     }
 
+    @discardableResult
     func configure(
         ownerID: UUID,
         generation: UInt32,
         formatDescription: CMVideoFormatDescription
-    ) async {
+    ) async -> Bool {
+        streamConfigurationRevision &+= 1
+        let revision = streamConfigurationRevision
+        pendingStreamOwnerID = ownerID
+        defer {
+            if streamConfigurationRevision == revision {
+                pendingStreamOwnerID = nil
+            }
+        }
         if writer != nil,
            (streamOwnerID != ownerID
                 || streamFormat?.generation != generation) {
             await stopAndSave()
+        }
+        await configurationInstallationBarrier?()
+        guard streamConfigurationRevision == revision,
+              pendingStreamOwnerID == ownerID else {
+            return false
         }
         streamOwnerID = ownerID
         streamFormat = StreamFormat(
@@ -170,6 +192,7 @@ final class CameraLocalRecordingController: ObservableObject {
             formatDescription: formatDescription
         )
         isStreamAvailable = true
+        return true
     }
 
     func append(
@@ -214,6 +237,10 @@ final class CameraLocalRecordingController: ObservableObject {
     }
 
     func streamDidEnd(ownerID: UUID) async {
+        if pendingStreamOwnerID == ownerID {
+            streamConfigurationRevision &+= 1
+            pendingStreamOwnerID = nil
+        }
         guard streamOwnerID == ownerID else { return }
         isStreamAvailable = false
         streamOwnerID = nil

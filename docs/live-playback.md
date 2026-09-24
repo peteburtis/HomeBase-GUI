@@ -71,6 +71,24 @@ camera UI; they retain the existing camera-section lifecycle policy.
 Backgrounding releases live video and history connections. Non-live playback
 (the live buffer or NVR history) pauses at its current position, including the
 shared timeline in Multiple mode, and stays paused when the screen resumes.
+
+Each selected `CameraGroupSession` owns its live stream, control monitor,
+playback/history controller, gestures, and recording controller. Camera pane
+views are presentation-only: appearing, disappearing, resizing, or moving
+between safe-area layouts cannot start or stop camera resources. The stable
+full-screen owner alone applies authorization, background, camera-selection,
+and dismissal lifecycle changes. Those transitions are serialized so teardown
+from an older generation cannot stop a newly resumed stream or control monitor.
+Immediate background/access shutdown reaches the active stream before its task
+is cancelled, so it bypasses the ordinary arbiter handoff grace even when an
+acquisition is still finishing. Run ownership remains tracked until cleanup is
+complete, so a later immediate stop also strengthens a superseded acquisition
+or an ordinary release already crossing into the arbiter. The same per-run epoch
+owns playback and Photos-recorder callbacks, so work returning from an await
+cannot republish a stopped stream. Credential arrival refreshes optional history
+access only while resources are active and cannot reactivate a backgrounded
+camera. A control subscription that ends in failure is retried by its persistent
+camera session; relayout is never used as a recovery mechanism.
 Foregrounding reconnects live collection and history access; it does not press
 Play. Live mode instead remains Live and reconnects to the current feed. Other
 live-lease unloads/interruption paths use the same pause rule, and an interrupted
@@ -100,54 +118,26 @@ screen still ends its session and releases its buffers.
   guarantee of coverage for any requested time range.
 - Neither seeking nor playback can pass the newest received frame. Reaching that
   frame during ordinary playback does not automatically exit buffered mode.
-- The leading native toolbar contains Close, the Back 30 / Play-Pause /
-  Forward 30 group, and Live. The three shuttles share one system glass capsule;
-  Close uses iOS 26's native close button role; a standard toolbar spacer separates
-  it from playback. The toolbar owns
+- On iOS, the navigation position contains Close and the primary-action position contains
+  camera selection. The bottom toolbar contains the Back 30 / Play-Pause /
+  Forward 30 group, Live, optional playback speed, Record, and the available
+  quality/day-night/privacy controls. The three shuttles share one system glass
+  capsule. A flexible toolbar spacer separates playback from camera controls and
+  expands in wider layouts. In compact width, Back 30, Forward 30, quality, and
+  day/night move to the system's secondary-action overflow; Pause, icon-only Live,
+  Record, and privacy remain directly visible in the bottom toolbar. Fixed spacers
+  retain the grouping within each side.
+  Close uses iOS 26's native close button role. The toolbar owns
   button sizing and glass, with no fixed button frame, custom backing, or padded
   button content. These are standard SwiftUI toolbar items/groups, with system
-  adaptation on narrow screens, not a custom toolbar. Live/Record retain only
-  their state-dependent native prominence and tint.
-  In **compact horizontal size class**, Back 30, Forward 30, Video quality,
-  Day and night mode, and Privacy mode use `.secondaryAction` to intentionally
-  appear in the system overflow menu. Close, Play-Pause, and Live stay leading.
-  Camera selection stays trailing, alongside Record while live or playback speed
-  while buffered/in history. In compact width, speed moves from leading to
-  trailing and replaces Record rather than going into overflow.
-  Compact width makes Live icon-only and omits the extra spacers between the
-  playback actions and trailing actions; Close retains its own separation.
-  Regular width keeps the full toolbar. This uses size classes, not orientation
-  or screen-width thresholds. It is an iOS 26 compatibility policy; when adopting
-  iOS 27, use its explicit toolbar overflow and visibility-priority APIs while
-  retaining this fallback for iOS 26. Native adaptation still applies if even
-  the reduced primary controls cannot fit. Camera capability, recording, and
-  live/history availability rules are unchanged. The all-playback ControlGroup
-  experiment and temporary removal of the trailing controls have been reverted.
-- History lives in a floating bottom-trailing capsule alongside PTZ, not in the
-  navigation bar. One selection controls three states: Off, History, and PTZ.
-  Off shows History first, then PTZ when available, with neither panel open. Selecting either
-  hides the alternate button and tints only the selected icon with the system
-  accent color; tapping it again returns Off. The capsule uses Apple's
-  `GlassEffectContainer`, shared glass union, and stable effect IDs to morph as
-  buttons appear/disappear. There is no red/prominent History state.
-  History uses `clock.arrow.trianglehead.counterclockwise.rotate.90` and is
-  disabled without advertised NVR history. The capsule keeps its horizontal
-  safe-area anchor. With History open, its center aligns vertically with the
-  actual timeline bounds, whether the timeline uses the safe area or extends to
-  the screen edge; closing History returns it to 12 points inside the bottom
-  safe area. This vertical move shares the snappy panel/button
-  animation (no animation with Reduce Motion). PTZ sliders always retain their
-  safe-area layout. No calendar button is shown.
-- PTZ uses the existing four-arrow icon and opens every supported axis together.
-  There is no separate zoom toggle. Zoom is at the leading edge, extended down
-  to the button baseline and up to the top of the tilt slider; pan remains below
-  tilt, to the left of the capsule. Zoom-only cameras also support this panel.
-  The PTZ button is shown only for a supported camera in single-camera Live mode.
-  It is absent during buffered/history playback and when two or more cameras are
-  selected. One selected camera retains PTZ even with Multiple enabled in the picker.
-  Returning to Live restores the button, not the sliders.
-  Leaving Live, adding a second camera, or losing the capability closes an open PTZ
-  panel. Opening either panel never writes camera settings or changes playback.
+  adaptation, not a custom toolbar. Compact width keeps Live icon-only.
+  Camera capability, recording, and live/history availability rules are unchanged.
+  macOS retains its native window-toolbar arrangement because SwiftUI does not
+  provide the `.bottomBar` item placement there.
+- History and PTZ still share one panel state internally, but their custom
+  floating picker is temporarily not presented. Both panels therefore remain
+  closed until a replacement entry point is introduced. Their implementation
+  remains in place so the controls can be restored without rebuilding either panel.
 - Live is always alongside Play-Pause. It shows only its icon in compact width,
   and its icon and “Live” label in regular width (and on macOS).
   It uses native toolbar styling: prominent with red tint in Live mode,
@@ -156,15 +146,10 @@ screen still ends its session and releases its buffers.
   fixed button/icon dimensions, or foreground colors are applied. Its label is
   always “Live” for accessibility: `dot.radiowaves.left.and.right` while live, or
   `chevron.forward.dotted.chevron.forward` during buffered/history playback.
-  It never uses the History icon. A composed icon/title label
-  currently keeps the text visible: in the tested iOS 26.1 toolbar,
-  `.labelStyle(.titleAndIcon)` is ignored. Prefer replacing the composed label
-  with that native modifier when it works in this context. This compatibility
-  layout does not customize button styling. Tapping Live resumes live playback
+  It never uses the History icon. Tapping Live resumes live playback
   without hiding shuttles or releasing the buffer. While already live, it is a
   no-op. Neither action changes timeline visibility.
-- A native speed menu (trailing in compact width, after Live on the leading side
-  in regular width) shows the current
+- A native speed menu in the bottom toolbar shows the current
   **1×, 2×, or 4×** rate. It is hidden, not disabled, in Live mode; pause or
   rewind first to reveal it. Changing speed preserves pause, cursor, and timeline
   visibility. Multiple mode
@@ -180,9 +165,9 @@ screen still ends its session and releases its buffers.
 - Record to Photos is available only in Live mode. Shuttle/Live controls stay
   visible but disabled while requesting Photos authorization, starting/saving a
   recording, or recording. The status/timer is shown beneath the navigation bar.
-  In regular width, Record remains in the trailing toolbar during buffered/history
-  playback, disabled rather than removed. In compact width it is hidden while
-  playback speed occupies that trailing space. Quality, day/night, and privacy are absent when
+  In regular width, Record remains in the bottom toolbar during buffered/history
+  playback, disabled rather than removed. In compact width it is hidden outside
+  Live. Quality, day/night, and privacy are absent when
   unavailable, including outside Live; invalid/disconnected day/night and privacy
   controls are hidden, and quality is hidden while Photos recording locks stream
   configuration. Pending day/night or privacy writes retain their brief disabled
@@ -212,7 +197,7 @@ screen still ends its session and releases its buffers.
 
 ## Switching cameras
 
-The far-right camera-selection button uses the filled-grid `rectangle.grid.3x3.fill`
+The camera-selection button uses the filled-video `video.fill`
 symbol and stays in its own toolbar group in both Live and History.
 Its popover lists the server's viewable cameras by display name, with a checkmark
 on the current camera. Selecting that camera is a no-op. The picker is disabled
@@ -261,16 +246,28 @@ all selected cameras; cameras added later open directly at the selected quality.
 The menu offers qualities supported by every selected camera. Adding a camera
 that cannot use the selected quality reports that incompatibility instead of
 silently changing the existing cameras. Two or more selected cameras hide Photos recording
-controls. In compact width with non-compact height, two, three, or four cameras
-form a single centered vertical column, in selection order. The 16:9 panes touch
-edge to edge. They use the full width when the whole column fits; otherwise the
-column scales down uniformly to fit the full height, leaving black bars on both
-sides. There is no scrolling, cropping, or offscreen top/bottom overflow.
-Other size-class combinations retain two panes side by side or a 2×2 grid for
-three/four, leaving the fourth cell black for three. Single-camera presentation
-is unchanged. Trait changes only relayout the existing panes; they do not replace
-camera sessions, stream connections, buffers, or playback state. The grid ignores safe
-areas, while video is aspect-fit inside each cell, never cropped or oversized.
+controls. For two through four cameras, layout compares the existing vertical
+column and grid candidates at the available canvas size, using each selected
+camera's current picture aspect ratio (16:9 only until configuration arrives),
+and chooses whichever gives the group the larger total rendered picture area.
+Two cameras therefore appear side by side on sufficiently wide canvases and top
+to bottom when that makes each picture larger. Three and four cameras make the
+same area-based choice between a column and the 2×2 grid; a three-camera grid
+leaves the fourth cell black. Ties prefer the grid. The centered column's 16:9
+panes touch edge to edge, use the full width when they fit, and otherwise scale
+uniformly to fit the available height. There is no scrolling, cropping, or
+offscreen overflow. Single-camera presentation is unchanged.
+
+Safe-area policy is independent of that layout choice. The media canvas ignores
+container safe-area insets only with compact height and regular width. Every
+other size-class combination lays the canvas out inside the safe area. Size-class
+changes can therefore alter the available canvas but never directly select a row,
+column, or grid. Relayout does not replace camera sessions, stream connections,
+buffers, or playback state. Video remains aspect-fit inside each cell, never
+cropped or oversized.
+The canvas keeps one structural SwiftUI hierarchy across every size-class
+combination; safe-area behavior changes through modifier values rather than an
+`if` that replaces its camera-pane subtree.
 Camera labels stay inside the screen's safe area without moving or shrinking
 the video panes; interior grid edges do not gain extra safe-area padding. In
 side-by-side two-up they touch the bottom of the actual video rectangle from immediately
@@ -434,13 +431,14 @@ snap, haptic, and visible-thumbnail calculations use the resulting cell width.
 Images proportionally fill the frame,
 cropping overflow from other aspect ratios instead of letterboxing or stretching.
 
-Player layout uses size classes for adaptive policy, not orientation, screen-model
-tables, or screen bounds. The camera preview grid uses horizontal size class;
-the timeline uses vertical size class. Video aspect-fit, per-pane gesture coordinates,
-safe-area label placement, and bounded PTZ slider lengths remain geometric
-calculations, not orientation guesses. Camera count and the combined width/height
-size classes choose the column or two/four-up grid; this does not change the
-timeline's hypothetical two-up sizing reference within Multiple mode. Native toolbars/popovers retain system adaptation (with
+Player layout uses compact-height plus regular-width size classes only for the
+explicit full-bleed safe-area policy, not to choose a multi-camera arrangement.
+The camera preview grid uses horizontal size class; the timeline uses vertical
+size class. Multi-camera arrangement, video aspect-fit, per-pane gesture
+coordinates, safe-area label placement, and bounded PTZ slider lengths remain
+geometric calculations, not orientation or device-model guesses. The selected
+column or two/four-up grid does not change the timeline's hypothetical two-up
+sizing reference within Multiple mode. Native toolbars/popovers retain system adaptation (with
 the explicitly requested popover behavior in compact layouts).
 
 Each interval label is left-aligned to its interval's start, but is hidden in
@@ -694,12 +692,21 @@ speed-aware bounded history refills versus ordinary cache exhaustion.
 It needs no server, camera, or saved footage. Run the full `HomeBase-GUI` scheme's
 tests on macOS and an iOS simulator.
 `CameraLivePlaybackPresentationTests` also checks History and Live symbols,
-Live's no-op action while live and its size-class-dependent label, native shuttle
-grouping and separation, and Close sizing against an unmodified system button.
-It verifies UIKit's secondary item groups and captures compact- and regular-width
-toolbar adaptation in both Live and History, including wide windows with compact
-traits to avoid orientation-based assumptions, and checks
-the native camera gesture recognizers' availability on iOS.
+Live's no-op action while live, size-class-specific icon/title sizing,
+Close sizing against an unmodified system button, and the native camera gesture
+recognizers' availability on iOS. The full-screen camera itself owns the only
+camera-toolbar composition and the only compact/regular toolbar branch.
+It also flips portrait and landscape traits around a mounted camera canvas and
+proves its content appears once, never disappears, and retains the same owned
+state. `CameraGroupTests` verifies rapid suspend/resume transitions serialize
+with the final stream/control start occurring after every older teardown, that
+immediate shutdown policy reaches the live stream, and that non-16:9 camera
+ratios participate in the layout decision. `CameraLiveVideoTests` covers the
+unfinished-run ownership window and recorder-configuration invalidation, and
+`CameraStreamArbiterTests` verifies that an ordinary idle handoff can be upgraded
+to immediate shutdown without disturbing another active consumer. A group test
+also proves that a late history-credential refresh leaves suspended camera
+resources suspended.
 `CameraHistoryTests` adds cache/refill, paused seeks, stale responses, stable time
 anchoring, protocol bounds, H.264/HEVC decoding, metadata ordering, WebSocket reuse,
 timeouts and cancellation tests with injected transports.
@@ -728,20 +735,15 @@ The history smoke suite requires HBNVR 0.14.0 and the corresponding Homebase rel
 It also checks both archive boundaries and a paused jump from an empty date to the
 first retained recording, including actual frame rendering at the returned target.
 
-Manual phone check: open a camera. Close, Play-Pause, and Live are present
-immediately; speed, the timeline, and PTZ sliders are absent. In regular width,
-the two 30-second shuttles share the Play-Pause capsule and Live has its title.
-In compact width, the shuttles and camera settings are in the system overflow,
-Live is icon-only, and Record and camera selection remain trailing. At bottom
-right, History precedes PTZ in one neutral glass capsule. Tap PTZ: only its tinted
-icon remains, supported sliders appear together, and no camera setting changes.
-Tap again: both icons return. Tap History: only its tinted icon remains and the
-timeline appears underneath the capsule, which animates to the timeline's vertical
-center without changing its horizontal anchor. Tap History again to hide it and
-animate the capsule back to its bottom safe-area anchor in the same panel transition.
-There is no separate handle or vertical show/hide gesture. Top-bar camera
-controls and gestures remain usable while Live. Horizontal timeline scrubbing
-still seeks. Verify full-size thumbnails with one camera, whether Multiple is on
+Manual phone check: open a camera. Close is in the navigation position, camera
+selection is the primary action, and Play-Pause and Live are present in the
+bottom toolbar; speed, the timeline, and PTZ sliders are absent. In regular width,
+  the two 30-second shuttles share the Play-Pause capsule and Live has its title.
+In compact width, Live is icon-only; Back 30, Forward 30, quality, and day/night
+appear in the secondary-action overflow while Pause, Record, and privacy remain
+grouped in the bottom toolbar. The temporary
+History/PTZ picker is absent, so neither panel can be opened. Camera controls and
+gestures remain usable while Live. Verify full-size thumbnails with one camera, whether Multiple is on
 or off, and compact sizing with two or more cameras. Open the picker: Multiple
 starts selected at the trailing edge without changing the one-camera controls
 or adding a label. Add a second camera, then remove either one: the survivor's
@@ -751,8 +753,8 @@ playing, confirming no playback state changes. In portrait, allow the system's
 native navigation-bar adaptation; there is no bespoke row layout.
 Seek to an empty time and use the gap arrows to find the preceding/following
 recording; missing directions are absent and paused jumps remain paused.
-Pause: in compact width, speed replaces Record on the trailing side. In regular
-width, speed appears beside Live and Record stays visible but disabled. Quality,
+Pause: speed appears in the bottom toolbar. In regular width, Record stays in the
+bottom toolbar but is disabled; in compact width, Record is hidden. Quality,
 day/night, privacy, and PTZ controls disappear. Camera gestures do not move the camera. Camera
 switching remains usable. After five seconds, Forward 30 should show the newest
 frame but remain paused as new frames arrive. Play, then Forward 30: this resumes
@@ -767,7 +769,7 @@ minute boundary, pause and seek both ways, then return Live. Camera controls and
 gestures must remain unavailable throughout historical playback.
 Open the camera list in Live and History; confirm its independent toolbar group
 and current-camera checkmark. Switch while Live, paused in the live buffer, and
-playing History. The screen and timeline visibility should stay put; historical time
+playing History through a programmatic or restored state. The screen and timeline visibility should stay put; historical time
 and pause state should carry across. With no destination NVR, expect Live instead.
 Start a Photos recording and confirm the list button stays visible but disabled
 until the recording finishes saving. The shuttles stay visible but disabled too,

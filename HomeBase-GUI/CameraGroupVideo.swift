@@ -4,8 +4,45 @@ import HomeBaseProtocol
 enum CameraGroupLayout {
     enum Arrangement: Equatable { case grid, column }
 
-    static func arrangement(horizontal: UserInterfaceSizeClass?, vertical: UserInterfaceSizeClass?) -> Arrangement {
-        horizontal == .compact && vertical != .compact ? .column : .grid
+    static func arrangement(
+        count: Int,
+        in size: CGSize,
+        aspectRatios: [CGFloat] = []
+    ) -> Arrangement {
+        guard count > 1 else { return .grid }
+        let gridArea = displayedVideoArea(
+            count: count,
+            in: size,
+            arrangement: .grid,
+            aspectRatios: aspectRatios
+        )
+        let columnArea = displayedVideoArea(
+            count: count,
+            in: size,
+            arrangement: .column,
+            aspectRatios: aspectRatios
+        )
+        return columnArea > gridArea ? .column : .grid
+    }
+
+    static func ignoresSafeArea(horizontal: UserInterfaceSizeClass?, vertical: UserInterfaceSizeClass?) -> Bool {
+        horizontal == .regular && vertical == .compact
+    }
+
+    private static func displayedVideoArea(
+        count: Int,
+        in size: CGSize,
+        arrangement: Arrangement,
+        aspectRatios: [CGFloat]
+    ) -> CGFloat {
+        let cells = cells(count: count, in: size, arrangement: arrangement)
+        return cells.enumerated().reduce(0) { total, item in
+            let ratio = aspectRatios.indices.contains(item.offset)
+                ? aspectRatios[item.offset]
+                : 16 / 9
+            let frame = videoFrame(in: item.element, aspectRatio: ratio)
+            return total + frame.width * frame.height
+        }
     }
 
     static func labelsBelowVideo(count: Int, arrangement: Arrangement) -> Bool {
@@ -90,21 +127,27 @@ struct CameraGroupLabelLayout: Layout {
     }
 }
 
-/// Only the media canvas extends outside the safe area. Capture the protected
-/// layout before expanding, then translate it into the full canvas coordinates.
-/// This also follows rotation and toolbar visibility without hard-coded insets.
+/// Optionally extend the media canvas outside the safe area. Capture the
+/// protected layout before expanding, then translate it into the full canvas
+/// coordinates. Both modes follow window and toolbar changes without hard-coded
+/// insets.
 struct CameraGroupCanvas<Content: View>: View {
+    let ignoresSafeArea: Bool
     let content: (CGSize, CGRect) -> Content
 
-    init(@ViewBuilder content: @escaping (CGSize, CGRect) -> Content) { self.content = content }
+    init(ignoresSafeArea: Bool = true,
+         @ViewBuilder content: @escaping (CGSize, CGRect) -> Content) {
+        self.ignoresSafeArea = ignoresSafeArea
+        self.content = content
+    }
 
     var body: some View {
         GeometryReader { safe in
-            GeometryReader { full in
-                let origin = full.frame(in: .global).origin
-                content(full.size, safe.frame(in: .global).offsetBy(dx: -origin.x, dy: -origin.y))
+            GeometryReader { canvas in
+                let origin = canvas.frame(in: .global).origin
+                content(canvas.size, safe.frame(in: .global).offsetBy(dx: -origin.x, dy: -origin.y))
             }
-            .ignoresSafeArea(.container)
+            .ignoresSafeArea(.container, edges: ignoresSafeArea ? .all : [])
         }
     }
 }
@@ -116,12 +159,18 @@ struct CameraGroupVideo: View {
     let cameraControlsEnabled: Bool
     let controlsVisible: Bool
     var isAccessAllowed = true
-    var credentials: CameraS3Credentials? = nil
     let onSingleTap: () -> Void
 
     var body: some View {
-        CameraGroupCanvas { size, safeBounds in
-            let arrangement = CameraGroupLayout.arrangement(horizontal: horizontalSizeClass, vertical: verticalSizeClass)
+        let ignoresSafeArea = CameraGroupLayout.ignoresSafeArea(
+            horizontal: horizontalSizeClass, vertical: verticalSizeClass
+        )
+        CameraGroupCanvas(ignoresSafeArea: ignoresSafeArea) { size, safeBounds in
+            let arrangement = CameraGroupLayout.arrangement(
+                count: group.sessions.count,
+                in: size,
+                aspectRatios: group.sessions.map { $0.liveVideo.aspectRatio }
+            )
             let cells = CameraGroupLayout.cells(count: group.sessions.count, in: size, arrangement: arrangement)
             ZStack(alignment: .topLeading) {
                 Color.black
@@ -130,7 +179,6 @@ struct CameraGroupVideo: View {
                         CameraGroupPane(session: session, group: group, cameraControlsEnabled: cameraControlsEnabled,
                             controlsVisible: controlsVisible,
                             isAccessAllowed: isAccessAllowed,
-                            credentials: credentials,
                             safeBounds: safeBounds.offsetBy(dx: -cells[index].minX, dy: -cells[index].minY),
                             labelBelowVideo: CameraGroupLayout.labelsBelowVideo(count: group.sessions.count, arrangement: arrangement),
                             onSingleTap: onSingleTap)
@@ -151,12 +199,10 @@ private struct CameraGroupPane: View {
     @ObservedObject var group: CameraGroupPlayback
     @ObservedObject private var playback: CameraLivePlaybackController
     @ObservedObject private var controls: LiveDeviceControlsModel
-    @State private var restartRequest = 0
-    @State private var aspectRatio: CGFloat = 16 / 9
+    @ObservedObject private var liveVideo: CameraLiveVideoModel
     let cameraControlsEnabled: Bool
     let controlsVisible: Bool
     let isAccessAllowed: Bool
-    let credentials: CameraS3Credentials?
     let safeBounds: CGRect
     let labelBelowVideo: Bool
     let onSingleTap: () -> Void
@@ -164,16 +210,15 @@ private struct CameraGroupPane: View {
     init(session: CameraGroupSession, group: CameraGroupPlayback, cameraControlsEnabled: Bool,
          controlsVisible: Bool,
          isAccessAllowed: Bool,
-         credentials: CameraS3Credentials?,
          safeBounds: CGRect, labelBelowVideo: Bool,
          onSingleTap: @escaping () -> Void) {
         self.session = session; self.group = group
         _playback = ObservedObject(wrappedValue: session.playback)
         _controls = ObservedObject(wrappedValue: session.controls)
+        _liveVideo = ObservedObject(wrappedValue: session.liveVideo)
         self.cameraControlsEnabled = cameraControlsEnabled
         self.controlsVisible = controlsVisible
         self.isAccessAllowed = isAccessAllowed
-        self.credentials = credentials
         self.safeBounds = safeBounds; self.labelBelowVideo = labelBelowVideo
         self.onSingleTap = onSingleTap
     }
@@ -194,12 +239,12 @@ private struct CameraGroupPane: View {
 
     var body: some View {
         ZStack {
-            CameraLiveVideoPlayer(deviceIdentifier: session.camera.device.addressableName, quality: session.quality,
-                client: group.client, allowsRetry: true, isStreamEnabled: isAccessAllowed,
-                restartRequest: restartRequest,
-                recordingController: session.videoRecordingController, playbackController: playback,
-                usesHistory: !isLive, onStateChanged: { session.liveState = $0 },
-                onAspectRatioChanged: { aspectRatio = $0 })
+            CameraLiveVideoSurface(
+                model: liveVideo,
+                allowsRetry: true,
+                usesHistory: !isLive,
+                retry: session.restartLiveVideoIfNeeded
+            )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background {
                     CameraLiveGestureSurface(videoVisible: group.showsVideo(session), cameraControlsEnabled: gesturesEnabled,
@@ -229,18 +274,12 @@ private struct CameraGroupPane: View {
         .background(Color.black)
         .overlay {
             if group.hasMultipleCameras && controlsVisible {
-                CameraGroupLabelLayout(safeBounds: safeBounds, aspectRatio: aspectRatio, belowVideo: labelBelowVideo) {
+                CameraGroupLabelLayout(safeBounds: safeBounds, aspectRatio: liveVideo.aspectRatio, belowVideo: labelBelowVideo) {
                     CameraGroupCameraLabel(name: session.camera.device.displayName)
                 }
                 .allowsHitTesting(false)
                 .transition(.opacity)
             }
-        }
-        .onChange(of: controls.deviceMetadata, initial: true) { _, metadata in
-            if isAccessAllowed { playback.prepareHistory(metadata: metadata, client: group.client, credentials: credentials) }
-        }
-        .onChange(of: credentials) { _, value in
-            if isAccessAllowed { playback.prepareHistory(metadata: controls.deviceMetadata, client: group.client, credentials: value) }
         }
         .onChange(of: gesturesEnabled, initial: true) { _, enabled in session.gestures.update(enabled: enabled) }
         .onChange(of: panTiltTarget?.observedPosition, initial: true) { _, _ in session.gestures.update(enabled: gesturesEnabled) }
@@ -249,18 +288,11 @@ private struct CameraGroupPane: View {
             if gesturesEnabled { session.gestures.recenter() }
         }
         .onChange(of: privacy) { old, new in
-            if CameraPrivacyStreamRecovery.shouldRequestRestart(from: old, to: new) { restartRequest &+= 1 }
-        }
-        .task(id: CameraLiveVideoLifecycle.isSuspended(in: scenePhase, isStreamEnabled: isAccessAllowed)) {
-            if CameraLiveVideoLifecycle.isSuspended(in: scenePhase, isStreamEnabled: isAccessAllowed) {
-                playback.suspend(); await controls.stop()
-            } else {
-                playback.resume()
-                playback.prepareHistory(metadata: controls.deviceMetadata, client: group.client, credentials: credentials)
-                await controls.run(reactivating: true)
+            if CameraPrivacyStreamRecovery.shouldRequestRestart(from: old, to: new) {
+                session.restartLiveVideoIfNeeded()
             }
         }
-        .onDisappear { session.gestures.update(enabled: false); Task { await controls.stop() } }
+        .onDisappear { session.gestures.update(enabled: false) }
     }
 
     private func status(_ message: String, loading: Bool) -> some View {

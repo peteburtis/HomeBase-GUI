@@ -18,15 +18,14 @@ struct CameraPlaybackSpeedMenu: View {
     @Binding var speed: CameraPlaybackSpeed
 
     var body: some View {
-        Menu {
-            Picker("Playback speed", selection: $speed) {
-                ForEach(CameraPlaybackSpeed.allCases) { speed in
-                    Text(speed.label).tag(speed)
-                }
+        Picker(selection: $speed) {
+            ForEach(CameraPlaybackSpeed.allCases) { speed in
+                Text(speed.label).tag(speed)
             }
         } label: {
             Text(speed.label)
         }
+        .pickerStyle(.menu)
         .accessibilityLabel("Playback speed")
         .accessibilityValue(speed.label)
     }

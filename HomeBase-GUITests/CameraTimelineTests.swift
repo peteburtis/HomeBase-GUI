@@ -451,7 +451,7 @@ final class CameraTimelineTests: XCTestCase {
         window.rootViewController = nil
     }
 
-    func testMountedColumnFitsTwoThreeAndFourCamerasAndRespondsToTraits() async throws {
+    func testMountedLayoutMaximizesVideoAreaAndUsesSizeClassesOnlyForSafeArea() async throws {
         let layout = TimelineTestLayout()
         let host = UIHostingController(rootView: TimelineTestCanvas(layout: layout).preferredColorScheme(.dark))
         host.traitOverrides.horizontalSizeClass = .compact
@@ -465,7 +465,11 @@ final class CameraTimelineTests: XCTestCase {
         for count in 2...4 {
             layout.count = count
             try await Task.sleep(for: .milliseconds(200))
-            let expected = CameraGroupLayout.cells(count: count, in: window.bounds.size, arrangement: .column)
+            let canvas = host.view.safeAreaLayoutGuide.layoutFrame
+            let arrangement = CameraGroupLayout.arrangement(count: count, in: canvas.size)
+            XCTAssertEqual(arrangement, .column)
+            let expected = CameraGroupLayout.cells(count: count, in: canvas.size, arrangement: arrangement)
+                .map { $0.offsetBy(dx: canvas.minX, dy: canvas.minY) }
             XCTAssertEqual(layout.paneFrames.count, count)
             for index in 0..<count {
                 let frame = try XCTUnwrap(layout.paneFrames[index])
@@ -481,20 +485,37 @@ final class CameraTimelineTests: XCTestCase {
                 host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
             }
             let attachment = XCTAttachment(image: image)
-            attachment.name = "Compact width column — \(count) cameras"
+            attachment.name = "Area-maximized portrait column — \(count) cameras"
             attachment.lifetime = .keepAlways; add(attachment)
         }
-        // Hold geometry fixed. Either compact height or regular width restores
-        // the grid; neither transition depends on physical orientation.
-        for (horizontal, vertical) in [(UIUserInterfaceSizeClass.compact, UIUserInterfaceSizeClass.compact),
-                                      (.regular, .regular)] {
-            host.traitOverrides.horizontalSizeClass = horizontal
-            host.traitOverrides.verticalSizeClass = vertical
-            host.view.layoutIfNeeded()
-            try await Task.sleep(for: .milliseconds(150))
-            let first = try XCTUnwrap(layout.paneFrames[0]), second = try XCTUnwrap(layout.paneFrames[1])
-            XCTAssertEqual(first.minY, second.minY, accuracy: 0.5)
-            XCTAssertEqual(second.minX, window.bounds.width / 2, accuracy: 0.5)
+
+        host.traitOverrides.horizontalSizeClass = .regular
+        host.traitOverrides.verticalSizeClass = .compact
+        window.frame = CGRect(x: 0, y: 0, width: 852, height: 393)
+        host.view.frame = window.bounds
+        host.view.layoutIfNeeded()
+        for count in 2...4 {
+            layout.paneFrames = layout.paneFrames.filter { $0.key < count }
+            layout.labelFrames = layout.labelFrames.filter { $0.key < count }
+            layout.count = count
+            try await Task.sleep(for: .milliseconds(200))
+            let arrangement = CameraGroupLayout.arrangement(count: count, in: window.bounds.size)
+            XCTAssertEqual(arrangement, .grid)
+            let expected = CameraGroupLayout.cells(count: count, in: window.bounds.size, arrangement: arrangement)
+            XCTAssertEqual(layout.paneFrames.count, count)
+            for index in 0..<count {
+                let frame = try XCTUnwrap(layout.paneFrames[index])
+                XCTAssertEqual(frame.minX, expected[index].minX, accuracy: 0.5)
+                XCTAssertEqual(frame.minY, expected[index].minY, accuracy: 0.5)
+                XCTAssertEqual(frame.width, expected[index].width, accuracy: 0.5)
+                XCTAssertEqual(frame.height, expected[index].height, accuracy: 0.5)
+            }
+            let image = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
+                host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+            }
+            let attachment = XCTAttachment(image: image)
+            attachment.name = "Area-maximized landscape grid — \(count) cameras"
+            attachment.lifetime = .keepAlways; add(attachment)
         }
     }
 
@@ -768,8 +789,11 @@ private struct TimelineTestCanvas: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @ObservedObject var layout: TimelineTestLayout
     var body: some View {
-        CameraGroupCanvas { size, safe in
-            let arrangement = CameraGroupLayout.arrangement(horizontal: horizontalSizeClass, vertical: verticalSizeClass)
+        let ignoresSafeArea = CameraGroupLayout.ignoresSafeArea(
+            horizontal: horizontalSizeClass, vertical: verticalSizeClass
+        )
+        CameraGroupCanvas(ignoresSafeArea: ignoresSafeArea) { size, safe in
+            let arrangement = CameraGroupLayout.arrangement(count: layout.count, in: size)
             let cells = CameraGroupLayout.cells(count: layout.count, in: size, arrangement: arrangement)
             ZStack(alignment: .topLeading) {
                 Color.black

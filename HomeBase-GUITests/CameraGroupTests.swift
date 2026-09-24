@@ -233,6 +233,105 @@ final class CameraGroupTests: XCTestCase {
         XCTAssertEqual(session.playback.history.position, 500)
     }
 
+    func testCameraResourcesSerializeRapidSuspendAndResume() async throws {
+        let spy = CameraSessionResourceSpy()
+        let coordinator = CameraSessionResourceCoordinator(
+            startLiveVideo: { _ in await spy.start("video") },
+            stopLiveVideo: { immediately in
+                spy.stop("video", immediately: immediately)
+            },
+            startControls: { await spy.start("controls") },
+            stopControls: { spy.stop("controls") }
+        )
+
+        coordinator.setActive(true, access: nil)
+        for _ in 0..<100 {
+            if spy.startCount["video"] == 1,
+               spy.startCount["controls"] == 1 { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(spy.startCount["video"], 1)
+        XCTAssertEqual(spy.startCount["controls"], 1)
+
+        // The second activation arrives before the suspended generation has
+        // finished tearing down. The final start must nevertheless be last.
+        coordinator.setActive(false, access: nil, stopImmediately: true)
+        coordinator.setActive(true, access: nil)
+        await coordinator.waitForTransitions()
+
+        XCTAssertTrue(coordinator.isActive)
+        XCTAssertEqual(spy.startCount["video"], 2)
+        XCTAssertEqual(spy.startCount["controls"], 2)
+        XCTAssertEqual(spy.events.filter { $0.hasPrefix("video.") }.last, "video.start.2")
+        XCTAssertEqual(spy.events.filter { $0.hasPrefix("controls.") }.last, "controls.start.2")
+        XCTAssertTrue(
+            spy.events.contains("video.stop.immediately"),
+            "Access/background teardown must reach the running stream before cancellation cleanup"
+        )
+
+        let settledEvents = spy.events
+        coordinator.setActive(true, access: nil)
+        await coordinator.waitForTransitions()
+        XCTAssertEqual(spy.events, settledEvents, "Duplicate activation is a lifecycle no-op")
+
+        coordinator.close(stopImmediately: true)
+        await coordinator.waitForTransitions()
+        XCTAssertFalse(coordinator.isActive)
+        XCTAssertEqual(
+            spy.events.filter { $0.hasPrefix("video.") }.last,
+            "video.stop.immediately"
+        )
+        XCTAssertEqual(spy.events.filter { $0.hasPrefix("controls.") }.last, "controls.stop")
+    }
+
+    func testFailedControlsCanRestartWithoutTogglingCameraLifecycle() async {
+        var videoStarts = 0
+        var controlsStarts = 0
+        let coordinator = CameraSessionResourceCoordinator(
+            startLiveVideo: { _ in videoStarts += 1 },
+            stopLiveVideo: { _ in },
+            startControls: { controlsStarts += 1 },
+            stopControls: {}
+        )
+
+        coordinator.setActive(true, access: nil)
+        await coordinator.waitForTransitions()
+        XCTAssertTrue(coordinator.isActive)
+        XCTAssertEqual(videoStarts, 1)
+        XCTAssertEqual(controlsStarts, 1)
+
+        // A failed monitor is restarted in place. The camera session remains
+        // active and its live stream is not used as a recovery side effect.
+        coordinator.restartControls()
+        await coordinator.waitForTransitions()
+        XCTAssertTrue(coordinator.isActive)
+        XCTAssertEqual(videoStarts, 1)
+        XCTAssertEqual(controlsStarts, 2)
+
+        coordinator.close()
+        await coordinator.waitForTransitions()
+    }
+
+    func testHistoryCredentialRefreshCannotReactivateSuspendedResources() throws {
+        let client = try makeClient()
+        let session = CameraGroupSession(
+            camera: try camera("A"),
+            client: client
+        )
+        let group = CameraGroupPlayback(
+            client: client,
+            initialSession: session
+        )
+        defer { group.deactivate() }
+
+        XCTAssertFalse(session.resourcesActive)
+        group.refreshHistoryAccess(nil)
+        XCTAssertFalse(
+            session.resourcesActive,
+            "A late credential result must not restart background resources"
+        )
+    }
+
     func testMultipleToggleRetainsSessionRendererQualityAndHistoryCache() async throws {
         let client = try makeClient()
         let session = CameraGroupSession(camera: try camera("A"), client: client, quality: .high)
@@ -323,12 +422,39 @@ final class CameraGroupTests: XCTestCase {
         XCTAssertTrue(CameraGroupLayout.cells(count: 2, in: .zero).isEmpty)
     }
 
-    func testColumnSelectionDependsOnBothSizeClassesNotOrientation() {
+    func testArrangementMaximizesDisplayedVideoAreaForEachCameraCount() {
+        let portrait = CGSize(width: 393, height: 852)
+        let landscape = CGSize(width: 852, height: 393)
+        for count in 2...4 {
+            XCTAssertEqual(CameraGroupLayout.arrangement(count: count, in: portrait), .column)
+            XCTAssertEqual(CameraGroupLayout.arrangement(count: count, in: landscape), .grid)
+        }
+
+        let square = CGSize(width: 600, height: 600)
+        XCTAssertEqual(CameraGroupLayout.arrangement(count: 1, in: square), .grid)
+        XCTAssertEqual(CameraGroupLayout.arrangement(count: 2, in: square), .column)
+        XCTAssertEqual(CameraGroupLayout.arrangement(count: 3, in: square), .column)
+        XCTAssertEqual(CameraGroupLayout.arrangement(count: 4, in: square), .grid)
+
+        XCTAssertEqual(
+            CameraGroupLayout.arrangement(
+                count: 3,
+                in: square,
+                aspectRatios: Array(repeating: 4 / 3, count: 3)
+            ),
+            .grid,
+            "Actual camera ratios, rather than a generic 16:9 feed, decide which layout shows more picture"
+        )
+    }
+
+    func testSafeAreaPolicyDependsOnlyOnCompactHeightAndRegularWidth() {
         let classes: [UserInterfaceSizeClass?] = [nil, .compact, .regular]
         for horizontal in classes {
             for vertical in classes {
-                XCTAssertEqual(CameraGroupLayout.arrangement(horizontal: horizontal, vertical: vertical),
-                    horizontal == .compact && vertical != .compact ? .column : .grid)
+                XCTAssertEqual(
+                    CameraGroupLayout.ignoresSafeArea(horizontal: horizontal, vertical: vertical),
+                    horizontal == .regular && vertical == .compact
+                )
             }
         }
     }
@@ -707,6 +833,31 @@ final class CameraGroupTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(5))
         }
         XCTFail("History did not settle: \(history.state)")
+    }
+}
+
+@MainActor
+private final class CameraSessionResourceSpy {
+    var events: [String] = []
+    var startCount: [String: Int] = [:]
+
+    func start(_ resource: String) async {
+        let count = (startCount[resource] ?? 0) + 1
+        startCount[resource] = count
+        events.append("\(resource).start.\(count)")
+        guard count == 1 else { return }
+        do {
+            try await Task.sleep(for: .seconds(60))
+        } catch {}
+        events.append("\(resource).end.\(count)")
+    }
+
+    func stop(_ resource: String) {
+        events.append("\(resource).stop")
+    }
+
+    func stop(_ resource: String, immediately: Bool) {
+        events.append("\(resource).stop\(immediately ? ".immediately" : "")")
     }
 }
 

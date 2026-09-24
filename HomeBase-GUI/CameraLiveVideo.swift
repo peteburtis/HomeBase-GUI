@@ -568,6 +568,59 @@ final class CameraH264Renderer: ObservableObject {
     }
 }
 
+/// Tracks the logical current run separately from every run that still owns
+/// cleanup work. A normal stop may supersede a run before its subscription
+/// acquisition returns; a later immediate stop must still strengthen that
+/// unfinished run's eventual release policy.
+@MainActor
+struct CameraLiveVideoRunOwnership {
+    struct Completion: Equatable {
+        let wasCurrent: Bool
+        let immediateStopRequested: Bool
+    }
+
+    private var current: UUID?
+    private var unfinished: Set<UUID> = []
+    private var immediateStops: Set<UUID> = []
+
+    mutating func begin() -> UUID {
+        let token = UUID()
+        current = token
+        unfinished.insert(token)
+        return token
+    }
+
+    func isCurrent(_ token: UUID) -> Bool {
+        current == token
+    }
+
+    @discardableResult
+    mutating func stop(immediately: Bool) -> UUID? {
+        let stopped = current
+        if immediately {
+            immediateStops.formUnion(unfinished)
+        }
+        current = nil
+        return stopped
+    }
+
+    func shouldReleaseImmediately(_ token: UUID) -> Bool {
+        immediateStops.contains(token)
+    }
+
+    mutating func finish(_ token: UUID) -> Completion {
+        let wasCurrent = current == token
+        if wasCurrent {
+            current = nil
+        }
+        unfinished.remove(token)
+        return Completion(
+            wasCurrent: wasCurrent,
+            immediateStopRequested: immediateStops.remove(token) != nil
+        )
+    }
+}
+
 @MainActor
 final class CameraLiveVideoModel: ObservableObject {
     enum State: Equatable {
@@ -590,10 +643,10 @@ final class CameraLiveVideoModel: ObservableObject {
     private let client: HomeBaseWebSocketClient
     private let recordingController: CameraLocalRecordingController?
     private let playbackController: CameraLivePlaybackController?
-    private let recordingOwnerID = UUID()
     private var arbiter: CameraStreamArbiter?
+    private var knownArbiter: CameraStreamArbiter?
     private var subscription: CameraStreamSubscription?
-    private var runToken: UUID?
+    private var runOwnership = CameraLiveVideoRunOwnership()
 
     init(
         deviceIdentifier: String,
@@ -617,8 +670,7 @@ final class CameraLiveVideoModel: ObservableObject {
 
     func run(access: CameraAccessSession? = nil) async {
         guard state == .idle, !Task.isCancelled else { return }
-        let token = UUID()
-        runToken = token
+        let token = runOwnership.begin()
         state = .connecting
         qualityWarning = nil
         var ownedArbiter: CameraStreamArbiter?
@@ -627,31 +679,37 @@ final class CameraLiveVideoModel: ObservableObject {
         do {
             try await client.reactivate()
             try Task.checkCancellation()
-            guard runToken == token else { throw CancellationError() }
+            guard runOwnership.isCurrent(token) else { throw CancellationError() }
             let shared = await client.cameraStreamArbiter()
-            guard runToken == token else { throw CancellationError() }
+            knownArbiter = shared
+            guard runOwnership.isCurrent(token) else { throw CancellationError() }
             let authorization = try access?.authorizeStreams(shared)
             let acquired = try await shared.subscribe(camera: deviceIdentifier, quality: quality, authorization: authorization)
             ownedArbiter = shared; ownedSubscription = acquired
             try Task.checkCancellation()
-            guard runToken == token else { throw CancellationError() }
+            guard runOwnership.isCurrent(token) else { throw CancellationError() }
             arbiter = shared; subscription = acquired
             // A quality selection may have changed during the acquire.
             await shared.update(acquired, quality: quality)
             events: for try await event in acquired.events {
                 try Task.checkCancellation()
-                guard runToken == token else { break }
+                guard runOwnership.isCurrent(token) else { break }
                 guard authorization?.isValid != false else { throw CancellationError() }
                 switch event {
                 case .qualityWarning(let message): qualityWarning = message
                 case .frames(let frames):
                     for frame in frames {
-                        guard runToken == token, !Task.isCancelled, authorization?.isValid != false else { break events }
-                        if try await !consume(frame) { break events }
+                        guard runOwnership.isCurrent(token), !Task.isCancelled,
+                              authorization?.isValid != false else { break events }
+                        if try await !consume(frame, ownerID: token) {
+                            break events
+                        }
+                        guard runOwnership.isCurrent(token),
+                              !Task.isCancelled else { break events }
                     }
                 }
             }
-            if !Task.isCancelled, runToken == token {
+            if !Task.isCancelled, runOwnership.isCurrent(token) {
                 switch state {
                 case .ended, .failed:
                     break
@@ -660,33 +718,63 @@ final class CameraLiveVideoModel: ObservableObject {
                 }
             }
         } catch is CancellationError {
-            if runToken == token { state = .idle }
+            if runOwnership.isCurrent(token) { state = .idle }
         } catch {
-            if runToken == token {
+            if runOwnership.isCurrent(token) {
                 state = .failed(error.localizedDescription)
             }
         }
 
-        await releaseSubscription(ownedSubscription, from: ownedArbiter)
-        if runToken == token {
-            playbackController?.stop(ownerID: recordingOwnerID)
-            runToken = nil
-            await recordingController?.streamDidEnd(ownerID: recordingOwnerID)
+        let stopImmediately = runOwnership.shouldReleaseImmediately(token)
+        await releaseSubscription(
+            ownedSubscription,
+            from: ownedArbiter,
+            immediately: stopImmediately
+        )
+        let completion = runOwnership.finish(token)
+        if completion.immediateStopRequested, !stopImmediately {
+            // An immediate stop can arrive while an ordinary unsubscribe is
+            // crossing actors. Upgrade the now-idle entry after that release.
+            await ownedArbiter?.stopIdleStreamImmediately(
+                camera: deviceIdentifier
+            )
+        }
+        if completion.wasCurrent {
+            playbackController?.stop(ownerID: token)
+            await recordingController?.streamDidEnd(ownerID: token)
         }
     }
 
     func stop(immediately: Bool = false) async {
-        runToken = nil
-        playbackController?.stop(ownerID: recordingOwnerID)
+        // Mark every unfinished run before awaiting network work. This covers
+        // a subscription that exists inside run() but is not published yet.
+        let stoppedOwnerID = runOwnership.stop(immediately: immediately)
+        if let stoppedOwnerID {
+            playbackController?.stop(ownerID: stoppedOwnerID)
+        }
         // Publish the stopped state before awaiting network cleanup, so an old
         // stop cannot overwrite a newer run after a quick dismissal/reopen.
         state = .idle
         qualityWarning = nil
         await releaseSubscription(subscription, from: arbiter, immediately: immediately)
-        await recordingController?.streamDidEnd(ownerID: recordingOwnerID)
+        if immediately {
+            // A preceding ordinary release may already have removed this
+            // consumer and entered the arbiter's handoff grace. Upgrade that
+            // idle entry too; another active viewer is never disturbed.
+            await knownArbiter?.stopIdleStreamImmediately(camera: deviceIdentifier)
+        }
+        if let stoppedOwnerID {
+            await recordingController?.streamDidEnd(ownerID: stoppedOwnerID)
+        }
     }
 
-    private func consume(_ frame: HBMediaFrame) async throws -> Bool {
+    private func consume(
+        _ frame: HBMediaFrame,
+        ownerID: UUID
+    ) async throws -> Bool {
+        guard runOwnership.isCurrent(ownerID), !Task.isCancelled else {
+            throw CancellationError()
+        }
         switch frame.type {
         case .streamStatus:
             let status = try JSONDecoder().decode(
@@ -712,16 +800,24 @@ final class CameraLiveVideoModel: ObservableObject {
             let formatDescription: CMVideoFormatDescription
             if let playbackController {
                 formatDescription = try playbackController.configure(
-                    configuration, ownerID: recordingOwnerID, preservingDisplayedImage: true
+                    configuration,
+                    ownerID: ownerID,
+                    preservingDisplayedImage: true
                 )
             } else {
                 formatDescription = try renderer.configure(configuration, removingDisplayedImage: false)
             }
-            await recordingController?.configure(
-                ownerID: recordingOwnerID,
-                generation: configuration.generation,
-                formatDescription: formatDescription
-            )
+            if let recordingController {
+                let configured = await recordingController.configure(
+                    ownerID: ownerID,
+                    generation: configuration.generation,
+                    formatDescription: formatDescription
+                )
+                guard configured else { throw CancellationError() }
+            }
+            guard runOwnership.isCurrent(ownerID), !Task.isCancelled else {
+                throw CancellationError()
+            }
             if configuration.width > 0, configuration.height > 0 {
                 aspectRatio = CGFloat(configuration.width)
                     / CGFloat(configuration.height)
@@ -731,7 +827,7 @@ final class CameraLiveVideoModel: ObservableObject {
             let sampleBuffer: CMSampleBuffer?
             if let playbackController {
                 sampleBuffer = try playbackController.receive(
-                    frame, ownerID: recordingOwnerID
+                    frame, ownerID: ownerID
                 )
             } else {
                 sampleBuffer = try renderer.enqueue(frame)
@@ -739,7 +835,7 @@ final class CameraLiveVideoModel: ObservableObject {
             if let sampleBuffer {
                 recordingController?.append(
                     sampleBuffer,
-                    ownerID: recordingOwnerID,
+                    ownerID: ownerID,
                     generation: frame.generation,
                     isKeyFrame: frame.flags.contains(.keyFrame)
                 )
@@ -858,6 +954,62 @@ struct CameraLiveVideoPlayer: View {
     }
 
     var body: some View {
+        CameraLiveVideoSurface(
+            model: model,
+            allowsRetry: allowsRetry,
+            usesHistory: usesHistory,
+            retry: retry
+        )
+        .onChange(of: quality, initial: true) { _, value in
+            Task { await model.setQuality(value) }
+        }
+        .onChange(of: model.state, initial: true) { _, state in onStateChanged?(state) }
+        .onChange(of: model.aspectRatio, initial: true) { _, ratio in onAspectRatioChanged?(ratio) }
+        .task(id: CameraLiveVideoLifecycle.taskIdentity(
+            retryID: retryID,
+            scenePhase: scenePhase,
+            isStreamEnabled: isStreamEnabled
+        )) {
+            // Standalone previews own their model lifetime. Full-screen camera
+            // sessions use CameraLiveVideoSurface directly and are coordinated
+            // by CameraGroupPlayback instead of view appearance.
+            await model.stop(immediately: scenePhase == .background)
+            guard !Task.isCancelled,
+                  !CameraLiveVideoLifecycle.isSuspended(
+                    in: scenePhase, isStreamEnabled: isStreamEnabled
+                  ) else { return }
+            await model.run(access: cameraAccessSession)
+        }
+        .onChange(of: restartRequest) { _, _ in
+            guard isStreamEnabled, scenePhase == .active,
+                  !model.state.displaysVideo else { return }
+            retry()
+        }
+        .onDisappear {
+            Task {
+                await model.stop()
+            }
+        }
+    }
+
+    private func retry() {
+        Task {
+            await model.stop()
+            retryID &+= 1
+        }
+    }
+}
+
+/// Presentation-only camera video. The caller owns the model and its resource
+/// lifetime, so rebuilding or laying out this view cannot open or close a
+/// camera stream.
+struct CameraLiveVideoSurface: View {
+    @ObservedObject var model: CameraLiveVideoModel
+    let allowsRetry: Bool
+    let usesHistory: Bool
+    let retry: () -> Void
+
+    var body: some View {
         ZStack {
             Color.black
                 .allowsHitTesting(false)
@@ -882,12 +1034,7 @@ struct CameraLiveVideoPlayer: View {
                         .multilineTextAlignment(.center)
                         .allowsHitTesting(false)
                     if allowsRetry, canRetry {
-                        Button("Try Again", systemImage: "arrow.clockwise") {
-                            Task {
-                                await model.stop()
-                                retryID += 1
-                            }
-                        }
+                        Button("Try Again", systemImage: "arrow.clockwise", action: retry)
                         .buttonStyle(.borderedProminent)
                     }
                 }
@@ -902,38 +1049,6 @@ struct CameraLiveVideoPlayer: View {
                 Text(warning).font(.caption).foregroundStyle(.white)
                     .padding(6).background(.black.opacity(0.65), in: .rect(cornerRadius: 6))
                     .padding().allowsHitTesting(false)
-            }
-        }
-        .onChange(of: quality, initial: true) { _, value in
-            Task { await model.setQuality(value) }
-        }
-        .onChange(of: model.state, initial: true) { _, state in onStateChanged?(state) }
-        .onChange(of: model.aspectRatio, initial: true) { _, ratio in onAspectRatioChanged?(ratio) }
-        .task(id: CameraLiveVideoLifecycle.taskIdentity(
-            retryID: retryID,
-            scenePhase: scenePhase,
-            isStreamEnabled: isStreamEnabled
-        )) {
-            // Covered previews relinquish their subscription; the arbiter
-            // keeps a short handoff grace period, except on background/lock.
-            await model.stop(immediately: scenePhase == .background)
-            guard !Task.isCancelled,
-                  !CameraLiveVideoLifecycle.isSuspended(
-                    in: scenePhase, isStreamEnabled: isStreamEnabled
-                  ) else { return }
-            await model.run(access: cameraAccessSession)
-        }
-        .onChange(of: restartRequest) { _, _ in
-            guard isStreamEnabled, scenePhase == .active,
-                  !model.state.displaysVideo else { return }
-            Task {
-                await model.stop()
-                retryID &+= 1
-            }
-        }
-        .onDisappear {
-            Task {
-                await model.stop()
             }
         }
     }
@@ -991,7 +1106,7 @@ private struct CameraToolbarVisibility: ViewModifier {
 #if os(iOS)
         content.toolbarVisibility(
             isVisible ? .visible : .hidden,
-            for: .navigationBar
+            for: .navigationBar, .bottomBar
         )
 #elseif os(macOS)
         content.toolbarVisibility(
@@ -1232,7 +1347,6 @@ struct CameraLiveGestureSurface: View {
 #endif
 
 struct CameraFullScreenLiveVideoView: View {
-    @Environment(\.dismiss) private var dismiss
     let client: HomeBaseWebSocketClient
     @StateObject private var selection: CameraScreenSelection
     @StateObject private var cameraPicker: CameraPickerModel
@@ -1262,18 +1376,6 @@ struct CameraFullScreenLiveVideoView: View {
                 selectCamera: { selection.select($0, position: $1) },
                 retainCamera: { selection.retain($0, quality: $1) })
                 .id(selection.session.id)
-                .allowsHitTesting(access.isUnlocked)
-                .accessibilityHidden(!access.isUnlocked)
-                .overlay {
-                    if !access.isUnlocked { CameraAccessLockedView(access: access) }
-                }
-                .toolbar {
-                    if !access.isUnlocked {
-                        ToolbarItem(placement: .cancellationAction) {
-                            CameraPlayerCloseButton { dismiss() }
-                        }
-                    }
-                }
             }
         }
     }
@@ -1286,7 +1388,6 @@ private struct CameraFullScreenCameraContent: View {
 #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 #endif
-
     let client: HomeBaseWebSocketClient
     let access: CameraAccessPresentation
     @StateObject private var initialSession: CameraGroupSession
@@ -1352,17 +1453,11 @@ private struct CameraFullScreenCameraContent: View {
 
     private var cameraPresentation: some View {
         liveVideo
-            .toolbar {
-                if access.isUnlocked { cameraToolbar }
-            }
-            .modifier(CameraTransparentToolbar())
-            .modifier(CameraToolbarVisibility(
-                isVisible: !access.isUnlocked || visiblePlayerControls
-            ))
         .onAppear {
-            if access.isAuthorized {
-                playbackController.prepareHistory(metadata: controlsModel.deviceMetadata, client: client, credentials: access.session?.unlockedCredentials)
-            } else { group.suspend() }
+            if !access.isAuthorized {
+                group.suspend()
+                group.suspendResources(stopImmediately: true)
+            }
             applyInitialPositionIfAuthorized()
         }
         .onDisappear {
@@ -1382,10 +1477,29 @@ private struct CameraFullScreenCameraContent: View {
                 stopLiveCameraGestures()
             }
         }
-        .task(id: CameraLiveVideoLifecycle.isSuspended(in: scenePhase, isStreamEnabled: access.isAuthorized)) {
-            if CameraLiveVideoLifecycle.isSuspended(in: scenePhase, isStreamEnabled: access.isAuthorized) {
+        .onChange(
+            of: CameraLiveVideoLifecycle.isSuspended(
+                in: scenePhase,
+                isStreamEnabled: access.isAuthorized
+            ),
+            initial: true
+        ) { _, isSuspended in
+            // This reconciliation is synchronous. A superseded SwiftUI task
+            // can therefore never apply an older foreground/background intent.
+            if isSuspended {
                 group.suspend()
-            } else { group.resume() }
+                group.suspendResources(
+                    stopImmediately: scenePhase == .background || !access.isAuthorized
+                )
+            } else {
+                group.resume()
+                group.activateResources(access: access.session)
+            }
+        }
+        .onChange(of: access.session?.unlockedCredentials) { _, _ in
+            if access.isAuthorized {
+                group.refreshHistoryAccess(access.session)
+            }
         }
         .onChange(of: availableQualities) { _, qualities in
             guard !qualities.contains(selectedQuality),
@@ -1456,6 +1570,7 @@ private struct CameraFullScreenCameraContent: View {
         }
         .onChange(of: access.isAuthorized) { _, allowed in
             if !allowed {
+                group.suspendResources(stopImmediately: true)
                 group.sessions.forEach { $0.playback.revokeCameraAccess() }
                 s3Destination = nil
                 cameraPickerVisible = false
@@ -1478,14 +1593,25 @@ private struct CameraFullScreenCameraContent: View {
         } message: {
             Text(cameraSwitchError ?? group.error ?? "Unknown error")
         }
+        .allowsHitTesting(access.isUnlocked)
+        .accessibilityHidden(!access.isUnlocked)
+        .overlay {
+            if !access.isUnlocked {
+                CameraAccessLockedView(access: access)
+            }
+        }
+        .toolbar { cameraToolbar }
+        .modifier(CameraTransparentToolbar())
+        .modifier(CameraToolbarVisibility(
+            isVisible: !access.isUnlocked || visiblePlayerControls
+        ))
     }
 
     private var liveVideo: some View {
         ZStack {
-            CameraGroupVideo(group: group, cameraControlsEnabled: cameraControlsEnabled,
+        CameraGroupVideo(group: group, cameraControlsEnabled: cameraControlsEnabled,
                 controlsVisible: visiblePlayerControls,
                 isAccessAllowed: access.isAuthorized,
-                credentials: access.session?.unlockedCredentials,
                 onSingleTap: toggleControls)
 
             if visiblePlayerControls && panel == .ptz && panelAvailability.enablesPTZ {
@@ -1533,9 +1659,6 @@ private struct CameraFullScreenCameraContent: View {
         }
         .overlayPreferenceValue(CameraTimelineBoundsPreference.self) { timelineBounds in
             if visiblePlayerControls {
-                CameraPlayerPanelPlacement(panel: panel, timelineBounds: timelineBounds) {
-                    CameraPlayerPanelPicker(selection: $panel, availability: panelAvailability)
-                }
                 if let destination = lockedS3Destination, access.session != nil {
                     CameraPlayerPanelPlacement(panel: panel, timelineBounds: timelineBounds, leading: true) {
                         CameraS3PadlockButton { s3Destination = destination }
@@ -1554,9 +1677,6 @@ private struct CameraFullScreenCameraContent: View {
         .background(Color.black.ignoresSafeArea())
         .animation(.snappy, value: controlsVisible)
         .animation(reduceMotion ? nil : .snappy, value: panel)
-        .onChange(of: controlsModel.deviceMetadata, initial: true) { _, metadata in
-            if access.isAuthorized, !group.active { playbackController.prepareHistory(metadata: metadata, client: client, credentials: access.session?.unlockedCredentials) }
-        }
         .accessibilityActions {
             if isShowingVideo {
                 Button("Toggle player controls", action: toggleControls)
@@ -1564,74 +1684,142 @@ private struct CameraFullScreenCameraContent: View {
         }
     }
 
+    @ToolbarContentBuilder
+    private var cameraToolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            CameraPlayerCloseButton { dismiss() }
+        }
+
 #if os(iOS)
-    @ToolbarContentBuilder
-    private var cameraToolbar: some ToolbarContent {
-        playbackToolbar
-        // In compact width, playback speed takes Record's trailing place
-        // outside Live. Regular width still keeps the disabled Record button.
-        if !group.hasMultipleCameras, horizontalSizeClass != .compact || isLive {
-            ToolbarItem(placement: .topBarTrailing) { recordingControl }
-            if horizontalSizeClass != .compact, hasLiveToolbarControls {
-                ToolbarSpacer(.fixed, placement: .topBarTrailing)
-            }
-        }
-        if showsQualityControl {
-            ToolbarItem(placement: cameraSettingsPlacement) { qualityControl }
-        }
-        if let dayNightModeControl {
-            ToolbarItem(placement: cameraSettingsPlacement) {
-                dayNightModeControl
-            }
-        }
-        if let privacyControl {
-            ToolbarItem(placement: cameraSettingsPlacement) {
-                privacyControl
-            }
-        }
-        if horizontalSizeClass != .compact {
-            ToolbarSpacer(.fixed, placement: .topBarTrailing)
-        }
-        ToolbarItem(placement: .topBarTrailing) {
-            cameraPickerControl
-        }
-    }
+        if access.isUnlocked {
+            if horizontalSizeClass == .compact {
+                ToolbarItem(placement: .bottomBar) {
+                    pauseControl.disabled(!playbackActionsEnabled)
+                }
+                ToolbarItemGroup(placement: .secondaryAction) {
+                    backControl.disabled(!playbackActionsEnabled)
+                    forwardControl.disabled(!playbackActionsEnabled)
+                }
+                ToolbarSpacer(.fixed, placement: .bottomBar)
+                ToolbarItem(placement: .bottomBar) {
+                    CameraLiveModeButton(
+                        isLive: isLive,
+                        showsTitle: false,
+                        action: returnToLive
+                    )
+                        .disabled(!playbackActionsEnabled)
+                }
+                if !isLive {
+                    ToolbarSpacer(.fixed, placement: .bottomBar)
+                    ToolbarItem(placement: .bottomBar) {
+                        playbackSpeedControl.disabled(!playbackActionsEnabled)
+                    }
+                }
+                ToolbarSpacer(.flexible, placement: .bottomBar)
 
-    private var cameraSettingsPlacement: ToolbarItemPlacement {
-        // iOS 26 compact-width overflow policy, shared with the 30-second
-        // shuttles in CameraPlaybackToolbar. Record and camera selection stay
-        // primary. Adopt iOS 27's overflow/visibility-priority APIs when available.
-        horizontalSizeClass == .compact ? .secondaryAction : .topBarTrailing
-    }
+                if !group.hasMultipleCameras, isLive {
+                    ToolbarItem(placement: .bottomBar) { recordingControl }
+                }
+                if let privacyControl {
+                    ToolbarItem(placement: .bottomBar) { privacyControl }
+                }
+                if showsQualityControl {
+                    ToolbarItem(placement: .secondaryAction) { qualityControl }
+                }
+                if let dayNightModeControl {
+                    ToolbarItem(placement: .secondaryAction) {
+                        dayNightModeControl
+                    }
+                }
+            } else {
+                ToolbarItemGroup(placement: .bottomBar) {
+                    backControl.disabled(!playbackActionsEnabled)
+                    pauseControl.disabled(!playbackActionsEnabled)
+                    forwardControl.disabled(!playbackActionsEnabled)
+                }
+                ToolbarSpacer(.fixed, placement: .bottomBar)
+                ToolbarItem(placement: .bottomBar) {
+                    CameraLiveModeButton(
+                        isLive: isLive,
+                        showsTitle: true,
+                        action: returnToLive
+                    )
+                        .disabled(!playbackActionsEnabled)
+                }
+                if !isLive {
+                    ToolbarSpacer(.fixed, placement: .bottomBar)
+                    ToolbarItem(placement: .bottomBar) {
+                        playbackSpeedControl.disabled(!playbackActionsEnabled)
+                    }
+                }
+                ToolbarSpacer(.flexible, placement: .bottomBar)
+
+                if !group.hasMultipleCameras {
+                    ToolbarItem(placement: .bottomBar) { recordingControl }
+                    if hasLiveToolbarControls {
+                        ToolbarSpacer(.fixed, placement: .bottomBar)
+                    }
+                }
+                if showsQualityControl {
+                    ToolbarItem(placement: .bottomBar) { qualityControl }
+                }
+                if let dayNightModeControl {
+                    ToolbarItem(placement: .bottomBar) {
+                        dayNightModeControl
+                    }
+                }
+                if let privacyControl {
+                    ToolbarItem(placement: .bottomBar) { privacyControl }
+                }
+            }
+
+            ToolbarItem(placement: .primaryAction) {
+                cameraPickerControl
+            }
+        }
 #else
-    @ToolbarContentBuilder
-    private var cameraToolbar: some ToolbarContent {
-        playbackToolbar
-        if showsQualityControl {
-            ToolbarItem(placement: .primaryAction) { qualityControl }
-        }
-        if let dayNightModeControl {
-            ToolbarItem(placement: .primaryAction) {
-                dayNightModeControl
+        if access.isUnlocked {
+            ToolbarSpacer(.fixed, placement: .navigation)
+            ToolbarItemGroup(placement: .navigation) {
+                backControl.disabled(!playbackActionsEnabled)
+                pauseControl.disabled(!playbackActionsEnabled)
+                forwardControl.disabled(!playbackActionsEnabled)
             }
-        }
-        if let privacyControl {
-            ToolbarItem(placement: .primaryAction) {
-                privacyControl
+            ToolbarSpacer(.fixed, placement: .navigation)
+            ToolbarItem(placement: .navigation) {
+                CameraLiveModeButton(
+                    isLive: isLive,
+                    showsTitle: true,
+                    action: returnToLive
+                )
+                    .disabled(!playbackActionsEnabled)
             }
-        }
-        ToolbarSpacer(.fixed, placement: .primaryAction)
-        ToolbarItem(placement: .primaryAction) {
-            cameraPickerControl
-        }
-    }
-#endif
+            if !isLive {
+                ToolbarSpacer(.fixed, placement: .navigation)
+                ToolbarItem(placement: .navigation) {
+                    playbackSpeedControl.disabled(!playbackActionsEnabled)
+                }
+            }
 
-    private var playbackToolbar: some ToolbarContent {
-        CameraPlaybackToolbar(isLive: isLive, playbackEnabled: playbackActionsEnabled,
-            close: { dismiss() }, goLive: returnToLive,
-            back: backControl, pause: pauseControl, forward: forwardControl,
-            speed: playbackSpeedControl)
+            if showsQualityControl {
+                ToolbarItem(placement: .primaryAction) { qualityControl }
+            }
+            if let dayNightModeControl {
+                ToolbarItem(placement: .primaryAction) {
+                    dayNightModeControl
+                }
+            }
+            if let privacyControl {
+                ToolbarItem(placement: .primaryAction) {
+                    privacyControl
+                }
+            }
+            ToolbarSpacer(.fixed, placement: .primaryAction)
+            ToolbarItem(placement: .primaryAction) {
+                cameraPickerControl
+            }
+        }
+#endif
     }
 
     private var cameraPickerControl: some View {
@@ -1640,7 +1828,7 @@ private struct CameraFullScreenCameraContent: View {
             cameraPickerVisible = true
         } label: {
             if switchingCamera { ProgressView() }
-            else { Image(systemName: "rectangle.grid.3x3.fill") }
+            else { Image(systemName: "video.fill") }
         }
         .accessibilityLabel("Choose camera")
         .accessibilityValue(group.active ? group.sessions.map { $0.camera.device.displayName }.joined(separator: ", ") : device.displayName)
@@ -1892,13 +2080,20 @@ private struct CameraFullScreenCameraContent: View {
         .disabled(isLive || !canControlPlayback || group.resolvingTime)
     }
 
+    private var showsQualityControl: Bool { cameraControlsEnabled && playbackActionsEnabled }
+
     private var privacyControl: CameraPrivacyToolbarControl? {
-        guard cameraControlsEnabled, activeControls.state == .live else { return nil }
+        guard cameraControlsEnabled, activeControls.state == .live else {
+            return nil
+        }
         let controls = CameraDetailControlSet(
             controls: activeControls.controls
         )
-        guard let privacy = controls.privacy, privacy.valid != false,
-              privacy.cameraOverlayBooleanValue != nil else { return nil }
+        guard let privacy = controls.privacy,
+              privacy.valid != false,
+              privacy.cameraOverlayBooleanValue != nil else {
+            return nil
+        }
         return CameraPrivacyToolbarControl(
             control: privacy,
             model: activeControls
@@ -1906,10 +2101,14 @@ private struct CameraFullScreenCameraContent: View {
     }
 
     private var dayNightModeControl: CameraDayNightModeToolbarControl? {
-        guard cameraControlsEnabled, activeControls.state == .live else { return nil }
+        guard cameraControlsEnabled, activeControls.state == .live else {
+            return nil
+        }
         guard let target = CameraDayNightModeTarget(
             controls: activeControls.controls
-        ), target.control.valid != false, target.selectedMode != nil else { return nil }
+        ), target.control.valid != false, target.selectedMode != nil else {
+            return nil
+        }
         return CameraDayNightModeToolbarControl(
             target: target,
             model: activeControls,
@@ -1917,31 +2116,29 @@ private struct CameraFullScreenCameraContent: View {
         )
     }
 
-    private var showsQualityControl: Bool { cameraControlsEnabled && playbackActionsEnabled }
-
     private var hasLiveToolbarControls: Bool {
-        showsQualityControl || dayNightModeControl != nil || privacyControl != nil
+        showsQualityControl
+            || dayNightModeControl != nil
+            || privacyControl != nil
     }
 
     private var qualityControl: some View {
         Menu {
-            ForEach(availableQualities, id: \.self) { quality in
-                Button {
-                    guard cameraControlsEnabled, playbackActionsEnabled else { return }
+            Picker("Video quality", selection: Binding(
+                get: { selectedQuality },
+                set: { quality in
+                    guard cameraControlsEnabled,
+                          playbackActionsEnabled else { return }
                     selectedQuality = quality
-                } label: {
-                    if quality == selectedQuality {
-                        Label(
-                            CameraLiveQualityPresentation.title(for: quality),
-                            systemImage: "checkmark"
-                        )
-                    } else {
-                        Text(CameraLiveQualityPresentation.title(for: quality))
-                    }
+                }
+            )) {
+                ForEach(availableQualities, id: \.self) { quality in
+                    Text(CameraLiveQualityPresentation.title(for: quality))
+                        .tag(quality)
                 }
             }
         } label: {
-            Label("Video quality", systemImage: "slider.horizontal.3")
+            Image(systemName: "slider.horizontal.3")
         }
         .accessibilityLabel("Video quality")
         .accessibilityValue(

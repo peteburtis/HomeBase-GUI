@@ -440,6 +440,33 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertFalse(controller.isStreamAvailable)
     }
 
+    func testRecordingConfigurationCannotReappearAfterItsRunEnds() async throws {
+        let barrier = CameraRecordingConfigurationBarrier()
+        let controller = CameraLocalRecordingController(
+            destination: CameraRecordingDestinationStub(),
+            configurationInstallationBarrier: {
+                await barrier.suspend()
+            }
+        )
+        let ownerID = UUID()
+        let formatDescription = try makeH264FormatDescription()
+        let configuration = Task { @MainActor in
+            await controller.configure(
+                ownerID: ownerID,
+                generation: 1,
+                formatDescription: formatDescription
+            )
+        }
+
+        await barrier.waitUntilEntered()
+        await controller.streamDidEnd(ownerID: ownerID)
+        barrier.release()
+
+        let configurationInstalled = await configuration.value
+        XCTAssertFalse(configurationInstalled)
+        XCTAssertFalse(controller.isStreamAvailable)
+    }
+
     func testPermissionDialogInactivityDoesNotRestartLiveVideoTask() {
         XCTAssertFalse(CameraLiveVideoLifecycle.isSuspended(in: .active))
         XCTAssertFalse(CameraLiveVideoLifecycle.isSuspended(in: .inactive))
@@ -486,6 +513,33 @@ final class CameraLiveVideoTests: XCTestCase {
         ))
         // Full-screen players opt in independently of their covered previews.
         XCTAssertFalse(CameraLiveVideoLifecycle.isSuspended(in: .active))
+    }
+
+    func testImmediateStopStrengthensSupersededAndReleasingRuns() {
+        var ownership = CameraLiveVideoRunOwnership()
+        let acquiring = ownership.begin()
+
+        // An ordinary transition can clear the logical current run while its
+        // subscription acquisition still owns cleanup work.
+        ownership.stop(immediately: false)
+        XCTAssertFalse(ownership.shouldReleaseImmediately(acquiring))
+        ownership.stop(immediately: true)
+        XCTAssertTrue(ownership.shouldReleaseImmediately(acquiring))
+        let acquiredCompletion = ownership.finish(acquiring)
+        XCTAssertFalse(acquiredCompletion.wasCurrent)
+        XCTAssertTrue(acquiredCompletion.immediateStopRequested)
+
+        // If the immediate request lands after cleanup sampled its release
+        // policy, completion still reports that the ordinary release must be
+        // upgraded once it returns from the arbiter.
+        let releasing = ownership.begin()
+        let sampledImmediatePolicy = ownership.shouldReleaseImmediately(
+            releasing
+        )
+        XCTAssertFalse(sampledImmediatePolicy)
+        ownership.stop(immediately: true)
+        let releasingCompletion = ownership.finish(releasing)
+        XCTAssertTrue(releasingCompletion.immediateStopRequested)
     }
 
     func testVideoIsDisplayedOnlyWhileActivelyPlaying() {
@@ -843,5 +897,34 @@ private final class CameraRecordingDestinationStub:
 
     func saveVideo(at fileURL: URL, creationDate: Date) async throws {
         savedURLs.append(fileURL)
+    }
+}
+
+@MainActor
+private final class CameraRecordingConfigurationBarrier {
+    private var entered = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { continuation in
+            entryWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }
