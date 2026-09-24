@@ -8,8 +8,8 @@ struct CameraTimelineBoundsPreference: PreferenceKey {
     }
 }
 
-/// The floating capsule is the only show/hide control. Removing the timeline
-/// also releases its thumbnail connection; no hidden handle intercepts video.
+/// Removing the timeline also releases its thumbnail connection; no hidden
+/// view remains to intercept video gestures.
 struct CameraTimelinePanel<Content: View>: View {
     let isPresented: Bool
     @ViewBuilder let content: () -> Content

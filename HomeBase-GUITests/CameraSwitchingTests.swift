@@ -77,6 +77,28 @@ final class CameraSwitchingTests: XCTestCase {
         XCTAssertTrue(requests.isEmpty)
     }
 
+    func testHistoryBookmarkAlwaysFreezesPlayback() {
+        XCTAssertEqual(CameraSwitchPosition.live.paused, .live)
+        XCTAssertEqual(
+            CameraSwitchPosition.canonical(500, paused: false).paused,
+            .canonical(500, paused: true)
+        )
+        XCTAssertEqual(
+            CameraSwitchPosition.relative(
+                cameraID: "source",
+                offset: -30,
+                capturedAt: 100,
+                paused: false
+            ).paused,
+            .relative(
+                cameraID: "source",
+                offset: -30,
+                capturedAt: 100,
+                paused: true
+            )
+        )
+    }
+
     func testFailedClockLookupDoesNotSilentlyLoseHistoryPosition() async throws {
         let departure = CameraSwitchPosition.relative(cameraID: "source", offset: -30, capturedAt: 100, paused: true)
         do {

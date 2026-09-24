@@ -644,10 +644,12 @@ final class CameraGroupPlayback: ObservableObject {
         lastTick = clock(); drive(seeking: true)
     }
 
-    func seek(to date: Date) {
+    func seek(to date: Date, paused requestedPause: Bool? = nil) {
         guard hasHistory else { return }
         cancelResolution()
-        source = .history; cursor = date.timeIntervalSince1970
+        source = .history
+        cursor = date.timeIntervalSince1970
+        if let requestedPause { isPaused = requestedPause }
         lastTick = clock(); drive(seeking: true)
     }
 

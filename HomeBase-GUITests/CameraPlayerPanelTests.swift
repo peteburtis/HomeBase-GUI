@@ -181,7 +181,7 @@ private struct PanelFixture: View {
             if state.panel == .ptz { CameraDetailControlsOverlay(model: model) }
         }
         .overlay(alignment: .bottom) {
-            CameraTimelinePlacement(isMultiple: state.availability.isMultiple) {
+            CameraTimelinePlacement {
                 CameraTimelinePanel(isPresented: state.panel == .history) {
                     Color.yellow.opacity(0.2).frame(height: state.timelineHeight).allowsHitTesting(false)
                         .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { state.timelineFrame = $0 }

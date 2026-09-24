@@ -10,42 +10,11 @@ import HomeBaseProtocol
 final class CameraTimelineTests: XCTestCase {
     private let camera = UUID().uuidString
 
-    func testSingleCameraAlwaysUsesFullHeightTimeline() {
-        for compact in [true, false] {
-            for canvas in [CGSize(width: 852, height: 393), CGSize(width: 393, height: 852), CGSize(width: 900, height: 250)] {
-                XCTAssertEqual(CameraTimelineSizing.thumbnail(in: canvas, compactHeight: compact, isMultiple: false,
-                    cameraLabelHeight: 26, timeLabelHeight: 10), CameraTimelineSizing.standard)
-            }
-        }
-    }
-
-    func testCompactTimelineBudgetsForTwoUpAndClampsWithoutDeviceChecks() {
-        let labelHeight = 24.5, timeHeight = 9.5
-        for canvas in [CGSize(width: 667, height: 375), CGSize(width: 812, height: 375),
-                       CGSize(width: 844, height: 390), CGSize(width: 852, height: 393),
-                       CGSize(width: 874, height: 402), CGSize(width: 896, height: 414),
-                       CGSize(width: 912, height: 420), CGSize(width: 932, height: 430),
-                       CGSize(width: 956, height: 440)] {
-            let size = CameraTimelineSizing.thumbnail(in: canvas, compactHeight: true, isMultiple: true,
-                cameraLabelHeight: labelHeight, timeLabelHeight: timeHeight)
-            XCTAssertEqual(size.width / size.height, 16 / 9, accuracy: 0.0001)
-            XCTAssertTrue((36...63).contains(size.height))
-            let reference = CameraGroupLayout.videoFrame(in: CGRect(x: 0, y: 0, width: canvas.width / 2,
-                height: canvas.height), aspectRatio: 16 / 9)
-            XCTAssertGreaterThanOrEqual(canvas.height - size.height - timeHeight + 0.001,
-                reference.maxY + labelHeight + CameraTimelineSizing.labelGap, "\(canvas)")
-        }
-        let tiny = CameraTimelineSizing.thumbnail(in: CGSize(width: 900, height: 250), compactHeight: true, isMultiple: true,
-            cameraLabelHeight: 40, timeLabelHeight: timeHeight)
-        XCTAssertEqual(tiny, CGSize(width: 64, height: 36), "Never shrink past the usable minimum")
-        let roomy = CameraTimelineSizing.thumbnail(in: CGSize(width: 1000, height: 800), compactHeight: true, isMultiple: true,
-            cameraLabelHeight: labelHeight, timeLabelHeight: timeHeight)
-        XCTAssertEqual(roomy, CameraTimelineSizing.standard)
-        for canvas in [CGSize(width: 393, height: 852), CGSize(width: 852, height: 393), .zero] {
-            XCTAssertEqual(CameraTimelineSizing.thumbnail(in: canvas, compactHeight: false, isMultiple: true,
-                cameraLabelHeight: labelHeight, timeLabelHeight: timeHeight), CameraTimelineSizing.standard,
-                "Regular height preserves the normal size, even in a wide window")
-        }
+    func testTimelineStandardThumbnailIsFullSixteenByNineSize() {
+        XCTAssertEqual(
+            CameraTimelineSizing.standard,
+            CGSize(width: CameraTimelineScale.cellWidth, height: 63)
+        )
     }
 
     func testDynamicScaleRoundTripsAndKeepsSnapDistanceInPoints() async throws {
@@ -401,6 +370,43 @@ final class CameraTimelineTests: XCTestCase {
     }
 
 #if os(iOS)
+    func testToolbarScrubRelayDrivesTheMountedTimeline() async throws {
+        let relay = CameraToolbarScrubRelay()
+        let fetcher = TimelineFetcher()
+        var begins = 0
+        var seeks: [Date] = []
+        let host = UIHostingController(rootView: CameraHistoryTimeline(
+            makeTransport: { fetcher },
+            cameraID: camera,
+            timeZone: TimeZone(secondsFromGMT: 0)!,
+            position: { .canonical(TimelineFetcher.anchor, paused: true) },
+            onBegin: { begins += 1 },
+            onSeek: { seeks.append($0) },
+            toolbarScrubRelay: relay
+        ).environment(\.scenePhase, .active))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 852, height: 100)
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+
+        relay.events.send(.began)
+        relay.events.send(.changed(translation: CameraTimelineScale.cellWidth))
+        relay.events.send(.ended(translation: CameraTimelineScale.cellWidth))
+        try await wait { seeks.count == 1 }
+
+        XCTAssertEqual(begins, 1)
+        XCTAssertEqual(
+            try XCTUnwrap(seeks.first).timeIntervalSince1970,
+            TimelineFetcher.anchor - CameraTimelineScale.seconds,
+            accuracy: 0.001
+        )
+    }
+
     func testHiddenTimelineHasNoHandleDoesNotFetchOrInterceptVideoAndClosingReleasesConnection() async throws {
         let state = TimelineTestPanelState()
         let fetcher = TimelineFetcher(jpeg: try sampleJPEG(width: 320, height: 180))
@@ -522,13 +528,17 @@ final class CameraTimelineTests: XCTestCase {
     func testMountedTimelineCentersLiveEdgeAndHasAnEmptyFutureHalf() async throws {
         // Exercise a non-16:9 source too: it should fill the tile, with only
         // centered cropping, rather than leaving bars around the image.
-        let fetcher = TimelineFetcher(jpeg: try sampleJPEG(width: 240, height: 180), jpegWidth: 240)
+        let fetcher = TimelineFetcher(
+            availabilityDelay: .milliseconds(300),
+            jpeg: try sampleJPEG(width: 240, height: 180),
+            jpegWidth: 240
+        )
         var position = CameraSwitchPosition.live
         var thumbnailSize = CameraTimelineSizing.standard
         let layout = TimelineTestLayout()
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let host = UIHostingController(rootView: TimelineTestCanvas(layout: layout).overlay(alignment: .bottom) {
-            TimelineTestPlacement(layout: layout) {
+        let host = UIHostingController(rootView: TimelineTestCanvas(layout: layout).overlay(alignment: .top) {
+            TimelineTestPlacement(edge: .top) {
             CameraHistoryTimeline(makeTransport: { fetcher }, cameraID: self.camera, timeZone: TimeZone(secondsFromGMT: 0)!,
                 position: { position }, onBegin: { XCTFail("Initial alignment must not seek") }, onSeek: { _ in XCTFail("Following is not scrubbing") })
                 .background(TimelineSizingProbe { thumbnailSize = $0 })
@@ -541,14 +551,19 @@ final class CameraTimelineTests: XCTestCase {
         window.rootViewController = host; window.isHidden = false
         defer { window.isHidden = true; window.rootViewController = nil }
         host.view.frame = window.bounds; host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(50))
+        let scroll = try XCTUnwrap(findScroll(in: host.view))
+        let reservedHeight = scroll.bounds.height
+        XCTAssertGreaterThan(reservedHeight, CameraTimelineSizing.standard.height)
         try await Task.sleep(for: .milliseconds(800))
         let count = await fetcher.requests.count
         XCTAssertGreaterThan(count, 0)
-        let scroll = try XCTUnwrap(findScroll(in: host.view))
+        XCTAssertEqual(scroll.bounds.height, reservedHeight, accuracy: 0.5,
+            "Loading and loaded timelines reserve the same height")
         let landscapeFrame = scroll.convert(scroll.bounds, to: host.view)
         XCTAssertGreaterThan(host.view.safeAreaInsets.bottom, 0, "Test must have a real protected bottom inset")
-        XCTAssertEqual(landscapeFrame.maxY, host.view.bounds.maxY, accuracy: 1,
-            "The landscape scroll viewport reaches the physical bottom edge")
+        XCTAssertEqual(landscapeFrame.minY, host.view.bounds.minY, accuracy: 1,
+            "Compact height ignores the top safe-area inset")
         XCTAssertEqual(landscapeFrame.minX, 0, accuracy: 1)
         XCTAssertEqual(landscapeFrame.maxX, host.view.bounds.maxX, accuracy: 1)
         let maxOffset = scroll.contentSize.width - scroll.bounds.width + scroll.adjustedContentInset.right
@@ -557,18 +572,14 @@ final class CameraTimelineTests: XCTestCase {
         XCTAssertEqual(scroll.contentOffset.x + scroll.adjustedContentInset.left,
             CameraTimelineScale.offset(time: TimelineFetcher.anchor, start: start, cellWidth: thumbnailSize.width), accuracy: 2,
             "Native safe-area insets must not change the time under the marker")
-        XCTAssertLessThan(thumbnailSize.height, CameraTimelineSizing.standard.height)
+        XCTAssertEqual(thumbnailSize, CameraTimelineSizing.standard)
         XCTAssertGreaterThan(scroll.contentSize.width, 72 * 64)
         XCTAssertEqual(layout.labelFrames.count, 2)
-        for frame in layout.labelFrames.values {
-            XCTAssertLessThanOrEqual(frame.maxY + CameraTimelineSizing.labelGap, landscapeFrame.minY + 0.5,
-                "Two-up camera labels must sit fully above the strip")
-        }
         let screenshot = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
             host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
         }
         let attachment = XCTAttachment(image: screenshot)
-        attachment.name = "Timeline at Live — centered marker and blank future"
+        attachment.name = "Full-size top timeline in compact height"
         attachment.lifetime = .keepAlways; add(attachment)
         position = .canonical(TimelineFetcher.anchor - 3600, paused: true)
         try await Task.sleep(for: .milliseconds(500))
@@ -581,7 +592,7 @@ final class CameraTimelineTests: XCTestCase {
         let historical = XCTAttachment(image: history)
         historical.name = "Timeline in History — recordings on both sides of the marker"
         historical.lifetime = .keepAlways; add(historical)
-        try assertTimelineBottom(in: history, bottom: host.view.bounds.maxY)
+        try assertTimelineBottom(in: history, bottom: landscapeFrame.maxY)
         // One minute past a mark leaves that interval label straddling the
         // playhead. It must disappear entirely, not leave a clipped prefix.
         let mark = floor((TimelineFetcher.anchor - 3600) / 1200) * 1200
@@ -593,7 +604,7 @@ final class CameraTimelineTests: XCTestCase {
         let overlapAttachment = XCTAttachment(image: overlap)
         overlapAttachment.name = "Timeline — overlapping interval label fully hidden"
         overlapAttachment.lifetime = .keepAlways; add(overlapAttachment)
-        try assertTimelineBottom(in: overlap, bottom: host.view.bounds.maxY, intervalCrossesPlayhead: true)
+        try assertTimelineBottom(in: overlap, bottom: landscapeFrame.maxY, intervalCrossesPlayhead: true)
         position = .canonical(TimelineFetcher.anchor - 25 * 3600, paused: true)
         try await Task.sleep(for: .milliseconds(500))
         let oldTarget = TimelineFetcher.anchor - 25 * 3600
@@ -607,11 +618,11 @@ final class CameraTimelineTests: XCTestCase {
         let datedAttachment = XCTAttachment(image: dated)
         datedAttachment.name = "Timeline — full date beyond 24 hours"
         datedAttachment.lifetime = .keepAlways; add(datedAttachment)
-        try assertTimelineBottom(in: dated, bottom: host.view.bounds.maxY)
-        let referenceSize = thumbnailSize
+        try assertTimelineBottom(in: dated, bottom: landscapeFrame.maxY)
+        let referenceSize = CameraTimelineSizing.standard
         for (count, multiple) in [(1, false), (1, true), (3, true), (4, true), (2, true)] {
             layout.count = count; layout.multiple = multiple
-            let expectedSize = count > 1 ? referenceSize : CameraTimelineSizing.standard
+            let expectedSize = CameraTimelineSizing.standard
             // Geometry and ScrollPosition updates settle across separate layout
             // passes. Wait for the result, not an arbitrary 150 ms deadline.
             try await wait {
@@ -619,7 +630,7 @@ final class CameraTimelineTests: XCTestCase {
                     CameraTimelineScale.offset(time: oldTarget, start: oldStart, cellWidth: expectedSize.width)) < 2
             }
             XCTAssertEqual(thumbnailSize, expectedSize,
-                "One camera always uses full sizing, independent of picker mode; \(count) cameras, Multiple=\(multiple)")
+                "Timeline sizing is independent of camera count and picker mode; \(count) cameras, Multiple=\(multiple)")
             XCTAssertEqual(scroll.contentOffset.x + scroll.adjustedContentInset.left,
                 CameraTimelineScale.offset(time: oldTarget, start: oldStart, cellWidth: thumbnailSize.width), accuracy: 2,
                 "Changing Multiple mode preserves the instant under the playhead")
@@ -632,7 +643,7 @@ final class CameraTimelineTests: XCTestCase {
             host.traitOverrides.horizontalSizeClass = horizontal
             host.view.layoutIfNeeded()
             try await Task.sleep(for: .milliseconds(150))
-            XCTAssertEqual(thumbnailSize, referenceSize, "Both landscape iPhone width classes use the height policy")
+            XCTAssertEqual(thumbnailSize, referenceSize, "Width class does not resize the timeline")
         }
         // Changing safe areas (e.g. toolbars) must not change the reference size.
         let compactSize = thumbnailSize
@@ -651,8 +662,12 @@ final class CameraTimelineTests: XCTestCase {
         let regularHeight = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
             host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
         }
-        try assertTimelineBottom(in: regularHeight, bottom: host.view.bounds.maxY - host.view.safeAreaInsets.bottom,
-            center: host.view.safeAreaLayoutGuide.layoutFrame.midX)
+        let regularFrame = scroll.convert(scroll.bounds, to: host.view)
+        XCTAssertEqual(regularFrame.minY, host.view.safeAreaLayoutGuide.layoutFrame.minY, accuracy: 1)
+        XCTAssertEqual(regularFrame.minX, host.view.safeAreaLayoutGuide.layoutFrame.minX, accuracy: 1)
+        XCTAssertEqual(regularFrame.maxX, host.view.safeAreaLayoutGuide.layoutFrame.maxX, accuracy: 1)
+        try assertTimelineBottom(in: regularHeight, bottom: regularFrame.maxY,
+            center: regularFrame.midX)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
         host.view.frame = window.bounds; host.view.layoutIfNeeded()
         try await Task.sleep(for: .milliseconds(300))
@@ -660,10 +675,14 @@ final class CameraTimelineTests: XCTestCase {
             host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
         }
         let portraitAttachment = XCTAttachment(image: portrait)
-        portraitAttachment.name = "Timeline in Portrait — bottom safe area retained"
+        portraitAttachment.name = "Timeline in Portrait — top safe area retained"
         portraitAttachment.lifetime = .keepAlways; add(portraitAttachment)
-        try assertTimelineBottom(in: portrait, bottom: host.view.bounds.maxY - host.view.safeAreaInsets.bottom,
-            center: host.view.safeAreaLayoutGuide.layoutFrame.midX)
+        let portraitFrame = scroll.convert(scroll.bounds, to: host.view)
+        XCTAssertEqual(portraitFrame.minY, host.view.safeAreaLayoutGuide.layoutFrame.minY, accuracy: 1)
+        XCTAssertEqual(portraitFrame.minX, host.view.safeAreaLayoutGuide.layoutFrame.minX, accuracy: 1)
+        XCTAssertEqual(portraitFrame.maxX, host.view.safeAreaLayoutGuide.layoutFrame.maxX, accuracy: 1)
+        try assertTimelineBottom(in: portrait, bottom: portraitFrame.maxY,
+            center: portraitFrame.midX)
         XCTAssertEqual(thumbnailSize, CameraTimelineSizing.standard)
         XCTAssertEqual(scroll.contentOffset.x + scroll.adjustedContentInset.left,
             CameraTimelineScale.offset(time: oldTarget, start: oldStart), accuracy: 2,
@@ -765,10 +784,19 @@ private struct TimelineTestPanel<Content: View>: View {
 }
 
 private struct TimelineTestPlacement<Content: View>: View {
-    @ObservedObject var layout: TimelineTestLayout
+    let edge: CameraTimelinePlacementEdge
     @ViewBuilder let content: () -> Content
+
+    init(
+        edge: CameraTimelinePlacementEdge = .bottom,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.edge = edge
+        self.content = content
+    }
+
     var body: some View {
-        CameraTimelinePlacement(isMultiple: layout.count > 1, content: content)
+        CameraTimelinePlacement(edge: edge, content: content)
     }
 }
 
@@ -830,10 +858,12 @@ private actor TimelineFetcher: CameraThumbnailFetching {
     var closed = false
     var maximumActive = 0
     private var active = 0
-    let unsupported: Bool, rejectLive: Bool, delay: Duration, jpeg: Data?
+    let unsupported: Bool, rejectLive: Bool, availabilityDelay: Duration, delay: Duration, jpeg: Data?
     let jpegWidth: Int
-    init(unsupported: Bool = false, rejectLive: Bool = false, delay: Duration = .zero, jpeg: Data? = nil, jpegWidth: Int = 320) {
-        self.unsupported = unsupported; self.rejectLive = rejectLive; self.delay = delay; self.jpeg = jpeg
+    init(unsupported: Bool = false, rejectLive: Bool = false, availabilityDelay: Duration = .zero,
+         delay: Duration = .zero, jpeg: Data? = nil, jpegWidth: Int = 320) {
+        self.unsupported = unsupported; self.rejectLive = rejectLive
+        self.availabilityDelay = availabilityDelay; self.delay = delay; self.jpeg = jpeg
         self.jpegWidth = jpegWidth
     }
     func start() {}
@@ -841,6 +871,7 @@ private actor TimelineFetcher: CameraThumbnailFetching {
     func fetch(_ request: HBNVRMediaRequest, onBegin: CameraHistoryBeginHandler?) async throws -> CameraHistoryBatch {
         availability.append(request)
         if rejectLive, request.relativeTo == "live" { throw CameraHistoryError.remote(3, "No live frame") }
+        if availabilityDelay != .zero { try await Task.sleep(for: availabilityDelay) }
         return CameraHistoryBatch(id: UUID(), range: .init(start: Self.anchor - 0.001, end: Self.anchor),
             anchor: Self.anchor, pieces: [], gaps: [])
     }

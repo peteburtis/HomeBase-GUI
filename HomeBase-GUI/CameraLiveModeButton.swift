@@ -19,36 +19,35 @@ struct CameraLiveModeButton: View {
     var systemImage: String {
         isLive
             ? "dot.radiowaves.left.and.right"
-            : "chevron.forward.dotted.chevron.forward"
+            : CameraPlayerPanelPicker.historySymbol
     }
+
+    var title: String { isLive ? "Live" : "History" }
 
     @ViewBuilder
     var body: some View {
-        if isLive {
-            button.buttonStyle(.borderedProminent).tint(.red)
-        } else {
-            button
-        }
+        button
+            .buttonStyle(.borderedProminent)
+            .tint(isLive ? .red : .yellow)
     }
 
     private var button: some View {
-        Button(action: returnToLive) {
+        Button(action: toggleMode) {
             if showsTitle {
                 HStack {
                     Image(systemName: systemImage)
-                    Text("Live")
+                    Text(title)
                 }
             } else {
                 Image(systemName: systemImage)
             }
         }
-        .accessibilityLabel("Live")
-        .accessibilityValue(isLive ? "Live" : "Not live")
-        .accessibilityHint(isLive ? "Already playing live" : "Returns to live playback")
+        .accessibilityLabel(title)
+        .accessibilityValue(isLive ? "Live video" : "History")
+        .accessibilityHint(isLive ? "Pauses and shows history" : "Returns to live video")
     }
 
-    func returnToLive() {
-        guard !isLive else { return }
+    func toggleMode() {
         action()
     }
 }

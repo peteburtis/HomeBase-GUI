@@ -157,19 +157,68 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
         XCTAssertEqual(neither.height, label.height, accuracy: 0.5)
     }
 
-    func testLiveButtonNeverUsesHistorySymbolAndIsNoOpWhileLive() {
+    func testLiveHistoryButtonUsesBothModeSymbolsAndAlwaysToggles() {
         for (live, symbol) in [
             (true, "dot.radiowaves.left.and.right"),
-            (false, "chevron.forward.dotted.chevron.forward"),
+            (false, CameraPlayerPanelPicker.historySymbol),
         ] {
-            var returnToLiveCount = 0
-            let button = CameraLiveModeButton(isLive: live) { returnToLiveCount += 1 }
+            var toggleCount = 0
+            let button = CameraLiveModeButton(isLive: live) { toggleCount += 1 }
             XCTAssertEqual(button.systemImage, symbol)
+            XCTAssertEqual(button.title, live ? "Live" : "History")
             XCTAssertNotNil(UIImage(systemName: symbol))
-            button.returnToLive()
-            XCTAssertEqual(returnToLiveCount, live ? 0 : 1)
+            button.toggleMode()
+            XCTAssertEqual(toggleCount, 1)
         }
-        XCTAssertNotNil(UIImage(systemName: CameraPlayerPanelPicker.historySymbol))
+    }
+
+    func testToolbarScrubBridgeUsesRealNavigationBarAndExcludesToolbarControls() async throws {
+        let relay = CameraToolbarScrubRelay()
+        let host = UIHostingController(rootView: NavigationStack {
+            Color.black
+                .background {
+                    CameraToolbarScrubBridge(isEnabled: true, relay: relay)
+                        .frame(width: 0, height: 0)
+                }
+                .toolbar {
+                    ToolbarItem(placement: .navigation) {
+                        CameraPlayerCloseButton(action: {})
+                    }
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("Choose camera", systemImage: "video.fill", action: {})
+                            .labelStyle(.iconOnly)
+                    }
+                }
+        })
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 852, height: 393)
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+
+        let bar = try XCTUnwrap(findNavigationBar(in: host.view))
+        XCTAssertEqual(
+            bar.gestureRecognizers?.filter { $0.name == "CameraToolbarScrubBridge" }.count,
+            1,
+            "The bridge augments the NavigationStack's real bar"
+        )
+
+        let backing = UIView(frame: bar.bounds)
+        bar.addSubview(backing)
+        let button = UIButton(type: .system)
+        button.frame = CGRect(x: 10, y: 0, width: 44, height: 44)
+        backing.addSubview(button)
+        let buttonLabel = UILabel(frame: button.bounds)
+        button.addSubview(buttonLabel)
+
+        XCTAssertTrue(CameraToolbarScrubBridge.Coordinator.isEmptyBarTouch(backing, inside: bar))
+        XCTAssertFalse(CameraToolbarScrubBridge.Coordinator.isEmptyBarTouch(button, inside: bar))
+        XCTAssertFalse(CameraToolbarScrubBridge.Coordinator.isEmptyBarTouch(buttonLabel, inside: bar))
+        XCTAssertFalse(CameraToolbarScrubBridge.Coordinator.isEmptyBarTouch(UIView(), inside: bar))
     }
 
     func testLiveButtonUsesTitleOnlyForRegularToolbarVariant() async throws {
@@ -278,6 +327,14 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
             }
         }
         return shapes
+    }
+
+    private func findNavigationBar(in view: UIView) -> UINavigationBar? {
+        if let bar = view as? UINavigationBar { return bar }
+        for child in view.subviews {
+            if let bar = findNavigationBar(in: child) { return bar }
+        }
+        return nil
     }
 
     func testBufferedModeDisablesCameraGesturesButKeepsSingleTap() async throws {

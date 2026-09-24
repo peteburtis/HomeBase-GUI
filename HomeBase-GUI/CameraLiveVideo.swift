@@ -1387,6 +1387,7 @@ private struct CameraFullScreenCameraContent: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
 #endif
     let client: HomeBaseWebSocketClient
     let access: CameraAccessPresentation
@@ -1413,11 +1414,16 @@ private struct CameraFullScreenCameraContent: View {
     @State private var cameraSwitchError: String?
     private var liveVideoState: CameraLiveVideoModel.State { primary.liveState }
     @State private var timelineResumeAfterSeek = false
+    @State private var historyBookmark: CameraSwitchPosition?
+    @State private var historyRestoreTask: Task<Void, Never>?
+    @State private var historyRestoreGeneration = UUID()
+    @State private var historyBookmarkError: String?
     @State private var s3Destination: CameraS3Destination?
 #if os(iOS)
     private var recordingController: CameraLocalRecordingController { primary.recordingController }
     @State private var savedConfirmationVisible = false
 #endif
+    @StateObject private var toolbarScrubRelay = CameraToolbarScrubRelay()
 
     init(
         device: HBTopologyDeviceDescriptor,
@@ -1461,6 +1467,7 @@ private struct CameraFullScreenCameraContent: View {
             applyInitialPositionIfAuthorized()
         }
         .onDisappear {
+            cancelHistoryRestore()
             cameraSwitchTask?.cancel(); cameraSwitchTask = nil
             stopLiveCameraGestures()
             group.deactivate()
@@ -1579,12 +1586,28 @@ private struct CameraFullScreenCameraContent: View {
             } else { applyInitialPositionIfAuthorized() }
         }
         .alert("Playback Unavailable", isPresented: Binding(
-            get: { access.isUnlocked && playbackController.errorMessage != nil },
-            set: { if !$0 { playbackController.dismissError() } }
+            get: {
+                access.isUnlocked
+                    && (historyBookmarkError != nil
+                        || playbackController.errorMessage != nil)
+            },
+            set: {
+                if !$0 {
+                    historyBookmarkError = nil
+                    playbackController.dismissError()
+                }
+            }
         )) {
-            Button("OK") { playbackController.dismissError() }
+            Button("OK") {
+                historyBookmarkError = nil
+                playbackController.dismissError()
+            }
         } message: {
-            Text(playbackController.errorMessage ?? "Unknown error")
+            Text(
+                historyBookmarkError
+                    ?? playbackController.errorMessage
+                    ?? "Unknown error"
+            )
         }
         .alert(cameraSwitchError != nil ? "Could Not Switch Camera" : "Camera Control Failed", isPresented: Binding(
             get: { access.isUnlocked && (cameraSwitchError != nil || group.error != nil) }, set: { if !$0 { cameraSwitchError = nil; group.error = nil } }
@@ -1605,6 +1628,19 @@ private struct CameraFullScreenCameraContent: View {
         .modifier(CameraToolbarVisibility(
             isVisible: !access.isUnlocked || visiblePlayerControls
         ))
+#if os(iOS)
+        .background {
+            CameraToolbarScrubBridge(
+                isEnabled: verticalSizeClass == .compact
+                    && timelineVisible
+                    && panel != .ptz
+                    && visiblePlayerControls
+                    && playbackActionsEnabled,
+                relay: toolbarScrubRelay
+            )
+            .frame(width: 0, height: 0)
+        }
+#endif
     }
 
     private var liveVideo: some View {
@@ -1620,10 +1656,12 @@ private struct CameraFullScreenCameraContent: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .overlay(alignment: .bottom) {
-            if visiblePlayerControls, panel != .ptz,
+        .overlay(alignment: .top) {
+            if timelineVisible, panel != .ptz,
                let metadata = CameraPlaybackHistoryAvailability.metadata(in: controlsModel.deviceMetadata) {
-                CameraTimelinePlacement(isMultiple: group.hasMultipleCameras) {
+                CameraTimelinePlacement(
+                    edge: .top
+                ) {
                     CameraTimelinePanel(isPresented: timelineVisible) {
                         CameraHistoryTimeline(makeTransport: {
                             await CameraHistorySources.thumbnails(metadata: metadata, client: client, credentials: access.session?.unlockedCredentials)
@@ -1632,6 +1670,7 @@ private struct CameraFullScreenCameraContent: View {
                             position: { group.active ? group.positionForSwitch() : playbackController.positionForCameraSwitch(metadata: controlsModel.deviceMetadata) },
                             onBegin: {
                                 guard playbackActionsEnabled else { return }
+                                cancelHistoryRestore()
                                 timelineResumeAfterSeek = !isPaused
                                 stopLiveCameraGestures()
                                 if !isPaused, canControlPlayback {
@@ -1651,7 +1690,7 @@ private struct CameraFullScreenCameraContent: View {
                                     if group.active { group.togglePause() } else { playbackController.togglePause() }
                                 }
                                 timelineResumeAfterSeek = false
-                            })
+                            }, toolbarScrubRelay: toolbarScrubRelay)
                             .id(metadata.cameraID)
                     }
                 }
@@ -1677,6 +1716,7 @@ private struct CameraFullScreenCameraContent: View {
         .background(Color.black.ignoresSafeArea())
         .animation(.snappy, value: controlsVisible)
         .animation(reduceMotion ? nil : .snappy, value: panel)
+        .animation(reduceMotion ? nil : .snappy, value: timelineVisible)
         .accessibilityActions {
             if isShowingVideo {
                 Button("Toggle player controls", action: toggleControls)
@@ -1693,21 +1733,18 @@ private struct CameraFullScreenCameraContent: View {
 #if os(iOS)
         if access.isUnlocked {
             if horizontalSizeClass == .compact {
-                ToolbarItem(placement: .bottomBar) {
-                    pauseControl.disabled(!playbackActionsEnabled)
-                }
                 ToolbarItemGroup(placement: .secondaryAction) {
                     backControl.disabled(!playbackActionsEnabled)
+                    pauseControl.disabled(!playbackActionsEnabled)
                     forwardControl.disabled(!playbackActionsEnabled)
                 }
-                ToolbarSpacer(.fixed, placement: .bottomBar)
                 ToolbarItem(placement: .bottomBar) {
                     CameraLiveModeButton(
                         isLive: isLive,
                         showsTitle: false,
-                        action: returnToLive
+                        action: toggleLiveHistory
                     )
-                        .disabled(!playbackActionsEnabled)
+                        .disabled(!playbackActionsEnabled || (isLive && !canControlPlayback))
                 }
                 if !isLive {
                     ToolbarSpacer(.fixed, placement: .bottomBar)
@@ -1734,7 +1771,9 @@ private struct CameraFullScreenCameraContent: View {
             } else {
                 ToolbarItemGroup(placement: .bottomBar) {
                     backControl.disabled(!playbackActionsEnabled)
-                    pauseControl.disabled(!playbackActionsEnabled)
+                    pauseControl
+                        .labelStyle(.iconOnly)
+                        .disabled(!playbackActionsEnabled)
                     forwardControl.disabled(!playbackActionsEnabled)
                 }
                 ToolbarSpacer(.fixed, placement: .bottomBar)
@@ -1742,9 +1781,9 @@ private struct CameraFullScreenCameraContent: View {
                     CameraLiveModeButton(
                         isLive: isLive,
                         showsTitle: true,
-                        action: returnToLive
+                        action: toggleLiveHistory
                     )
-                        .disabled(!playbackActionsEnabled)
+                        .disabled(!playbackActionsEnabled || (isLive && !canControlPlayback))
                 }
                 if !isLive {
                     ToolbarSpacer(.fixed, placement: .bottomBar)
@@ -1782,7 +1821,9 @@ private struct CameraFullScreenCameraContent: View {
             ToolbarSpacer(.fixed, placement: .navigation)
             ToolbarItemGroup(placement: .navigation) {
                 backControl.disabled(!playbackActionsEnabled)
-                pauseControl.disabled(!playbackActionsEnabled)
+                pauseControl
+                    .labelStyle(.iconOnly)
+                    .disabled(!playbackActionsEnabled)
                 forwardControl.disabled(!playbackActionsEnabled)
             }
             ToolbarSpacer(.fixed, placement: .navigation)
@@ -1790,9 +1831,9 @@ private struct CameraFullScreenCameraContent: View {
                 CameraLiveModeButton(
                     isLive: isLive,
                     showsTitle: true,
-                    action: returnToLive
+                    action: toggleLiveHistory
                 )
-                    .disabled(!playbackActionsEnabled)
+                    .disabled(!playbackActionsEnabled || (isLive && !canControlPlayback))
             }
             if !isLive {
                 ToolbarSpacer(.fixed, placement: .navigation)
@@ -1866,6 +1907,7 @@ private struct CameraFullScreenCameraContent: View {
     private func switchCamera(_ camera: CameraVideoDevice) {
         cameraPickerVisible = false
         guard access.isUnlocked, camera.id != device.identifier, !switchingCamera else { return }
+        cancelHistoryRestore()
         let departure = CameraPlaybackHistoryAvailability.isAvailable(in: camera.device.metadata)
             ? playbackController.positionForCameraSwitch(metadata: controlsModel.deviceMetadata) : .live
         stopLiveCameraGestures()
@@ -1988,12 +2030,109 @@ private struct CameraFullScreenCameraContent: View {
             isLive: cameraControlsEnabled, isMultiple: group.hasMultipleCameras)
     }
 
-    private var timelineVisible: Bool { panel == .history }
+    private var timelineVisible: Bool { !isLive }
 
-    private func returnToLive() {
-        guard !isLive, playbackActionsEnabled else { return }
+    private var playbackPosition: CameraSwitchPosition {
+        group.active
+            ? group.positionForSwitch()
+            : playbackController.positionForCameraSwitch(
+                metadata: controlsModel.deviceMetadata
+            )
+    }
+
+    private func toggleLiveHistory() {
+        guard playbackActionsEnabled else { return }
+        if isLive {
+            enterHistory()
+        } else {
+            leaveHistory()
+        }
+    }
+
+    private func enterHistory() {
+        guard isLive, canControlPlayback else { return }
         stopLiveCameraGestures()
-        if group.active { group.goLive() } else { playbackController.goLive() }
+        cancelHistoryRestore()
+
+        // Entering History for the first time freezes the current live edge.
+        // A later entry starts there too, then replaces it with the frozen
+        // bookmark as soon as any source-camera clock lookup completes.
+        if group.active {
+            group.togglePause()
+        } else {
+            playbackController.togglePause()
+        }
+
+        guard let historyBookmark, historyBookmark != .live else { return }
+        restoreHistoryBookmark(historyBookmark.paused)
+    }
+
+    private func leaveHistory() {
+        guard !isLive else { return }
+        cancelHistoryRestore()
+        let departure = playbackPosition.paused
+        if departure != .live {
+            historyBookmark = departure
+        }
+        stopLiveCameraGestures()
+        if group.active {
+            group.goLive()
+        } else {
+            playbackController.goLive()
+        }
+    }
+
+    private func restoreHistoryBookmark(_ position: CameraSwitchPosition) {
+        switch position.paused {
+        case .live:
+            return
+        case .canonical:
+            applyHistoryBookmark(position.paused)
+        case .relative:
+            let generation = UUID()
+            historyRestoreGeneration = generation
+            historyRestoreTask = Task {
+                let transport = await client.makeHistoryTransport()
+                let resolved: CameraSwitchPosition
+                do {
+                    resolved = try await position.paused.resolve(
+                        using: transport
+                    )
+                } catch is CancellationError {
+                    await transport.close()
+                    return
+                } catch {
+                    await transport.close()
+                    guard historyRestoreGeneration == generation else { return }
+                    historyRestoreTask = nil
+                    historyBookmarkError = error.localizedDescription
+                    return
+                }
+                await transport.close()
+                guard !Task.isCancelled,
+                      historyRestoreGeneration == generation,
+                      !isLive else { return }
+                applyHistoryBookmark(resolved.paused)
+                historyRestoreTask = nil
+            }
+        }
+    }
+
+    private func applyHistoryBookmark(_ position: CameraSwitchPosition) {
+        guard case .canonical(let time, _) = position else { return }
+        let date = Date(timeIntervalSince1970: time)
+        historyBookmark = position.paused
+        if group.active {
+            group.seek(to: date, paused: true)
+        } else {
+            playbackController.seek(to: date, paused: true)
+        }
+    }
+
+    private func cancelHistoryRestore() {
+        historyRestoreGeneration = UUID()
+        historyRestoreTask?.cancel()
+        historyRestoreTask = nil
     }
 
     private func applyInitialPositionIfAuthorized() {
@@ -2068,7 +2207,6 @@ private struct CameraFullScreenCameraContent: View {
             stopLiveCameraGestures()
             if group.active { group.togglePause() } else { playbackController.togglePause() }
         }
-        .labelStyle(.iconOnly)
         .disabled(!canControlPlayback || group.resolvingTime)
     }
 

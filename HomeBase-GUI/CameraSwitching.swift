@@ -10,6 +10,24 @@ nonisolated enum CameraSwitchPosition: Equatable, Sendable {
     case canonical(Double, paused: Bool)
     case relative(cameraID: String, offset: Double, capturedAt: Double, paused: Bool)
 
+    /// A history bookmark is a frozen cursor even when playback was running
+    /// when the viewer returned to Live.
+    var paused: Self {
+        switch self {
+        case .live:
+            return .live
+        case .canonical(let time, _):
+            return .canonical(time, paused: true)
+        case .relative(let cameraID, let offset, let capturedAt, _):
+            return .relative(
+                cameraID: cameraID,
+                offset: offset,
+                capturedAt: capturedAt,
+                paused: true
+            )
+        }
+    }
+
     func resolve(using transport: any CameraHistoryFetching,
                  clock: @Sendable () -> Double = { ProcessInfo.processInfo.systemUptime }) async throws -> Self {
         guard case .relative(let cameraID, let offset, let capturedAt, let paused) = self else { return self }
