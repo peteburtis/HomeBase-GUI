@@ -172,6 +172,68 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
         }
     }
 
+    func testToolbarArrangementAcrossPlaybackAndSizeClasses() {
+        let liveCompactWidth = CameraToolbarArrangement(
+            isLive: true,
+            compactWidth: true,
+            compactHeight: false
+        )
+        XCTAssertTrue(liveCompactWidth.configurationControlsInBottomTrailing)
+        XCTAssertFalse(liveCompactWidth.pauseInBottomTrailing)
+        XCTAssertFalse(liveCompactWidth.navigationItemsInBottomToolbar)
+        XCTAssertTrue(liveCompactWidth.recordInTrailingNavigationBar)
+        XCTAssertFalse(liveCompactWidth.recordInBottomTrailing)
+
+        let historyCompactWidth = CameraToolbarArrangement(
+            isLive: false,
+            compactWidth: true,
+            compactHeight: false
+        )
+        XCTAssertFalse(historyCompactWidth.configurationControlsInBottomTrailing)
+        XCTAssertTrue(historyCompactWidth.pauseInBottomTrailing)
+        XCTAssertFalse(historyCompactWidth.navigationItemsInBottomToolbar)
+        XCTAssertFalse(historyCompactWidth.compactTransportInBottomLeading)
+        XCTAssertFalse(historyCompactWidth.recordInTrailingNavigationBar)
+        XCTAssertFalse(historyCompactWidth.recordInBottomTrailing)
+
+        let liveCompactHeight = CameraToolbarArrangement(
+            isLive: true,
+            compactWidth: false,
+            compactHeight: true
+        )
+        XCTAssertTrue(liveCompactHeight.navigationItemsInBottomToolbar)
+        XCTAssertFalse(liveCompactHeight.compactTransportInBottomLeading)
+        XCTAssertFalse(liveCompactHeight.recordInTrailingNavigationBar)
+        XCTAssertTrue(liveCompactHeight.recordInBottomTrailing)
+
+        let fullyCompactLive = CameraToolbarArrangement(
+            isLive: true,
+            compactWidth: true,
+            compactHeight: true
+        )
+        XCTAssertTrue(fullyCompactLive.navigationItemsInBottomToolbar)
+        XCTAssertTrue(fullyCompactLive.compactTransportInBottomLeading)
+        XCTAssertFalse(fullyCompactLive.recordInTrailingNavigationBar)
+        XCTAssertTrue(fullyCompactLive.recordInBottomTrailing)
+
+        let historyCompactHeight = CameraToolbarArrangement(
+            isLive: false,
+            compactWidth: false,
+            compactHeight: true
+        )
+        XCTAssertTrue(historyCompactHeight.navigationItemsInBottomToolbar)
+        XCTAssertFalse(historyCompactHeight.compactTransportInBottomLeading)
+
+        let fullyCompactHistory = CameraToolbarArrangement(
+            isLive: false,
+            compactWidth: true,
+            compactHeight: true
+        )
+        XCTAssertTrue(fullyCompactHistory.pauseInBottomTrailing)
+        XCTAssertTrue(fullyCompactHistory.navigationItemsInBottomToolbar)
+        XCTAssertTrue(fullyCompactHistory.compactTransportInBottomLeading)
+    }
+
     func testToolbarScrubBridgeUsesRealNavigationBarAndExcludesToolbarControls() async throws {
         let relay = CameraToolbarScrubRelay()
         let host = UIHostingController(rootView: NavigationStack {

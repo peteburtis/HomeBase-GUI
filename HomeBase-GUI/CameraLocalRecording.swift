@@ -16,6 +16,24 @@ protocol CameraRecordingDestination {
     func saveVideo(at fileURL: URL, creationDate: Date) async throws
 }
 
+struct CameraLocalRecording: Identifiable, Equatable {
+    let id: UUID
+    let fileURL: URL
+    let creationDate: Date
+
+    init(
+        id: UUID = UUID(),
+        fileURL: URL,
+        creationDate: Date
+    ) {
+        self.id = id
+        self.fileURL = fileURL
+        self.creationDate = creationDate
+    }
+
+    var filename: String { fileURL.lastPathComponent }
+}
+
 enum CameraRecordingDestinationError: LocalizedError {
     case unavailable
     case permissionDenied
@@ -66,10 +84,10 @@ struct CameraPhotoLibraryRecordingDestination: CameraRecordingDestination {
 final class CameraLocalRecordingController: ObservableObject {
     enum State: Equatable {
         case idle
-        case requestingAuthorization
         case waitingForKeyFrame
         case recording
-        case saving
+        case finalizing
+        case exporting
         case failed(String)
     }
 
@@ -80,8 +98,9 @@ final class CameraLocalRecordingController: ObservableObject {
 
     @Published private(set) var state: State = .idle
     @Published private(set) var isStreamAvailable = false
-    @Published private(set) var successfulSaveCount = 0
+    @Published private(set) var successfulExportCount = 0
     @Published private(set) var recordingStartedAt: Date?
+    @Published private(set) var pendingRecording: CameraLocalRecording?
 
     private let destination: any CameraRecordingDestination
     private var streamOwnerID: UUID?
@@ -90,16 +109,18 @@ final class CameraLocalRecordingController: ObservableObject {
     private var writerInput: AVAssetWriterInput?
     private var outputURL: URL?
     private var recordingCreationDate: Date?
-    private var authorizationOperation = UUID()
+    private var recordingFilename: String?
     private var streamConfigurationRevision = 0
     private var pendingStreamOwnerID: UUID?
     private let configurationInstallationBarrier: (() async -> Void)?
 
     init(
         destination: any CameraRecordingDestination,
+        pendingRecording: CameraLocalRecording? = nil,
         configurationInstallationBarrier: (() async -> Void)? = nil
     ) {
         self.destination = destination
+        self.pendingRecording = pendingRecording
         self.configurationInstallationBarrier =
             configurationInstallationBarrier
     }
@@ -108,17 +129,18 @@ final class CameraLocalRecordingController: ObservableObject {
         switch state {
         case .waitingForKeyFrame, .recording:
             true
-        case .idle, .requestingAuthorization, .saving, .failed:
+        case .idle, .finalizing, .exporting, .failed:
             false
         }
     }
 
     var locksStreamConfiguration: Bool {
+        if pendingRecording != nil { return true }
         switch state {
-        case .requestingAuthorization, .waitingForKeyFrame, .recording, .saving:
-            true
+        case .waitingForKeyFrame, .recording, .finalizing, .exporting:
+            return true
         case .idle, .failed:
-            false
+            return false
         }
     }
 
@@ -127,39 +149,21 @@ final class CameraLocalRecordingController: ObservableObject {
         return message
     }
 
-    func toggle() {
-        Task {
-            if isRecording {
-                await stopAndSave()
-            } else {
-                await start()
-            }
-        }
-    }
-
-    func start() async {
+    func start(suggestedFilename: String? = nil) async {
         guard isStreamAvailable,
               streamFormat != nil,
+              pendingRecording == nil,
               !locksStreamConfiguration else {
             return
         }
 
-        let operation = UUID()
-        authorizationOperation = operation
-        state = .requestingAuthorization
-        do {
-            try await destination.prepare()
-            guard authorizationOperation == operation,
-                  isStreamAvailable,
-                  streamFormat != nil else {
-                return
-            }
-            recordingCreationDate = Date()
-            state = .waitingForKeyFrame
-        } catch {
-            guard authorizationOperation == operation else { return }
-            fail(error)
-        }
+        let creationDate = Date()
+        recordingCreationDate = creationDate
+        recordingFilename = Self.filename(
+            cameraName: suggestedFilename,
+            creationDate: creationDate
+        )
+        state = .waitingForKeyFrame
     }
 
     @discardableResult
@@ -179,7 +183,7 @@ final class CameraLocalRecordingController: ObservableObject {
         if writer != nil,
            (streamOwnerID != ownerID
                 || streamFormat?.generation != generation) {
-            await stopAndSave()
+            await stop()
         }
         await configurationInstallationBarrier?()
         guard streamConfigurationRevision == revision,
@@ -245,13 +249,11 @@ final class CameraLocalRecordingController: ObservableObject {
         isStreamAvailable = false
         streamOwnerID = nil
         streamFormat = nil
-        authorizationOperation = UUID()
-        await stopAndSave()
+        await stop()
     }
 
-    func stopAndSave() async {
-        guard state != .saving else { return }
-        authorizationOperation = UUID()
+    func stop() async {
+        guard state != .finalizing, state != .exporting else { return }
 
         guard let writer, let writerInput, let outputURL else {
             cancelWriter()
@@ -265,8 +267,9 @@ final class CameraLocalRecordingController: ObservableObject {
         self.writerInput = nil
         self.outputURL = nil
         recordingCreationDate = nil
+        recordingFilename = nil
         recordingStartedAt = nil
-        state = .saving
+        state = .finalizing
 
         writerInput.markAsFinished()
         await withCheckedContinuation { continuation in
@@ -279,17 +282,48 @@ final class CameraLocalRecordingController: ObservableObject {
             guard writer.status == .completed else {
                 throw writer.error ?? CameraRecordingError.finishFailed
             }
-            try await destination.saveVideo(
-                at: outputURL,
+            pendingRecording = CameraLocalRecording(
+                fileURL: outputURL,
                 creationDate: creationDate
             )
-            try? FileManager.default.removeItem(at: outputURL)
             state = .idle
-            successfulSaveCount &+= 1
         } catch {
-            try? FileManager.default.removeItem(at: outputURL)
+            Self.removeRecordingFile(at: outputURL)
             fail(error)
         }
+    }
+
+    @discardableResult
+    func savePendingRecordingToPhotos() async -> Bool {
+        guard let pendingRecording, state == .idle else { return false }
+        state = .exporting
+        do {
+            try await destination.prepare()
+            try await destination.saveVideo(
+                at: pendingRecording.fileURL,
+                creationDate: pendingRecording.creationDate
+            )
+            completePendingExport()
+            return true
+        } catch {
+            fail(error)
+            return false
+        }
+    }
+
+    func completePendingExport() {
+        guard let pendingRecording else { return }
+        Self.removeRecordingFile(at: pendingRecording.fileURL)
+        self.pendingRecording = nil
+        state = .idle
+        successfulExportCount &+= 1
+    }
+
+    func discardPendingRecording() {
+        guard let pendingRecording else { return }
+        Self.removeRecordingFile(at: pendingRecording.fileURL)
+        self.pendingRecording = nil
+        state = .idle
     }
 
     func dismissError() {
@@ -301,9 +335,21 @@ final class CameraLocalRecordingController: ObservableObject {
         _ firstSampleBuffer: CMSampleBuffer,
         formatDescription: CMVideoFormatDescription
     ) throws {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("HomeBase-Camera-\(UUID().uuidString)")
-            .appendingPathExtension("mov")
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "HomeBase-Camera-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let url = directory.appendingPathComponent(
+            recordingFilename ?? Self.filename(
+                cameraName: nil,
+                creationDate: Date()
+            )
+        )
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let input = AVAssetWriterInput(
             mediaType: .video,
@@ -332,17 +378,42 @@ final class CameraLocalRecordingController: ObservableObject {
     private func cancelWriter() {
         writer?.cancelWriting()
         if let outputURL {
-            try? FileManager.default.removeItem(at: outputURL)
+            Self.removeRecordingFile(at: outputURL)
         }
         writer = nil
         writerInput = nil
         outputURL = nil
         recordingCreationDate = nil
+        recordingFilename = nil
         recordingStartedAt = nil
     }
 
     private func fail(_ error: Error) {
         state = .failed(error.localizedDescription)
+    }
+
+    private static func filename(
+        cameraName: String?,
+        creationDate: Date
+    ) -> String {
+        let unsafeCharacters = CharacterSet(charactersIn: "/:\\")
+        let cleanedName = (cameraName ?? "Camera")
+            .components(separatedBy: unsafeCharacters)
+            .joined(separator: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        let timestamp = formatter.string(from: creationDate)
+        return "\(cleanedName.isEmpty ? "Camera" : cleanedName) \(timestamp).mov"
+    }
+
+    private static func removeRecordingFile(at url: URL) {
+        try? FileManager.default.removeItem(at: url)
+        let directory = url.deletingLastPathComponent()
+        if directory.lastPathComponent.hasPrefix("HomeBase-Camera-") {
+            try? FileManager.default.removeItem(at: directory)
+        }
     }
 }
 

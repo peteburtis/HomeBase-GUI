@@ -473,7 +473,7 @@ struct CameraHistoryTimeline: View {
 
     private var referenceCell: some View {
         VStack(spacing: 0) {
-            Color.clear
+            thumbnailGridCell
                 .frame(width: thumbnailSize.width, height: thumbnailSize.height)
             CameraTimelineTimeLabelLayout(bottomPadding: 2 / displayScale) {
                 Text("00:00")
@@ -558,7 +558,7 @@ struct CameraHistoryTimeline: View {
         let space = timelineSpace, playhead = viewportWidth / 2
         return VStack(spacing: 0) {
             ZStack {
-                Color(white: 0.12)
+                thumbnailGridCell
                 if let entry = model.previews[tile] {
                     switch entry.preview {
                     case .image(let image): Image(decorative: image, scale: 1).resizable().aspectRatio(contentMode: .fill)
@@ -583,5 +583,13 @@ struct CameraHistoryTimeline: View {
         }
         .frame(width: width, alignment: .leading).clipped()
         .accessibilityHidden(true)
+    }
+
+    private var thumbnailGridCell: some View {
+        ZStack {
+            Color(white: 0.12)
+            Rectangle()
+                .strokeBorder(.tertiary, lineWidth: 1 / displayScale)
+        }
     }
 }

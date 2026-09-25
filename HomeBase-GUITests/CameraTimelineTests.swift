@@ -435,6 +435,7 @@ final class CameraTimelineTests: XCTestCase {
         let bottomCenter = try XCTUnwrap(host.view.hitTest(CGPoint(x: 426, y: 380), with: nil))
         XCTAssertTrue(bottomCenter is CameraLiveGestureUIView, "No grab handle or vertical show/hide gesture intercepts the bottom center")
 
+        state.active = true
         state.presented = true
         try await wait { transportCount == 1 }
         try await Task.sleep(for: .milliseconds(400))
@@ -448,8 +449,14 @@ final class CameraTimelineTests: XCTestCase {
         attachment.lifetime = .keepAlways; add(attachment)
         state.presented = false
         try await Task.sleep(for: .milliseconds(400))
-        let closed = await fetcher.closed
-        XCTAssertTrue(closed)
+        var closed = await fetcher.closed
+        XCTAssertFalse(closed, "Hiding controls keeps the timeline connection and thumbnails alive")
+        XCTAssertEqual(transportCount, 1)
+        XCTAssertTrue(host.view.hitTest(CGPoint(x: 30, y: 360), with: nil) is CameraLiveGestureUIView)
+        state.active = false
+        try await Task.sleep(for: .milliseconds(400))
+        closed = await fetcher.closed
+        XCTAssertTrue(closed, "Leaving history releases the timeline connection")
         XCTAssertEqual(begins, 0, "Showing or hiding a timeline never pauses playback")
         XCTAssertEqual(seeks, 0, "Showing or hiding a timeline never seeks")
         XCTAssertEqual(transportCount, 1)
@@ -764,6 +771,7 @@ private struct TimelineSizingProbe: View {
 
 #if os(iOS)
 @MainActor private final class TimelineTestPanelState: ObservableObject {
+    @Published var active = false
     @Published var presented = false
     nonisolated deinit {}
 }
@@ -778,7 +786,11 @@ private struct TimelineTestPanel<Content: View>: View {
                 onPan: { _, _, _ in }, onMagnify: nil, onSingleTap: {}, onTwoFingerTap: {})
         }
         .overlay(alignment: .bottom) {
-            CameraTimelinePanel(isPresented: state.presented, content: content)
+            CameraTimelinePanel(
+                isPresented: state.presented,
+                isActive: state.active,
+                content: content
+            )
         }
     }
 }

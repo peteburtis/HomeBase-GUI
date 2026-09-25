@@ -357,7 +357,7 @@ final class CameraLiveVideoTests: XCTestCase {
         )
     }
 
-    func testRecordingArmsAfterDestinationPreparation() async throws {
+    func testRecordingArmsWithoutRequestingPhotosAccess() async throws {
         let destination = CameraRecordingDestinationStub()
         let controller = CameraLocalRecordingController(
             destination: destination
@@ -375,34 +375,34 @@ final class CameraLiveVideoTests: XCTestCase {
         )
         await controller.start()
 
-        XCTAssertEqual(destination.prepareCount, 1)
+        XCTAssertEqual(destination.prepareCount, 0)
         XCTAssertEqual(controller.state, .waitingForKeyFrame)
         XCTAssertTrue(controller.isRecording)
         XCTAssertTrue(controller.locksStreamConfiguration)
 
-        await controller.stopAndSave()
+        await controller.stop()
         XCTAssertEqual(controller.state, .idle)
         XCTAssertFalse(controller.isRecording)
         XCTAssertEqual(destination.savedURLs.count, 0)
     }
 
-    func testRecordingPreparationFailureIsPresented() async throws {
+    func testPhotosPreparationFailureIsPresentedWhenExportIsRequested() async {
         let destination = CameraRecordingDestinationStub(
             preparationError: CameraRecordingDestinationError.permissionDenied
         )
+        let pendingRecording = CameraLocalRecording(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("HomeBase-recording-test.mov"),
+            creationDate: Date()
+        )
         let controller = CameraLocalRecordingController(
-            destination: destination
-        )
-        let ownerID = UUID()
-        let formatDescription = try makeH264FormatDescription()
-        await controller.configure(
-            ownerID: ownerID,
-            generation: 1,
-            formatDescription: formatDescription
+            destination: destination,
+            pendingRecording: pendingRecording
         )
 
-        await controller.start()
+        let saved = await controller.savePendingRecordingToPhotos()
 
+        XCTAssertFalse(saved)
         XCTAssertEqual(destination.prepareCount, 1)
         XCTAssertEqual(
             controller.errorMessage,
@@ -410,9 +410,60 @@ final class CameraLiveVideoTests: XCTestCase {
                 .localizedDescription
         )
         XCTAssertFalse(controller.isRecording)
+        XCTAssertEqual(controller.pendingRecording, pendingRecording)
 
         controller.dismissError()
         XCTAssertEqual(controller.state, .idle)
+    }
+
+    func testSuccessfulPhotosExportReleasesPendingRecording() async {
+        let destination = CameraRecordingDestinationStub()
+        let pendingRecording = CameraLocalRecording(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("HomeBase-recording-export-test.mov"),
+            creationDate: Date()
+        )
+        let controller = CameraLocalRecordingController(
+            destination: destination,
+            pendingRecording: pendingRecording
+        )
+
+        let saved = await controller.savePendingRecordingToPhotos()
+
+        XCTAssertTrue(saved)
+        XCTAssertEqual(destination.prepareCount, 1)
+        XCTAssertEqual(destination.savedURLs, [pendingRecording.fileURL])
+        XCTAssertNil(controller.pendingRecording)
+        XCTAssertEqual(controller.successfulExportCount, 1)
+        XCTAssertEqual(controller.state, .idle)
+    }
+
+    func testCancelDiscardsPendingRecordingWithoutCountingAnExport() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "HomeBase-Camera-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let fileURL = directory.appendingPathComponent("Recording.mov")
+        try Data().write(to: fileURL)
+        let controller = CameraLocalRecordingController(
+            destination: CameraRecordingDestinationStub(),
+            pendingRecording: CameraLocalRecording(
+                fileURL: fileURL,
+                creationDate: Date()
+            )
+        )
+
+        controller.discardPendingRecording()
+
+        XCTAssertNil(controller.pendingRecording)
+        XCTAssertEqual(controller.successfulExportCount, 0)
+        XCTAssertEqual(controller.state, .idle)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
     }
 
     func testRecordingIgnoresEndFromSupersededPlayer() async throws {

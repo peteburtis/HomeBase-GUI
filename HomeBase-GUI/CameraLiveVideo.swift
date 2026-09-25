@@ -1100,14 +1100,20 @@ private struct CameraTransparentToolbar: ViewModifier {
 
 private struct CameraToolbarVisibility: ViewModifier {
     let isVisible: Bool
+    let hidesNavigationBar: Bool
 
     @ViewBuilder
     func body(content: Content) -> some View {
 #if os(iOS)
-        content.toolbarVisibility(
-            isVisible ? .visible : .hidden,
-            for: .navigationBar, .bottomBar
-        )
+        content
+            .toolbarVisibility(
+                isVisible && !hidesNavigationBar ? .visible : .hidden,
+                for: .navigationBar
+            )
+            .toolbarVisibility(
+                isVisible ? .visible : .hidden,
+                for: .bottomBar
+            )
 #elseif os(macOS)
         content.toolbarVisibility(
             isVisible ? .visible : .hidden,
@@ -1116,6 +1122,36 @@ private struct CameraToolbarVisibility: ViewModifier {
 #else
         content
 #endif
+    }
+}
+
+nonisolated struct CameraToolbarArrangement: Equatable {
+    let isLive: Bool
+    let compactWidth: Bool
+    let compactHeight: Bool
+
+    var configurationControlsInBottomTrailing: Bool {
+        isLive && compactWidth
+    }
+
+    var pauseInBottomTrailing: Bool {
+        !isLive && compactWidth
+    }
+
+    var navigationItemsInBottomToolbar: Bool {
+        compactHeight
+    }
+
+    var compactTransportInBottomLeading: Bool {
+        compactWidth && navigationItemsInBottomToolbar
+    }
+
+    var recordInTrailingNavigationBar: Bool {
+        isLive && !navigationItemsInBottomToolbar
+    }
+
+    var recordInBottomTrailing: Bool {
+        isLive && navigationItemsInBottomToolbar
     }
 }
 
@@ -1381,6 +1417,163 @@ struct CameraFullScreenLiveVideoView: View {
     }
 }
 
+#if os(iOS)
+private enum CameraRecordingSystemPresentation: Identifiable {
+    case files([CameraLocalRecording])
+    case share([CameraLocalRecording])
+
+    var id: String {
+        switch self {
+        case .files(let recordings):
+            "files-\(recordings.map(\.id.uuidString).joined(separator: "-"))"
+        case .share(let recordings):
+            "share-\(recordings.map(\.id.uuidString).joined(separator: "-"))"
+        }
+    }
+}
+
+private struct CameraRecordingExportPopover: View {
+    let recordings: [CameraLocalRecording]
+    let saveToPhotos: () -> Void
+    let saveToFiles: () -> Void
+    let share: () -> Void
+    let delete: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(spacing: 4) {
+                    ForEach(recordings) { recording in
+                        Text(recording.filename)
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+            }
+            .scrollIndicators(.hidden)
+            .frame(maxHeight: 120)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding()
+
+            Divider()
+
+            VStack(spacing: 8) {
+                actionButton(
+                    "Save to Photos",
+                    systemImage: "photo.on.rectangle",
+                    action: saveToPhotos
+                )
+                actionButton(
+                    "Save to Files",
+                    systemImage: "folder",
+                    action: saveToFiles
+                )
+                actionButton(
+                    "Share",
+                    systemImage: "square.and.arrow.up",
+                    action: share
+                )
+                Button(role: .destructive, action: delete) {
+                    Label("Delete", systemImage: "trash")
+                        .foregroundStyle(.red)
+                        .frame(
+                            maxWidth: .infinity,
+                            minHeight: 44,
+                            maxHeight: 44
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.bordered)
+            }
+            .padding(12)
+        }
+        .frame(width: 300)
+    }
+
+    private func actionButton(
+        _ title: String,
+        systemImage: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .foregroundStyle(.primary)
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: 44,
+                    maxHeight: 44
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.bordered)
+    }
+}
+
+private struct CameraRecordingDocumentPicker: UIViewControllerRepresentable {
+    let recordings: [CameraLocalRecording]
+    let completion: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(completion: completion)
+    }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let controller = UIDocumentPickerViewController(
+            forExporting: recordings.map(\.fileURL),
+            asCopy: true
+        )
+        controller.delegate = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(
+        _ uiViewController: UIDocumentPickerViewController,
+        context: Context
+    ) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        private let completion: (Bool) -> Void
+
+        init(completion: @escaping (Bool) -> Void) {
+            self.completion = completion
+        }
+
+        func documentPicker(
+            _ controller: UIDocumentPickerViewController,
+            didPickDocumentsAt urls: [URL]
+        ) {
+            completion(!urls.isEmpty)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            completion(false)
+        }
+    }
+}
+
+private struct CameraRecordingActivityView: UIViewControllerRepresentable {
+    let recordings: [CameraLocalRecording]
+    let completion: (Bool) -> Void
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(
+            activityItems: recordings.map(\.fileURL),
+            applicationActivities: nil
+        )
+        controller.completionWithItemsHandler = { _, completed, _, _ in
+            completion(completed)
+        }
+        return controller
+    }
+
+    func updateUIViewController(
+        _ uiViewController: UIActivityViewController,
+        context: Context
+    ) {}
+}
+#endif
+
 private struct CameraFullScreenCameraContent: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
@@ -1420,8 +1613,46 @@ private struct CameraFullScreenCameraContent: View {
     @State private var historyBookmarkError: String?
     @State private var s3Destination: CameraS3Destination?
 #if os(iOS)
-    private var recordingController: CameraLocalRecordingController { primary.recordingController }
-    @State private var savedConfirmationVisible = false
+    private var recordingControllers: [CameraLocalRecordingController] {
+        group.sessions.map(\.recordingController)
+    }
+
+    private var pendingRecordings: [CameraLocalRecording] {
+        recordingControllers.compactMap(\.pendingRecording)
+    }
+
+    private var recordingIsActive: Bool {
+        recordingControllers.contains(where: \.isRecording)
+    }
+
+    private var recordingHasStarted: Bool {
+        recordingControllers.contains { $0.state == .recording }
+    }
+
+    private var recordingIsBusy: Bool {
+        recordingControllers.contains {
+            $0.state == .finalizing || $0.state == .exporting
+        }
+    }
+
+    private var recordingLocksStreamConfiguration: Bool {
+        recordingControllers.contains(where: \.locksStreamConfiguration)
+    }
+
+    private var recordingStartedAt: Date? {
+        recordingControllers.compactMap(\.recordingStartedAt).min()
+    }
+
+    private var recordingErrorMessage: String? {
+        recordingControllers.compactMap(\.errorMessage).first
+    }
+
+    private var successfulRecordingExportCount: Int {
+        recordingControllers.reduce(0) { $0 + $1.successfulExportCount }
+    }
+
+    @State private var recordingExportPresented = false
+    @State private var recordingSystemPresentation: CameraRecordingSystemPresentation?
 #endif
     @StateObject private var toolbarScrubRelay = CameraToolbarScrubRelay()
 
@@ -1470,6 +1701,11 @@ private struct CameraFullScreenCameraContent: View {
             cancelHistoryRestore()
             cameraSwitchTask?.cancel(); cameraSwitchTask = nil
             stopLiveCameraGestures()
+#if os(iOS)
+            if !pendingRecordings.isEmpty {
+                discardRecordingExport()
+            }
+#endif
             group.deactivate()
         }
         .onChange(of: cameraControlsEnabled) { _, enabled in
@@ -1524,44 +1760,45 @@ private struct CameraFullScreenCameraContent: View {
         )) { _ in
             group.sessions.forEach { $0.playback.trimBufferForMemoryPressure() }
         }
-        .task(id: recordingController.successfulSaveCount) {
-            guard recordingController.successfulSaveCount > 0 else { return }
-            withAnimation(.snappy) {
-                savedConfirmationVisible = true
-            }
-            do {
-                try await Task.sleep(for: .seconds(1.5))
-            } catch {
-                return
-            }
-            withAnimation(.easeOut(duration: 0.2)) {
-                savedConfirmationVisible = false
-            }
-        }
-        .onChange(of: recordingController.state) { _, state in
-            if state == .requestingAuthorization {
-                savedConfirmationVisible = false
-            }
-        }
         .sensoryFeedback(
             .success,
-            trigger: recordingController.successfulSaveCount
+            trigger: successfulRecordingExportCount
         )
         .sensoryFeedback(
             .impact(weight: .medium),
-            trigger: recordingController.state
-        ) { previousState, currentState in
-            previousState != .recording && currentState == .recording
+            trigger: recordingHasStarted
+        ) { wasRecording, isRecording in
+            !wasRecording && isRecording
         }
         .alert(
-            "Recording Unavailable",
+            "Recording Error",
             isPresented: recordingErrorIsPresented
         ) {
             Button("OK") {
-                recordingController.dismissError()
+                recordingControllers.forEach { $0.dismissError() }
             }
         } message: {
-            Text(recordingController.errorMessage ?? "Unknown error")
+            Text(recordingErrorMessage ?? "Unknown error")
+        }
+        .sheet(item: $recordingSystemPresentation) { presentation in
+            switch presentation {
+            case .files(let recordings):
+                CameraRecordingDocumentPicker(recordings: recordings) { saved in
+                    finishSystemRecordingExport(saved: saved)
+                }
+                .ignoresSafeArea()
+            case .share(let recordings):
+                CameraRecordingActivityView(recordings: recordings) { shared in
+                    finishSystemRecordingExport(saved: shared)
+                }
+                .ignoresSafeArea()
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background,
+               !pendingRecordings.isEmpty {
+                discardRecordingExport()
+            }
         }
 #else
         cameraPresentation
@@ -1626,15 +1863,15 @@ private struct CameraFullScreenCameraContent: View {
         .toolbar { cameraToolbar }
         .modifier(CameraTransparentToolbar())
         .modifier(CameraToolbarVisibility(
-            isVisible: !access.isUnlocked || visiblePlayerControls
+            isVisible: !access.isUnlocked || visiblePlayerControls,
+            hidesNavigationBar: hidesNavigationBarInCompactHeight
         ))
 #if os(iOS)
         .background {
             CameraToolbarScrubBridge(
                 isEnabled: verticalSizeClass == .compact
-                    && timelineVisible
+                    && timelinePresented
                     && panel != .ptz
-                    && visiblePlayerControls
                     && playbackActionsEnabled,
                 relay: toolbarScrubRelay
             )
@@ -1662,7 +1899,10 @@ private struct CameraFullScreenCameraContent: View {
                 CameraTimelinePlacement(
                     edge: .top
                 ) {
-                    CameraTimelinePanel(isPresented: timelineVisible) {
+                    CameraTimelinePanel(
+                        isPresented: timelinePresented,
+                        isActive: timelineVisible
+                    ) {
                         CameraHistoryTimeline(makeTransport: {
                             await CameraHistorySources.thumbnails(metadata: metadata, client: client, credentials: access.session?.unlockedCredentials)
                         }, source: .init(metadata: metadata, credentials: access.session?.unlockedCredentials),
@@ -1705,14 +1945,6 @@ private struct CameraFullScreenCameraContent: View {
                 }
             }
         }
-#if os(iOS)
-        .overlay(alignment: .top) {
-            if visiblePlayerControls, !group.hasMultipleCameras,
-               recordingController.locksStreamConfiguration || savedConfirmationVisible {
-                cameraStatusMessage.fixedSize().padding(.top, 8).allowsHitTesting(false)
-            }
-        }
-#endif
         .background(Color.black.ignoresSafeArea())
         .animation(.snappy, value: controlsVisible)
         .animation(reduceMotion ? nil : .snappy, value: panel)
@@ -1726,74 +1958,126 @@ private struct CameraFullScreenCameraContent: View {
 
     @ToolbarContentBuilder
     private var cameraToolbar: some ToolbarContent {
+#if os(iOS)
+        if toolbarArrangement.navigationItemsInBottomToolbar {
+            ToolbarItem(placement: .bottomBar) {
+                CameraPlayerCloseButton { dismiss() }
+            }
+            ToolbarSpacer(.fixed, placement: .bottomBar)
+        } else {
+            ToolbarItem(placement: .navigation) {
+                CameraPlayerCloseButton { dismiss() }
+            }
+        }
+#else
         ToolbarItem(placement: .navigation) {
             CameraPlayerCloseButton { dismiss() }
         }
+#endif
 
 #if os(iOS)
         if access.isUnlocked {
             if horizontalSizeClass == .compact {
-                ToolbarItemGroup(placement: .secondaryAction) {
-                    backControl.disabled(!playbackActionsEnabled)
-                    pauseControl.disabled(!playbackActionsEnabled)
-                    forwardControl.disabled(!playbackActionsEnabled)
-                }
-                ToolbarItem(placement: .bottomBar) {
-                    CameraLiveModeButton(
-                        isLive: isLive,
-                        showsTitle: false,
-                        action: toggleLiveHistory
-                    )
-                        .disabled(!playbackActionsEnabled || (isLive && !canControlPlayback))
-                }
-                if !isLive {
-                    ToolbarSpacer(.fixed, placement: .bottomBar)
+                if !recordingLocksStreamConfiguration {
+                    if toolbarArrangement.compactTransportInBottomLeading {
+                        ToolbarItemGroup(placement: .bottomBar) {
+                            if isLive {
+                                pauseControl.disabled(!playbackActionsEnabled)
+                            } else {
+                                backControl.disabled(!playbackActionsEnabled)
+                                forwardControl.disabled(!playbackActionsEnabled)
+                            }
+                        }
+                    } else {
+                        ToolbarItemGroup(placement: .secondaryAction) {
+                            backControl.disabled(!playbackActionsEnabled)
+                            if isLive {
+                                pauseControl.disabled(!playbackActionsEnabled)
+                            }
+                            forwardControl.disabled(!playbackActionsEnabled)
+                        }
+                    }
                     ToolbarItem(placement: .bottomBar) {
-                        playbackSpeedControl.disabled(!playbackActionsEnabled)
+                        CameraLiveModeButton(
+                            isLive: isLive,
+                            showsTitle: false,
+                            action: toggleLiveHistory
+                        )
+                            .disabled(!playbackActionsEnabled || (isLive && !canControlPlayback))
+                    }
+                    if !isLive {
+                        ToolbarSpacer(.fixed, placement: .bottomBar)
+                        ToolbarItem(placement: .bottomBar) {
+                            playbackSpeedControl.disabled(!playbackActionsEnabled)
+                        }
                     }
                 }
                 ToolbarSpacer(.flexible, placement: .bottomBar)
 
-                if !group.hasMultipleCameras, isLive {
-                    ToolbarItem(placement: .bottomBar) { recordingControl }
+                if toolbarArrangement.configurationControlsInBottomTrailing {
+                    if toolbarArrangement.recordInBottomTrailing {
+                        if recordingHasStarted {
+                            ToolbarItem(placement: .bottomBar) {
+                                recordingElapsedTimeLabel
+                            }
+                            .sharedBackgroundVisibility(.hidden)
+                        }
+                        ToolbarItem(placement: .bottomBar) { recordingControl }
+                    }
+                    if showsQualityControl {
+                        ToolbarItem(placement: .bottomBar) { qualityControl }
+                    }
+                    if let dayNightModeControl {
+                        ToolbarItem(placement: .bottomBar) {
+                            dayNightModeControl
+                        }
+                    }
+                    if let privacyControl {
+                        ToolbarItem(placement: .bottomBar) { privacyControl }
+                    }
                 }
-                if let privacyControl {
-                    ToolbarItem(placement: .bottomBar) { privacyControl }
-                }
-                if showsQualityControl {
-                    ToolbarItem(placement: .secondaryAction) { qualityControl }
-                }
-                if let dayNightModeControl {
-                    ToolbarItem(placement: .secondaryAction) {
-                        dayNightModeControl
+                if toolbarArrangement.pauseInBottomTrailing,
+                   !recordingLocksStreamConfiguration {
+                    ToolbarItem(placement: .bottomBar) {
+                        pauseControl
+                            .labelStyle(.iconOnly)
+                            .disabled(!playbackActionsEnabled)
                     }
                 }
             } else {
-                ToolbarItemGroup(placement: .bottomBar) {
-                    backControl.disabled(!playbackActionsEnabled)
-                    pauseControl
-                        .labelStyle(.iconOnly)
-                        .disabled(!playbackActionsEnabled)
-                    forwardControl.disabled(!playbackActionsEnabled)
-                }
-                ToolbarSpacer(.fixed, placement: .bottomBar)
-                ToolbarItem(placement: .bottomBar) {
-                    CameraLiveModeButton(
-                        isLive: isLive,
-                        showsTitle: true,
-                        action: toggleLiveHistory
-                    )
-                        .disabled(!playbackActionsEnabled || (isLive && !canControlPlayback))
-                }
-                if !isLive {
+                if !recordingLocksStreamConfiguration {
+                    ToolbarItemGroup(placement: .bottomBar) {
+                        backControl.disabled(!playbackActionsEnabled)
+                        pauseControl
+                            .labelStyle(.iconOnly)
+                            .disabled(!playbackActionsEnabled)
+                        forwardControl.disabled(!playbackActionsEnabled)
+                    }
                     ToolbarSpacer(.fixed, placement: .bottomBar)
                     ToolbarItem(placement: .bottomBar) {
-                        playbackSpeedControl.disabled(!playbackActionsEnabled)
+                        CameraLiveModeButton(
+                            isLive: isLive,
+                            showsTitle: true,
+                            action: toggleLiveHistory
+                        )
+                            .disabled(!playbackActionsEnabled || (isLive && !canControlPlayback))
+                    }
+                    if !isLive {
+                        ToolbarSpacer(.fixed, placement: .bottomBar)
+                        ToolbarItem(placement: .bottomBar) {
+                            playbackSpeedControl.disabled(!playbackActionsEnabled)
+                        }
                     }
                 }
                 ToolbarSpacer(.flexible, placement: .bottomBar)
 
-                if !group.hasMultipleCameras {
+                if toolbarArrangement.recordInBottomTrailing {
+                    if recordingHasStarted {
+                        ToolbarItem(placement: .bottomBar) {
+                            recordingElapsedTimeLabel
+                        }
+                        .sharedBackgroundVisibility(.hidden)
+                    }
                     ToolbarItem(placement: .bottomBar) { recordingControl }
                     if hasLiveToolbarControls {
                         ToolbarSpacer(.fixed, placement: .bottomBar)
@@ -1812,8 +2096,33 @@ private struct CameraFullScreenCameraContent: View {
                 }
             }
 
-            ToolbarItem(placement: .primaryAction) {
-                cameraPickerControl
+            if toolbarArrangement.navigationItemsInBottomToolbar {
+                if !recordingLocksStreamConfiguration {
+                    ToolbarSpacer(.fixed, placement: .bottomBar)
+                    ToolbarItem(placement: .bottomBar) {
+                        cameraPickerControl
+                    }
+                }
+            } else {
+                if toolbarArrangement.recordInTrailingNavigationBar {
+                    if recordingHasStarted {
+                        ToolbarItem(placement: .primaryAction) {
+                            recordingElapsedTimeLabel
+                        }
+                        .sharedBackgroundVisibility(.hidden)
+                    }
+                    ToolbarItem(placement: .primaryAction) {
+                        recordingControl
+                    }
+                }
+                if !recordingLocksStreamConfiguration {
+                    if toolbarArrangement.recordInTrailingNavigationBar {
+                        ToolbarSpacer(.fixed, placement: .primaryAction)
+                    }
+                    ToolbarItem(placement: .primaryAction) {
+                        cameraPickerControl
+                    }
+                }
             }
         }
 #else
@@ -1874,9 +2183,6 @@ private struct CameraFullScreenCameraContent: View {
         .accessibilityLabel("Choose camera")
         .accessibilityValue(group.active ? group.sessions.map { $0.camera.device.displayName }.joined(separator: ", ") : device.displayName)
         .disabled(switchingCamera || group.resolvingTime)
-#if os(iOS)
-        .disabled(recordingController.locksStreamConfiguration)
-#endif
         .popover(isPresented: $cameraPickerVisible, attachmentAnchor: .rect(.bounds)) {
             CameraPickerPopover(model: cameraPicker,
                 selectedIDs: Set(group.active ? group.sessions.map(\.id) : [device.identifier]),
@@ -1897,7 +2203,7 @@ private struct CameraFullScreenCameraContent: View {
     private func setMultiple(_ enabled: Bool) {
         guard access.isUnlocked, enabled != group.multipleSelectionEnabled, !switchingCamera else { return }
 #if os(iOS)
-        guard !recordingController.locksStreamConfiguration else { return }
+        guard !recordingLocksStreamConfiguration else { return }
 #endif
         stopLiveCameraGestures()
         withAnimation(.snappy) { group.setMultipleSelection(enabled) }
@@ -1916,10 +2222,18 @@ private struct CameraFullScreenCameraContent: View {
             defer { switchingCamera = false }
             do {
 #if os(iOS)
-                // A camera change must never mix cameras in one Photos recording.
-                await recordingController.stopAndSave()
-                while recordingController.state == .saving { try await Task.sleep(for: .milliseconds(50)) }
-                guard recordingController.errorMessage == nil else { return }
+                // A camera change must never mix cameras in one local movie.
+                await stopRecording()
+                while recordingControllers.contains(where: {
+                    $0.state == .finalizing
+                }) {
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                guard recordingErrorMessage == nil else { return }
+                guard pendingRecordings.isEmpty else {
+                    recordingExportPresented = true
+                    return
+                }
 #endif
                 let destination: CameraSwitchPosition
                 if case .relative = departure {
@@ -1939,40 +2253,10 @@ private struct CameraFullScreenCameraContent: View {
 
 #if os(iOS)
     @ViewBuilder
-    private var cameraStatusMessage: some View {
-        if recordingController.state == .requestingAuthorization {
-            CameraToolbarStatus(title: "Requesting Photos access…")
-        } else if recordingController.state == .waitingForKeyFrame {
-            CameraToolbarStatus(
-                title: "Recording",
-                showsActivityIndicator: true,
-                accessibilityValue: "Waiting for video to start"
-            )
-        } else if recordingController.state == .recording {
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                let elapsed = recordingController.recordingStartedAt.map {
-                    max(0, context.date.timeIntervalSince($0))
-                } ?? 0
-                let timer = Duration.seconds(elapsed).formatted(
-                    .time(pattern: .minuteSecond(padMinuteToLength: 1))
-                )
-                CameraToolbarStatus(
-                    title: "Recording \(timer)",
-                    prominent: true,
-                    monospacedDigits: true
-                )
-            }
-        } else if recordingController.state == .saving {
-            CameraToolbarStatus(title: "Saving to Photos…")
-        } else if savedConfirmationVisible {
-            CameraToolbarStatus(title: "Saved to Photos")
-        }
-    }
-
-    @ViewBuilder
     private var recordingControl: some View {
-        if recordingController.isRecording {
-            recordingButton.buttonStyle(.glassProminent)
+        if recordingIsActive {
+            recordingButton
+                .buttonStyle(.glassProminent)
         } else {
             recordingButton
         }
@@ -1980,44 +2264,170 @@ private struct CameraFullScreenCameraContent: View {
 
     private var recordingButton: some View {
         Button {
-            guard recordingController.isRecording || cameraControlsEnabled else { return }
-            recordingController.toggle()
+            if !pendingRecordings.isEmpty {
+                recordingExportPresented = true
+            } else if recordingIsActive {
+                Task {
+                    await stopRecording()
+                    recordingExportPresented = !pendingRecordings.isEmpty
+                }
+            } else {
+                guard cameraControlsEnabled else { return }
+                Task {
+                    await startRecording()
+                }
+            }
         } label: {
-            Image(systemName: recordingController.isRecording
-                ? "stop.fill"
-                : "record.circle")
+            recordingButtonLabel
         }
         .tint(.red)
         .disabled(
-            recordingController.state == .requestingAuthorization
-                || recordingController.state == .saving
-                || (!recordingController.isRecording
-                    && (!recordingController.isStreamAvailable || !cameraControlsEnabled))
+            recordingIsBusy
+                || (!recordingIsActive
+                    && pendingRecordings.isEmpty
+                    && (recordingControllers.isEmpty
+                        || !recordingControllers.allSatisfy(\.isStreamAvailable)
+                        || !cameraControlsEnabled))
         )
         .accessibilityLabel(
-            recordingController.isRecording
+            recordingIsActive
                 ? "Stop recording"
                 : "Record video"
         )
         .accessibilityValue(recordingAccessibilityValue)
+        .popover(
+            isPresented: $recordingExportPresented,
+            attachmentAnchor: .rect(.bounds)
+        ) {
+            if !pendingRecordings.isEmpty {
+                CameraRecordingExportPopover(
+                    recordings: pendingRecordings,
+                    saveToPhotos: saveRecordingToPhotos,
+                    saveToFiles: {
+                        presentSystemRecordingExport(.files(pendingRecordings))
+                    },
+                    share: {
+                        presentSystemRecordingExport(.share(pendingRecordings))
+                    },
+                    delete: discardRecordingExport
+                )
+                .presentationCompactAdaptation(.popover)
+                .interactiveDismissDisabled()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var recordingButtonLabel: some View {
+        if recordingIsBusy || (recordingIsActive && !recordingHasStarted) {
+            ProgressView()
+        } else if recordingHasStarted {
+            Image(systemName: "stop.fill")
+        } else {
+            Image(systemName: "record.circle")
+        }
+    }
+
+    private var recordingElapsedTimeLabel: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let elapsed = recordingStartedAt.map {
+                max(0, context.date.timeIntervalSince($0))
+            } ?? 0
+            let timer = Duration.seconds(elapsed).formatted(
+                .time(pattern: .hourMinuteSecond(padHourToLength: 2))
+            )
+            Text(timer)
+                .font(.system(.callout, design: .monospaced, weight: .bold))
+                .foregroundStyle(.red)
+                .accessibilityLabel("Recording duration")
+                .accessibilityValue(timer)
+        }
     }
 
     private var recordingAccessibilityValue: String {
-        switch recordingController.state {
-        case .idle: "Not recording"
-        case .requestingAuthorization: "Requesting Photos access"
-        case .waitingForKeyFrame: "Starting recording"
-        case .recording: "Recording"
-        case .saving: "Saving to Photos"
-        case .failed: "Recording unavailable"
+        if recordingControllers.contains(where: { $0.state == .exporting }) {
+            return "Exporting recordings"
         }
+        if recordingControllers.contains(where: { $0.state == .finalizing }) {
+            return "Finishing recordings"
+        }
+        if recordingHasStarted { return "Recording" }
+        if recordingIsActive { return "Starting recording" }
+        if recordingErrorMessage != nil { return "Recording unavailable" }
+        return "Not recording"
+    }
+
+    private func startRecording() async {
+        for session in group.sessions {
+            await session.recordingController.start(
+                suggestedFilename: session.camera.device.displayName
+            )
+        }
+    }
+
+    private func stopRecording() async {
+        let tasks = recordingControllers
+            .filter(\.isRecording)
+            .map { controller in
+                Task { @MainActor in
+                    await controller.stop()
+                }
+            }
+        for task in tasks {
+            await task.value
+        }
+    }
+
+    private func saveRecordingToPhotos() {
+        recordingExportPresented = false
+        Task {
+            for controller in recordingControllers
+            where controller.pendingRecording != nil {
+                guard await controller.savePendingRecordingToPhotos() else {
+                    return
+                }
+            }
+        }
+    }
+
+    private func presentSystemRecordingExport(
+        _ presentation: CameraRecordingSystemPresentation
+    ) {
+        recordingExportPresented = false
+        Task { @MainActor in
+            await Task.yield()
+            recordingSystemPresentation = presentation
+        }
+    }
+
+    private func finishSystemRecordingExport(saved: Bool) {
+        recordingSystemPresentation = nil
+        if saved {
+            recordingControllers.forEach { $0.completePendingExport() }
+        } else if !pendingRecordings.isEmpty {
+            Task { @MainActor in
+                await Task.yield()
+                recordingExportPresented = true
+            }
+        }
+    }
+
+    private func discardRecordingExport() {
+        recordingExportPresented = false
+        recordingSystemPresentation = nil
+        recordingControllers.forEach { $0.discardPendingRecording() }
     }
 
     private var recordingErrorIsPresented: Binding<Bool> {
         Binding(
-            get: { access.isUnlocked && recordingController.errorMessage != nil },
+            get: { access.isUnlocked && recordingErrorMessage != nil },
             set: { isPresented in
-                if !isPresented { recordingController.dismissError() }
+                if !isPresented {
+                    recordingControllers.forEach { $0.dismissError() }
+                    if !pendingRecordings.isEmpty {
+                        recordingExportPresented = true
+                    }
+                }
             }
         )
     }
@@ -2031,6 +2441,23 @@ private struct CameraFullScreenCameraContent: View {
     }
 
     private var timelineVisible: Bool { !isLive }
+    private var timelinePresented: Bool { timelineVisible && visiblePlayerControls }
+
+#if os(iOS)
+    private var toolbarArrangement: CameraToolbarArrangement {
+        CameraToolbarArrangement(
+            isLive: isLive,
+            compactWidth: horizontalSizeClass == .compact,
+            compactHeight: verticalSizeClass == .compact
+        )
+    }
+
+    private var hidesNavigationBarInCompactHeight: Bool {
+        toolbarArrangement.navigationItemsInBottomToolbar
+    }
+#else
+    private var hidesNavigationBarInCompactHeight: Bool { false }
+#endif
 
     private var playbackPosition: CameraSwitchPosition {
         group.active
@@ -2150,7 +2577,7 @@ private struct CameraFullScreenCameraContent: View {
 
     private var playbackActionsEnabled: Bool {
 #if os(iOS)
-        access.isUnlocked && !switchingCamera && !recordingController.locksStreamConfiguration
+        access.isUnlocked && !switchingCamera && !recordingLocksStreamConfiguration
 #else
         access.isUnlocked && !switchingCamera
 #endif
@@ -2283,9 +2710,6 @@ private struct CameraFullScreenCameraContent: View {
             CameraLiveQualityPresentation.title(for: selectedQuality)
         )
         .disabled(!cameraControlsEnabled)
-#if os(iOS)
-        .disabled(recordingController.locksStreamConfiguration)
-#endif
     }
 
     private var availableQualities: [CameraLiveQualitySelection] {
