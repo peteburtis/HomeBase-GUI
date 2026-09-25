@@ -93,6 +93,9 @@ final class CameraPickerModel: ObservableObject {
             try Task.checkCancellation()
             guard generation == id else { return }
             cameras = CameraVideoCatalog.cameras(in: devices).sorted {
+                if ($0.artificialFeed == nil) != ($1.artificialFeed == nil) {
+                    return $0.artificialFeed == nil
+                }
                 let order = $0.device.displayName.localizedStandardCompare($1.device.displayName)
                 return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
             }

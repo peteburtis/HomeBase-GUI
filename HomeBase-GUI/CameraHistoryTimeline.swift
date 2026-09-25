@@ -34,6 +34,8 @@ nonisolated enum CameraTimelineScale {
 /// height changes placement relative to safe areas, not the scrubber scale.
 nonisolated enum CameraTimelineSizing {
     static let standard = CGSize(width: CameraTimelineScale.cellWidth, height: CameraTimelineScale.thumbnailHeight)
+    static let thumbnailToScrubberSpacing: CGFloat = 4
+    static let thumbnailOpacity = 0.9
 }
 
 private struct CameraTimelineThumbnailSizeKey: EnvironmentKey {
@@ -472,9 +474,10 @@ struct CameraHistoryTimeline: View {
     }
 
     private var referenceCell: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: CameraTimelineSizing.thumbnailToScrubberSpacing) {
             thumbnailGridCell
                 .frame(width: thumbnailSize.width, height: thumbnailSize.height)
+                .opacity(CameraTimelineSizing.thumbnailOpacity)
             CameraTimelineTimeLabelLayout(bottomPadding: 2 / displayScale) {
                 Text("00:00")
                     .font(.system(size: 10, weight: .semibold).monospacedDigit())
@@ -556,7 +559,7 @@ struct CameraHistoryTimeline: View {
         let start = Double(tile) * CameraTimelineScale.seconds
         let width = min(thumbnailSize.width, max(0, (model.end - start) / CameraTimelineScale.seconds * thumbnailSize.width))
         let space = timelineSpace, playhead = viewportWidth / 2
-        return VStack(spacing: 0) {
+        return VStack(spacing: CameraTimelineSizing.thumbnailToScrubberSpacing) {
             ZStack {
                 thumbnailGridCell
                 if let entry = model.previews[tile] {
@@ -569,6 +572,7 @@ struct CameraHistoryTimeline: View {
             }
             .frame(width: thumbnailSize.width, height: thumbnailSize.height)
             .clipped()
+            .opacity(CameraTimelineSizing.thumbnailOpacity)
             CameraTimelineTimeLabelLayout(bottomPadding: 2 / displayScale) {
                 Text(CameraHistoryTimestamp.string(for: Date(timeIntervalSince1970: start), timeZone: timeZone).suffix(8).prefix(5))
                     .font(.system(size: 10, weight: .semibold).monospacedDigit())

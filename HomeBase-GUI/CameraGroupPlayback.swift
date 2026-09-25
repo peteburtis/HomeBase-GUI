@@ -204,14 +204,16 @@ final class CameraGroupSession: ObservableObject, Identifiable {
             quality: initialQuality,
             client: client,
             recordingController: recordingController,
-            playbackController: playback
+            playbackController: playback,
+            artificialFeed: camera.artificialFeed
         )
 #else
         let liveVideo = CameraLiveVideoModel(
             deviceIdentifier: camera.device.addressableName,
             quality: initialQuality,
             client: client,
-            playbackController: playback
+            playbackController: playback,
+            artificialFeed: camera.artificialFeed
         )
 #endif
         self.liveVideo = liveVideo
@@ -224,7 +226,9 @@ final class CameraGroupSession: ObservableObject, Identifiable {
                 await liveVideo.stop(immediately: immediately)
             },
             startControls: {
-                await controls.run(reactivating: true)
+                if camera.artificialFeed == nil {
+                    await controls.run(reactivating: true)
+                }
             },
             stopControls: {
                 await controls.stop()
@@ -412,7 +416,10 @@ final class CameraGroupPlayback: ObservableObject {
 
     var isLive: Bool { source == .live }
     var hasMultipleCameras: Bool { sessions.count > 1 }
-    var hasHistory: Bool { sessions.contains { $0.historyAvailable } }
+    var historySourceSession: CameraGroupSession? {
+        sessions.first(where: \.historyAvailable)
+    }
+    var hasHistory: Bool { historySourceSession != nil }
     var playbackDate: Date? { source == .history ? cursor.map(Date.init(timeIntervalSince1970:)) : nil }
     var liveEdge: Double? { edgeAnchor.map { $0.canonical + max(0, clock() - $0.host) } }
 
@@ -677,14 +684,14 @@ final class CameraGroupPlayback: ObservableObject {
         if isLive { return .live }
         guard let cursor else { return .live }
         if source == .history { return .canonical(cursor, paused: isPaused) }
-        guard let session = sessions.first(where: { $0.historyAvailable }),
+        guard let session = historySourceSession,
               let metadata = CameraPlaybackHistoryAvailability.metadata(in: session.controls.deviceMetadata) else { return .live }
         let now = clock()
         return .relative(cameraID: metadata.cameraID, offset: min(0, cursor - now), capturedAt: now, paused: isPaused)
     }
 
     private func resolveHistory(at hostTime: Double) {
-        guard !resolvingTime, let session = sessions.first(where: { $0.historyAvailable }),
+        guard !resolvingTime, let session = historySourceSession,
               let metadata = CameraPlaybackHistoryAvailability.metadata(in: session.controls.deviceMetadata) else { return }
         let id = UUID(); generation = id
         let now = clock(), paused = isPaused

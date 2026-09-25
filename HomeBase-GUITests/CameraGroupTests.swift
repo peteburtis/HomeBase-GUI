@@ -96,6 +96,24 @@ final class CameraGroupTests: XCTestCase {
         XCTAssertNotNil(group.error)
     }
 
+    func testHistorySourceFallsForwardToFirstSelectedCameraWithHistory() throws {
+        let client = try makeClient()
+        let noHistory = try camera("No History", history: false)
+        let firstHistory = try camera("First History")
+        let secondHistory = try camera("Second History")
+        let initial = CameraGroupSession(camera: noHistory, client: client)
+        let group = CameraGroupPlayback(client: client, initialSession: initial)
+        defer { group.deactivate() }
+
+        XCTAssertNil(group.historySourceSession)
+        group.toggle(firstHistory)
+        group.toggle(secondHistory)
+        XCTAssertEqual(group.historySourceSession?.id, firstHistory.id)
+
+        group.toggle(firstHistory)
+        XCTAssertEqual(group.historySourceSession?.id, secondHistory.id)
+    }
+
     func testSharedSpeedKeepsEveryHistoryPaneInLockstepAndSurvivesMultipleToggle() async throws {
         var now = 100.0
         let group = try makeGroup(clock: { now })
@@ -422,6 +440,66 @@ final class CameraGroupTests: XCTestCase {
         XCTAssertTrue(CameraGroupLayout.cells(count: 2, in: .zero).isEmpty)
     }
 
+    func testLandscapeGridVideoFramesGravitateTowardCenterSeams() {
+        let size = CGSize(width: 852, height: 393)
+        for count in 2...4 {
+            let cells = CameraGroupLayout.cells(count: count, in: size)
+            let videos = cells.enumerated().map { index, cell in
+                CameraGroupLayout.videoFrame(
+                    in: cell,
+                    aspectRatio: 16 / 9,
+                    gravity: CameraGroupLayout.videoGravity(
+                        index: index,
+                        count: count,
+                        arrangement: .grid
+                    )
+                )
+            }
+
+            XCTAssertEqual(videos[0].maxX, size.width / 2, accuracy: 0.0001)
+            XCTAssertEqual(videos[1].minX, size.width / 2, accuracy: 0.0001)
+            if count > 2 {
+                XCTAssertEqual(videos[0].maxY, size.height / 2, accuracy: 0.0001)
+                XCTAssertEqual(videos[2].minY, size.height / 2, accuracy: 0.0001)
+                XCTAssertEqual(videos[2].maxX, size.width / 2, accuracy: 0.0001)
+            }
+        }
+    }
+
+    func testGridLabelsAnchorTowardOutsideEdgesAndColumnLabelsStayLeading() {
+        let cell = CGRect(x: 0, y: 0, width: 320, height: 180)
+        let labelSize = CGSize(width: 100, height: 24)
+
+        for index in 0..<4 {
+            let anchor = CameraGroupLayout.labelAnchor(
+                index: index,
+                arrangement: .grid
+            )
+            let frame = CameraGroupLayout.labelFrame(
+                in: cell,
+                safeBounds: cell,
+                aspectRatio: 16 / 9,
+                labelSize: labelSize,
+                belowVideo: false,
+                anchor: anchor
+            )
+            if index.isMultiple(of: 2) {
+                XCTAssertEqual(anchor, .leading)
+                XCTAssertEqual(frame.minX, cell.minX)
+            } else {
+                XCTAssertEqual(anchor, .trailing)
+                XCTAssertEqual(frame.maxX, cell.maxX)
+            }
+            XCTAssertEqual(
+                CameraGroupLayout.labelAnchor(
+                    index: index,
+                    arrangement: .column
+                ),
+                .leading
+            )
+        }
+    }
+
     func testArrangementMaximizesDisplayedVideoAreaForEachCameraCount() {
         let portrait = CGSize(width: 393, height: 852)
         let landscape = CGSize(width: 852, height: 393)
@@ -569,13 +647,22 @@ final class CameraGroupTests: XCTestCase {
         let safe = CGRect(x: 62, y: 50, width: 728, height: 322)
         for count in 1...4 {
             let cells = CameraGroupLayout.cells(count: count, in: size)
-            for cell in cells {
+            for (index, cell) in cells.enumerated() {
+                let anchor = CameraGroupLayout.labelAnchor(
+                    index: index,
+                    arrangement: .grid
+                )
                 let label = CameraGroupLayout.labelFrame(in: cell, safeBounds: safe, aspectRatio: 16 / 9,
-                    labelSize: CGSize(width: 120, height: 24), belowVideo: count == 2)
+                    labelSize: CGSize(width: 120, height: 24), belowVideo: count == 2,
+                    anchor: anchor)
                 let video = CameraGroupLayout.videoFrame(in: cell, aspectRatio: 16 / 9)
                 XCTAssertTrue(safe.contains(label))
                 XCTAssertTrue(cell.contains(label))
-                XCTAssertEqual(label.minX, max(video.minX, safe.minX))
+                if anchor == .leading {
+                    XCTAssertEqual(label.minX, max(video.minX, safe.minX))
+                } else {
+                    XCTAssertEqual(label.maxX, min(video.maxX, safe.maxX))
+                }
                 if count == 2 { XCTAssertEqual(label.minY, video.maxY) }
                 else { XCTAssertLessThanOrEqual(label.maxY, video.maxY) }
             }

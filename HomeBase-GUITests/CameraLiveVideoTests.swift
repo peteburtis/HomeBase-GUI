@@ -122,6 +122,27 @@ final class CameraLiveVideoTests: XCTestCase {
         )
     }
 
+    func testVideoCatalogAppendsFourArtificialCamerasAfterRealCameras() {
+        let real = HBTopologyDeviceDescriptor(
+            identifier: "camera-real",
+            addressableName: "RealCamera",
+            displayName: "Real Camera",
+            metadata: [CameraLiveVideoCapability.availableMetadataKey: true]
+        )
+
+        let cameras = CameraVideoCatalog.cameras(
+            in: [real],
+            includesArtificial: true
+        )
+
+        XCTAssertEqual(cameras.first?.id, real.identifier)
+        XCTAssertEqual(
+            cameras.dropFirst().compactMap(\.artificialFeed),
+            CameraArtificialFeed.allCases
+        )
+        XCTAssertEqual(cameras.count, 5)
+    }
+
     func testQualityMenuShowsDefaultBeforeAvailableTiersFromHighestToLowest() {
         XCTAssertEqual(
             CameraLiveQualityPresentation.options(
@@ -436,6 +457,49 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertNil(controller.pendingRecording)
         XCTAssertEqual(controller.successfulExportCount, 1)
         XCTAssertEqual(controller.state, .idle)
+    }
+
+    func testEveryRecordingExportBatchGetsNewPresentationIdentity() {
+        let recording = CameraLocalRecording(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("HomeBase-recording-presentation.mov"),
+            creationDate: Date()
+        )
+
+        let first = CameraRecordingExportPresentation(
+            recordings: [recording]
+        )
+        let second = CameraRecordingExportPresentation(
+            recordings: [recording]
+        )
+
+        XCTAssertEqual(first.recordings, second.recordings)
+        XCTAssertNotEqual(first.id, second.id)
+    }
+
+    func testCompletedExportAllowsRecordingControllerToRearm() async throws {
+        let pendingRecording = CameraLocalRecording(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("HomeBase-recording-rearm.mov"),
+            creationDate: Date()
+        )
+        let controller = CameraLocalRecordingController(
+            destination: CameraRecordingDestinationStub(),
+            pendingRecording: pendingRecording
+        )
+        controller.completePendingExport()
+        await controller.configure(
+            ownerID: UUID(),
+            generation: 1,
+            formatDescription: try makeH264FormatDescription()
+        )
+
+        await controller.start()
+        XCTAssertEqual(controller.state, .waitingForKeyFrame)
+        await controller.stop()
+        XCTAssertEqual(controller.state, .idle)
+        await controller.start()
+        XCTAssertEqual(controller.state, .waitingForKeyFrame)
     }
 
     func testCancelDiscardsPendingRecordingWithoutCountingAnExport() async throws {

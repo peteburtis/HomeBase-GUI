@@ -839,7 +839,20 @@ private struct TimelineTestCanvas: View {
                 Color.black
                 ForEach(cells.indices, id: \.self) { index in
                     let cell = cells[index]
-                    let video = CameraGroupLayout.videoFrame(in: CGRect(origin: .zero, size: cell.size), aspectRatio: 16 / 9)
+                    let gravity = CameraGroupLayout.videoGravity(
+                        index: index,
+                        count: layout.count,
+                        arrangement: arrangement
+                    )
+                    let labelAnchor = CameraGroupLayout.labelAnchor(
+                        index: index,
+                        arrangement: arrangement
+                    )
+                    let video = CameraGroupLayout.videoFrame(
+                        in: CGRect(origin: .zero, size: cell.size),
+                        aspectRatio: 16 / 9,
+                        gravity: gravity
+                    )
                     ZStack(alignment: .topLeading) {
                         Rectangle().fill(index.isMultiple(of: 2) ? Color.blue.opacity(0.4) : Color.teal.opacity(0.4))
                             .frame(width: video.width, height: video.height)
@@ -847,8 +860,13 @@ private struct TimelineTestCanvas: View {
                         if layout.count > 1 && layout.controlsVisible {
                             CameraGroupLabelLayout(safeBounds: safe.offsetBy(dx: -cell.minX, dy: -cell.minY),
                                 aspectRatio: 16 / 9,
-                                belowVideo: CameraGroupLayout.labelsBelowVideo(count: layout.count, arrangement: arrangement)) {
-                                CameraGroupCameraLabel(name: "Camera \(index + 1)")
+                                belowVideo: CameraGroupLayout.labelsBelowVideo(count: layout.count, arrangement: arrangement),
+                                gravity: gravity,
+                                anchor: labelAnchor) {
+                                CameraGroupCameraLabelContainer(
+                                    name: "Camera \(index + 1)",
+                                    anchor: labelAnchor
+                                )
                                     .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { layout.labelFrames[index] = $0 }
                             }
                         }

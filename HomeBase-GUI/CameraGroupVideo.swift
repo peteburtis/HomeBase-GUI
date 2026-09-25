@@ -3,6 +3,39 @@ import HomeBaseProtocol
 
 enum CameraGroupLayout {
     enum Arrangement: Equatable { case grid, column }
+    enum LabelAnchor: Equatable { case leading, trailing }
+
+    struct VideoGravity: Equatable {
+        enum Horizontal: Equatable { case leading, center, trailing }
+        enum Vertical: Equatable { case top, center, bottom }
+
+        let horizontal: Horizontal
+        let vertical: Vertical
+
+        static let center = VideoGravity(
+            horizontal: .center,
+            vertical: .center
+        )
+
+        var alignment: Alignment {
+            let horizontalAlignment: HorizontalAlignment
+            switch horizontal {
+            case .leading: horizontalAlignment = .leading
+            case .center: horizontalAlignment = .center
+            case .trailing: horizontalAlignment = .trailing
+            }
+            let verticalAlignment: VerticalAlignment
+            switch vertical {
+            case .top: verticalAlignment = .top
+            case .center: verticalAlignment = .center
+            case .bottom: verticalAlignment = .bottom
+            }
+            return Alignment(
+                horizontal: horizontalAlignment,
+                vertical: verticalAlignment
+            )
+        }
+    }
 
     static func arrangement(
         count: Int,
@@ -49,6 +82,15 @@ enum CameraGroupLayout {
         count == 2 && arrangement == .grid
     }
 
+    static func labelAnchor(
+        index: Int,
+        arrangement: Arrangement
+    ) -> LabelAnchor {
+        arrangement == .grid && !index.isMultiple(of: 2)
+            ? .trailing
+            : .leading
+    }
+
     static func cells(count: Int, in size: CGSize, arrangement: Arrangement = .grid) -> [CGRect] {
         guard (1...4).contains(count), size.width > 0, size.height > 0 else { return [] }
         if arrangement == .column && count > 1 {
@@ -70,28 +112,80 @@ enum CameraGroupLayout {
         }
     }
 
-    static func videoFrame(in cell: CGRect, aspectRatio: CGFloat) -> CGRect {
-        let ratio = aspectRatio.isFinite && aspectRatio > 0 ? aspectRatio : 16 / 9
-        let width = min(cell.width, cell.height * ratio), height = min(cell.height, cell.width / ratio)
-        return CGRect(x: cell.midX - width / 2, y: cell.midY - height / 2, width: width, height: height)
+    static func videoGravity(
+        index: Int,
+        count: Int,
+        arrangement: Arrangement
+    ) -> VideoGravity {
+        guard arrangement == .grid, count > 1 else { return .center }
+        let columns = 2
+        let rows = count <= 2 ? 1 : 2
+        return VideoGravity(
+            horizontal: index % columns == 0 ? .trailing : .leading,
+            vertical: rows == 1
+                ? .center
+                : (index / columns == 0 ? .bottom : .top)
+        )
     }
 
-    static func labelArea(in cell: CGRect, safeBounds: CGRect, aspectRatio: CGFloat) -> CGRect {
-        let video = videoFrame(in: cell, aspectRatio: aspectRatio)
+    static func videoFrame(
+        in cell: CGRect,
+        aspectRatio: CGFloat,
+        gravity: VideoGravity = .center
+    ) -> CGRect {
+        let ratio = aspectRatio.isFinite && aspectRatio > 0 ? aspectRatio : 16 / 9
+        let width = min(cell.width, cell.height * ratio), height = min(cell.height, cell.width / ratio)
+        let x = switch gravity.horizontal {
+        case .leading: cell.minX
+        case .center: cell.midX - width / 2
+        case .trailing: cell.maxX - width
+        }
+        let y = switch gravity.vertical {
+        case .top: cell.minY
+        case .center: cell.midY - height / 2
+        case .bottom: cell.maxY - height
+        }
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    static func labelArea(
+        in cell: CGRect,
+        safeBounds: CGRect,
+        aspectRatio: CGFloat,
+        gravity: VideoGravity = .center
+    ) -> CGRect {
+        let video = videoFrame(
+            in: cell,
+            aspectRatio: aspectRatio,
+            gravity: gravity
+        )
         let intersection = CGRect(x: video.minX, y: cell.minY, width: video.width, height: cell.height).intersection(safeBounds)
         return intersection.isNull ? .zero : intersection
     }
 
     static func labelFrame(in cell: CGRect, safeBounds: CGRect, aspectRatio: CGFloat,
-                           labelSize: CGSize, belowVideo: Bool) -> CGRect {
-        let area = labelArea(in: cell, safeBounds: safeBounds, aspectRatio: aspectRatio)
-        let video = videoFrame(in: cell, aspectRatio: aspectRatio)
+                           labelSize: CGSize, belowVideo: Bool,
+                           gravity: VideoGravity = .center,
+                           anchor: LabelAnchor = .leading) -> CGRect {
+        let area = labelArea(
+            in: cell,
+            safeBounds: safeBounds,
+            aspectRatio: aspectRatio,
+            gravity: gravity
+        )
+        let video = videoFrame(
+            in: cell,
+            aspectRatio: aspectRatio,
+            gravity: gravity
+        )
         let height = min(labelSize.height, area.height)
         let desiredY = belowVideo ? video.maxY : video.maxY - height
         // If there is insufficient letterboxing, overlap the video rather than
         // putting text behind a screen corner or the home indicator.
-        return CGRect(x: area.minX, y: max(area.minY, min(desiredY, area.maxY - height)),
-                      width: min(labelSize.width, area.width), height: height)
+        let width = min(labelSize.width, area.width)
+        let x = anchor == .leading ? area.minX : area.maxX - width
+        return CGRect(x: x, y: max(area.minY, min(desiredY, area.maxY - height)),
+                      width: width, height: height)
     }
 }
 
@@ -102,7 +196,27 @@ struct CameraGroupCameraLabel: View {
     var body: some View {
         Text(name)
             .font(.caption).foregroundStyle(.white).lineLimit(1)
-            .padding(5).background(.black.opacity(0.5))
+            .padding(5)
+            .background(
+                .black.opacity(0.5),
+                ignoresSafeAreaEdges: []
+            )
+    }
+}
+
+/// The container accepts the safe-area-adjusted placement proposal while the
+/// nested label keeps its intrinsic background. This prevents the label's
+/// background from stretching through a bottom or side safe-area inset.
+struct CameraGroupCameraLabelContainer: View {
+    let name: String
+    let anchor: CameraGroupLayout.LabelAnchor
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if anchor == .trailing { Spacer(minLength: 0) }
+            CameraGroupCameraLabel(name: name)
+            if anchor == .leading { Spacer(minLength: 0) }
+        }
     }
 }
 
@@ -110,6 +224,8 @@ struct CameraGroupLabelLayout: Layout {
     let safeBounds: CGRect
     let aspectRatio: CGFloat
     let belowVideo: Bool
+    var gravity: CameraGroupLayout.VideoGravity = .center
+    var anchor: CameraGroupLayout.LabelAnchor = .leading
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         proposal.replacingUnspecifiedDimensions()
@@ -118,10 +234,16 @@ struct CameraGroupLabelLayout: Layout {
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
         guard let label = subviews.first else { return }
         let cell = CGRect(origin: .zero, size: bounds.size)
-        let area = CameraGroupLayout.labelArea(in: cell, safeBounds: safeBounds, aspectRatio: aspectRatio)
+        let area = CameraGroupLayout.labelArea(
+            in: cell,
+            safeBounds: safeBounds,
+            aspectRatio: aspectRatio,
+            gravity: gravity
+        )
         let size = label.sizeThatFits(ProposedViewSize(width: area.width, height: nil))
         let frame = CameraGroupLayout.labelFrame(in: cell, safeBounds: safeBounds, aspectRatio: aspectRatio,
-                                                labelSize: size, belowVideo: belowVideo)
+                                                labelSize: size, belowVideo: belowVideo,
+                                                gravity: gravity, anchor: anchor)
         label.place(at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY),
                     anchor: .topLeading, proposal: ProposedViewSize(frame.size))
     }
@@ -176,10 +298,21 @@ struct CameraGroupVideo: View {
                 Color.black
                 ForEach(Array(group.sessions.enumerated()), id: \.element.id) { index, session in
                     if cells.indices.contains(index) {
+                        let gravity = CameraGroupLayout.videoGravity(
+                            index: index,
+                            count: group.sessions.count,
+                            arrangement: arrangement
+                        )
+                        let labelAnchor = CameraGroupLayout.labelAnchor(
+                            index: index,
+                            arrangement: arrangement
+                        )
                         CameraGroupPane(session: session, group: group, cameraControlsEnabled: cameraControlsEnabled,
                             controlsVisible: controlsVisible,
                             isAccessAllowed: isAccessAllowed,
                             safeBounds: safeBounds.offsetBy(dx: -cells[index].minX, dy: -cells[index].minY),
+                            videoGravity: gravity,
+                            labelAnchor: labelAnchor,
                             labelBelowVideo: CameraGroupLayout.labelsBelowVideo(count: group.sessions.count, arrangement: arrangement),
                             onSingleTap: onSingleTap)
                             .frame(width: cells[index].width, height: cells[index].height)
@@ -204,13 +337,18 @@ private struct CameraGroupPane: View {
     let controlsVisible: Bool
     let isAccessAllowed: Bool
     let safeBounds: CGRect
+    let videoGravity: CameraGroupLayout.VideoGravity
+    let labelAnchor: CameraGroupLayout.LabelAnchor
     let labelBelowVideo: Bool
     let onSingleTap: () -> Void
 
     init(session: CameraGroupSession, group: CameraGroupPlayback, cameraControlsEnabled: Bool,
          controlsVisible: Bool,
          isAccessAllowed: Bool,
-         safeBounds: CGRect, labelBelowVideo: Bool,
+         safeBounds: CGRect,
+         videoGravity: CameraGroupLayout.VideoGravity,
+         labelAnchor: CameraGroupLayout.LabelAnchor,
+         labelBelowVideo: Bool,
          onSingleTap: @escaping () -> Void) {
         self.session = session; self.group = group
         _playback = ObservedObject(wrappedValue: session.playback)
@@ -219,7 +357,10 @@ private struct CameraGroupPane: View {
         self.cameraControlsEnabled = cameraControlsEnabled
         self.controlsVisible = controlsVisible
         self.isAccessAllowed = isAccessAllowed
-        self.safeBounds = safeBounds; self.labelBelowVideo = labelBelowVideo
+        self.safeBounds = safeBounds
+        self.videoGravity = videoGravity
+        self.labelAnchor = labelAnchor
+        self.labelBelowVideo = labelBelowVideo
         self.onSingleTap = onSingleTap
     }
 
@@ -245,7 +386,11 @@ private struct CameraGroupPane: View {
                 usesHistory: !isLive,
                 retry: session.restartLiveVideoIfNeeded
             )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(
+                    maxWidth: .infinity,
+                    maxHeight: .infinity,
+                    alignment: videoGravity.alignment
+                )
                 .background {
                     CameraLiveGestureSurface(videoVisible: group.showsVideo(session), cameraControlsEnabled: gesturesEnabled,
                         onPan: { phase, translation, viewport in session.gestures.pan(phase, translation: translation, viewport: viewport) },
@@ -274,8 +419,17 @@ private struct CameraGroupPane: View {
         .background(Color.black)
         .overlay {
             if group.hasMultipleCameras && controlsVisible {
-                CameraGroupLabelLayout(safeBounds: safeBounds, aspectRatio: liveVideo.aspectRatio, belowVideo: labelBelowVideo) {
-                    CameraGroupCameraLabel(name: session.camera.device.displayName)
+                CameraGroupLabelLayout(
+                    safeBounds: safeBounds,
+                    aspectRatio: liveVideo.aspectRatio,
+                    belowVideo: labelBelowVideo,
+                    gravity: videoGravity,
+                    anchor: labelAnchor
+                ) {
+                    CameraGroupCameraLabelContainer(
+                        name: session.camera.device.displayName,
+                        anchor: labelAnchor
+                    )
                 }
                 .allowsHitTesting(false)
                 .transition(.opacity)

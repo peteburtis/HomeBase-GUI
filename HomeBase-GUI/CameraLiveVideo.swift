@@ -73,19 +73,80 @@ struct CameraVideoDevice: Identifiable, Equatable, Sendable {
     let capability: CameraLiveVideoCapability
 
     var id: String { device.identifier }
+    var artificialFeed: CameraArtificialFeed? {
+        device.metadata[CameraArtificialFeed.metadataKey]?.stringValue
+            .flatMap(CameraArtificialFeed.init(rawValue:))
+    }
+}
+
+enum CameraArtificialFeed: String, CaseIterable, Sendable {
+    static let environmentVariable = "HOMEBASE_ARTIFICIAL_CAMERAS"
+    static let metadataKey = "homeBaseGUIArtificialCameraFeed"
+
+    case red
+    case green
+    case blue
+    case purple
+
+    var color: Color {
+        switch self {
+        case .red: .red
+        case .green: .green
+        case .blue: .blue
+        case .purple: .purple
+        }
+    }
+
+    var displayName: String {
+        "Artificial \(rawValue.capitalized) Camera"
+    }
+
+    static var isEnabledByEnvironment: Bool {
+        guard let value = ProcessInfo.processInfo.environment[environmentVariable]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        else { return false }
+        return !value.isEmpty && !["0", "false", "no", "off"].contains(value)
+    }
 }
 
 enum CameraVideoCatalog {
     static func cameras(
-        in devices: [HBTopologyDeviceDescriptor]
+        in devices: [HBTopologyDeviceDescriptor],
+        includesArtificial: Bool = CameraArtificialFeed.isEnabledByEnvironment
     ) -> [CameraVideoDevice] {
-        devices.compactMap { device in
+        let realCameras: [CameraVideoDevice] = devices.compactMap { device in
             guard let capability = CameraLiveVideoCapability(
                 metadata: device.metadata
             ) else { return nil }
             return CameraVideoDevice(
                 device: device,
                 capability: capability
+            )
+        }
+        guard includesArtificial else { return realCameras }
+        return realCameras + CameraArtificialFeed.allCases.map { feed in
+            let device = HBTopologyDeviceDescriptor(
+                identifier: "homebase-gui-artificial-camera-\(feed.rawValue)",
+                addressableName: "HomeBaseGUIArtificialCamera\(feed.rawValue.capitalized)",
+                displayName: feed.displayName,
+                metadata: [
+                    CameraLiveVideoCapability.availableMetadataKey: .bool(true),
+                    CameraLiveVideoCapability.qualitiesMetadataKey: .array(
+                        HBCameraLiveQuality.allCases.map { .string($0.rawValue) }
+                    ),
+                    CameraLiveVideoCapability.streamPolicyMetadataKey: .object([
+                        "version": .integer(1),
+                    ]),
+                    CameraArtificialFeed.metadataKey: .string(feed.rawValue),
+                ]
+            )
+            return CameraVideoDevice(
+                device: device,
+                capability: CameraLiveVideoCapability(
+                    qualities: Set(HBCameraLiveQuality.allCases),
+                    supportsDefaultQuality: true
+                )
             )
         }
     }
@@ -639,6 +700,7 @@ final class CameraLiveVideoModel: ObservableObject {
     let renderer: CameraH264Renderer
 
     private let deviceIdentifier: String
+    let artificialFeed: CameraArtificialFeed?
     private var quality: CameraLiveQualitySelection
     private let client: HomeBaseWebSocketClient
     private let recordingController: CameraLocalRecordingController?
@@ -653,9 +715,11 @@ final class CameraLiveVideoModel: ObservableObject {
         quality: CameraLiveQualitySelection,
         client: HomeBaseWebSocketClient,
         recordingController: CameraLocalRecordingController? = nil,
-        playbackController: CameraLivePlaybackController? = nil
+        playbackController: CameraLivePlaybackController? = nil,
+        artificialFeed: CameraArtificialFeed? = nil
     ) {
         self.deviceIdentifier = deviceIdentifier
+        self.artificialFeed = artificialFeed
         self.quality = quality
         self.client = client
         self.recordingController = recordingController
@@ -671,6 +735,17 @@ final class CameraLiveVideoModel: ObservableObject {
     func run(access: CameraAccessSession? = nil) async {
         guard state == .idle, !Task.isCancelled else { return }
         let token = runOwnership.begin()
+        if artificialFeed != nil {
+            state = .playing
+            do {
+                while runOwnership.isCurrent(token), !Task.isCancelled {
+                    try await Task.sleep(for: .seconds(3_600))
+                }
+            } catch {}
+            let completion = runOwnership.finish(token)
+            if completion.wasCurrent { state = .idle }
+            return
+        }
         state = .connecting
         qualityWarning = nil
         var ownedArbiter: CameraStreamArbiter?
@@ -933,6 +1008,7 @@ struct CameraLiveVideoPlayer: View {
         restartRequest: Int = 0,
         recordingController: CameraLocalRecordingController? = nil,
         playbackController: CameraLivePlaybackController? = nil,
+        artificialFeed: CameraArtificialFeed? = nil,
         usesHistory: Bool = false,
         onStateChanged: ((CameraLiveVideoModel.State) -> Void)? = nil,
         onAspectRatioChanged: ((CGFloat) -> Void)? = nil
@@ -942,7 +1018,8 @@ struct CameraLiveVideoPlayer: View {
             quality: quality,
             client: client,
             recordingController: recordingController,
-            playbackController: playbackController
+            playbackController: playbackController,
+            artificialFeed: artificialFeed
         ))
         self.allowsRetry = allowsRetry
         self.isStreamEnabled = isStreamEnabled
@@ -1013,7 +1090,10 @@ struct CameraLiveVideoSurface: View {
         ZStack {
             Color.black
                 .allowsHitTesting(false)
-            if usesHistory || model.state.displaysVideo {
+            if let artificialFeed = model.artificialFeed, !usesHistory {
+                artificialFeed.color
+                    .allowsHitTesting(false)
+            } else if usesHistory || model.state.displaysVideo {
                 CameraSampleBufferView(renderer: model.renderer)
                     .allowsHitTesting(false)
             }
@@ -1218,8 +1298,8 @@ final class CameraLiveGestureUIView: UIView {
     }
 
     private func updateRecognizerAvailability() {
-        isUserInteractionEnabled = videoVisible
-        singleTapRecognizer.isEnabled = videoVisible
+        isUserInteractionEnabled = true
+        singleTapRecognizer.isEnabled = true
         panRecognizer.isEnabled = videoVisible && cameraControlsEnabled
         pinchRecognizer.isEnabled = videoVisible && cameraControlsEnabled && onMagnify != nil
         twoFingerTapRecognizer.isEnabled = videoVisible && cameraControlsEnabled
@@ -1253,7 +1333,6 @@ final class CameraLiveGestureUIView: UIView {
     }
 
     @objc private func singleTapped() {
-        guard videoVisible else { return }
         onSingleTap?()
     }
 
@@ -1349,7 +1428,7 @@ struct CameraLiveGestureSurface: View {
                 )
                 .simultaneousGesture(
                     TapGesture().onEnded(onSingleTap),
-                    including: videoVisible ? .all : .none
+                    including: .all
                 )
 
             if videoVisible, cameraControlsEnabled, let onMagnify {
@@ -1371,7 +1450,7 @@ struct CameraLiveGestureSurface: View {
                 surface
             }
         }
-        .allowsHitTesting(videoVisible)
+        .allowsHitTesting(true)
         .onChange(of: videoVisible && cameraControlsEnabled) { _, enabled in
             if !enabled {
                 isDragging = false
@@ -1428,6 +1507,38 @@ private enum CameraRecordingSystemPresentation: Identifiable {
             "files-\(recordings.map(\.id.uuidString).joined(separator: "-"))"
         case .share(let recordings):
             "share-\(recordings.map(\.id.uuidString).joined(separator: "-"))"
+        }
+    }
+}
+
+struct CameraRecordingExportPresentation: Identifiable, Equatable {
+    let id: UUID
+    let recordings: [CameraLocalRecording]
+
+    init(
+        recordings: [CameraLocalRecording],
+        id: UUID = UUID()
+    ) {
+        self.recordings = recordings
+        self.id = id
+    }
+}
+
+struct CameraRecordingExportTrigger: Equatable {
+    let recordingIDs: [UUID]
+    let isBusy: Bool
+    let errorMessage: String?
+}
+
+private struct CameraRecordingControlStyle: ViewModifier {
+    let isProminent: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isProminent {
+            content.buttonStyle(.glassProminent)
+        } else {
+            content
         }
     }
 }
@@ -1621,6 +1732,18 @@ private struct CameraFullScreenCameraContent: View {
         recordingControllers.compactMap(\.pendingRecording)
     }
 
+    private var pendingRecordingIDs: [UUID] {
+        pendingRecordings.map(\.id)
+    }
+
+    private var recordingExportTrigger: CameraRecordingExportTrigger {
+        CameraRecordingExportTrigger(
+            recordingIDs: pendingRecordingIDs,
+            isBusy: recordingIsBusy,
+            errorMessage: recordingErrorMessage
+        )
+    }
+
     private var recordingIsActive: Bool {
         recordingControllers.contains(where: \.isRecording)
     }
@@ -1651,7 +1774,8 @@ private struct CameraFullScreenCameraContent: View {
         recordingControllers.reduce(0) { $0 + $1.successfulExportCount }
     }
 
-    @State private var recordingExportPresented = false
+    @State private var recordingExportPresentation:
+        CameraRecordingExportPresentation?
     @State private var recordingSystemPresentation: CameraRecordingSystemPresentation?
 #endif
     @StateObject private var toolbarScrubRelay = CameraToolbarScrubRelay()
@@ -1716,7 +1840,6 @@ private struct CameraFullScreenCameraContent: View {
         }
         .onChange(of: isShowingVideo, initial: true) { _, showsVideo in
             if !showsVideo {
-                controlsVisible = true
                 stopLiveCameraGestures()
             }
         }
@@ -1895,7 +2018,10 @@ private struct CameraFullScreenCameraContent: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay(alignment: .top) {
             if timelineVisible, panel != .ptz,
-               let metadata = CameraPlaybackHistoryAvailability.metadata(in: controlsModel.deviceMetadata) {
+               let timelineSession,
+               let metadata = CameraPlaybackHistoryAvailability.metadata(
+                   in: timelineSession.controls.deviceMetadata
+               ) {
                 CameraTimelinePlacement(
                     edge: .top
                 ) {
@@ -1907,7 +2033,13 @@ private struct CameraFullScreenCameraContent: View {
                             await CameraHistorySources.thumbnails(metadata: metadata, client: client, credentials: access.session?.unlockedCredentials)
                         }, source: .init(metadata: metadata, credentials: access.session?.unlockedCredentials),
                             cameraID: metadata.cameraID, timeZone: playbackTimeZone,
-                            position: { group.active ? group.positionForSwitch() : playbackController.positionForCameraSwitch(metadata: controlsModel.deviceMetadata) },
+                            position: {
+                                group.active
+                                    ? group.positionForSwitch()
+                                    : timelineSession.playback.positionForCameraSwitch(
+                                        metadata: timelineSession.controls.deviceMetadata
+                                    )
+                            },
                             onBegin: {
                                 guard playbackActionsEnabled else { return }
                                 cancelHistoryRestore()
@@ -1950,9 +2082,7 @@ private struct CameraFullScreenCameraContent: View {
         .animation(reduceMotion ? nil : .snappy, value: panel)
         .animation(reduceMotion ? nil : .snappy, value: timelineVisible)
         .accessibilityActions {
-            if isShowingVideo {
-                Button("Toggle player controls", action: toggleControls)
-            }
+            Button("Toggle player controls", action: toggleControls)
         }
     }
 
@@ -2178,7 +2308,7 @@ private struct CameraFullScreenCameraContent: View {
             cameraPickerVisible = true
         } label: {
             if switchingCamera { ProgressView() }
-            else { Image(systemName: "video.fill") }
+        else { Image(systemName: "video") }
         }
         .accessibilityLabel("Choose camera")
         .accessibilityValue(group.active ? group.sessions.map { $0.camera.device.displayName }.joined(separator: ", ") : device.displayName)
@@ -2230,10 +2360,7 @@ private struct CameraFullScreenCameraContent: View {
                     try await Task.sleep(for: .milliseconds(50))
                 }
                 guard recordingErrorMessage == nil else { return }
-                guard pendingRecordings.isEmpty else {
-                    recordingExportPresented = true
-                    return
-                }
+                guard pendingRecordings.isEmpty else { return }
 #endif
                 let destination: CameraSwitchPosition
                 if case .relative = departure {
@@ -2252,24 +2379,55 @@ private struct CameraFullScreenCameraContent: View {
     }
 
 #if os(iOS)
-    @ViewBuilder
     private var recordingControl: some View {
-        if recordingIsActive {
-            recordingButton
-                .buttonStyle(.glassProminent)
-        } else {
-            recordingButton
-        }
+        recordingButton
+            .modifier(CameraRecordingControlStyle(
+                isProminent: recordingIsActive
+            ))
+            .popover(
+                item: $recordingExportPresentation,
+                attachmentAnchor: .rect(.bounds)
+            ) { presentation in
+                CameraRecordingExportPopover(
+                    recordings: presentation.recordings,
+                    saveToPhotos: saveRecordingToPhotos,
+                    saveToFiles: {
+                        presentSystemRecordingExport(
+                            .files(presentation.recordings)
+                        )
+                    },
+                    share: {
+                        presentSystemRecordingExport(
+                            .share(presentation.recordings)
+                        )
+                    },
+                    delete: discardRecordingExport
+                )
+                .presentationCompactAdaptation(.popover)
+                .interactiveDismissDisabled()
+            }
+            .task(id: recordingExportTrigger) {
+                guard !recordingExportTrigger.recordingIDs.isEmpty,
+                      !recordingExportTrigger.isBusy,
+                      recordingExportTrigger.errorMessage == nil,
+                      recordingExportPresentation == nil,
+                      recordingSystemPresentation == nil
+                else { return }
+                // In regular height the primary-action toolbar is rebuilt
+                // when the neighboring camera control disappears. Present
+                // only after this placement's new anchor has mounted.
+                await Task.yield()
+                presentRecordingExport()
+            }
     }
 
     private var recordingButton: some View {
         Button {
             if !pendingRecordings.isEmpty {
-                recordingExportPresented = true
+                presentRecordingExport()
             } else if recordingIsActive {
                 Task {
                     await stopRecording()
-                    recordingExportPresented = !pendingRecordings.isEmpty
                 }
             } else {
                 guard cameraControlsEnabled else { return }
@@ -2295,26 +2453,6 @@ private struct CameraFullScreenCameraContent: View {
                 : "Record video"
         )
         .accessibilityValue(recordingAccessibilityValue)
-        .popover(
-            isPresented: $recordingExportPresented,
-            attachmentAnchor: .rect(.bounds)
-        ) {
-            if !pendingRecordings.isEmpty {
-                CameraRecordingExportPopover(
-                    recordings: pendingRecordings,
-                    saveToPhotos: saveRecordingToPhotos,
-                    saveToFiles: {
-                        presentSystemRecordingExport(.files(pendingRecordings))
-                    },
-                    share: {
-                        presentSystemRecordingExport(.share(pendingRecordings))
-                    },
-                    delete: discardRecordingExport
-                )
-                .presentationCompactAdaptation(.popover)
-                .interactiveDismissDisabled()
-            }
-        }
     }
 
     @ViewBuilder
@@ -2379,7 +2517,7 @@ private struct CameraFullScreenCameraContent: View {
     }
 
     private func saveRecordingToPhotos() {
-        recordingExportPresented = false
+        recordingExportPresentation = nil
         Task {
             for controller in recordingControllers
             where controller.pendingRecording != nil {
@@ -2393,7 +2531,7 @@ private struct CameraFullScreenCameraContent: View {
     private func presentSystemRecordingExport(
         _ presentation: CameraRecordingSystemPresentation
     ) {
-        recordingExportPresented = false
+        recordingExportPresentation = nil
         Task { @MainActor in
             await Task.yield()
             recordingSystemPresentation = presentation
@@ -2407,15 +2545,23 @@ private struct CameraFullScreenCameraContent: View {
         } else if !pendingRecordings.isEmpty {
             Task { @MainActor in
                 await Task.yield()
-                recordingExportPresented = true
+                presentRecordingExport()
             }
         }
     }
 
     private func discardRecordingExport() {
-        recordingExportPresented = false
+        recordingExportPresentation = nil
         recordingSystemPresentation = nil
         recordingControllers.forEach { $0.discardPendingRecording() }
+    }
+
+    private func presentRecordingExport() {
+        let recordings = pendingRecordings
+        guard !recordings.isEmpty else { return }
+        recordingExportPresentation = CameraRecordingExportPresentation(
+            recordings: recordings
+        )
     }
 
     private var recordingErrorIsPresented: Binding<Bool> {
@@ -2424,9 +2570,6 @@ private struct CameraFullScreenCameraContent: View {
             set: { isPresented in
                 if !isPresented {
                     recordingControllers.forEach { $0.dismissError() }
-                    if !pendingRecordings.isEmpty {
-                        recordingExportPresented = true
-                    }
                 }
             }
         )
@@ -2435,13 +2578,19 @@ private struct CameraFullScreenCameraContent: View {
 
     private var panelAvailability: CameraPlayerPanelAvailability {
         CameraPlayerPanelAvailability(
-            historyAvailable: CameraPlaybackHistoryAvailability.isAvailable(in: controlsModel.deviceMetadata),
+            historyAvailable: group.active
+                ? group.hasHistory
+                : primary.historyAvailable,
             ptzSupported: CameraDetailControlSet(controls: controlsModel.controls).hasPTZ,
             isLive: cameraControlsEnabled, isMultiple: group.hasMultipleCameras)
     }
 
     private var timelineVisible: Bool { !isLive }
     private var timelinePresented: Bool { timelineVisible && visiblePlayerControls }
+    private var timelineSession: CameraGroupSession? {
+        if group.active { return group.historySourceSession }
+        return primary.historyAvailable ? primary : nil
+    }
 
 #if os(iOS)
     private var toolbarArrangement: CameraToolbarArrangement {
@@ -2588,7 +2737,10 @@ private struct CameraFullScreenCameraContent: View {
     private var canControlPlayback: Bool { group.active ? group.canControlPlayback : playbackController.canControlPlayback }
     private var activeControls: LiveDeviceControlsModel { group.hasMultipleCameras ? group.sharedControls : controlsModel }
     private var isShowingVideo: Bool { group.active ? group.allPanesShowVideo : interactionPresentation.showsVideo }
-    private var visiblePlayerControls: Bool { access.isUnlocked && (!isShowingVideo || controlsVisible) }
+    private var visiblePlayerControls: Bool {
+        access.isUnlocked
+            && interactionPresentation.controlsVisible(requested: controlsVisible)
+    }
 
     private var lockedS3Destination: CameraS3Destination? {
         for session in group.sessions {
@@ -2604,7 +2756,10 @@ private struct CameraFullScreenCameraContent: View {
     }
 
     private var playbackTimeZone: TimeZone {
-        CameraHistoryTimestamp.timeZone(in: group.active ? (group.sessions.first?.controls.deviceMetadata ?? [:]) : controlsModel.deviceMetadata)
+        CameraHistoryTimestamp.timeZone(
+            in: timelineSession?.controls.deviceMetadata
+                ?? controlsModel.deviceMetadata
+        )
     }
 
     private var playbackSpeedControl: some View {
@@ -2721,7 +2876,9 @@ private struct CameraFullScreenCameraContent: View {
 
     private func toggleControls() {
         withAnimation(.snappy) {
-            controlsVisible = isShowingVideo ? !controlsVisible : true
+            controlsVisible = interactionPresentation.togglingControls(
+                from: controlsVisible
+            )
         }
     }
 

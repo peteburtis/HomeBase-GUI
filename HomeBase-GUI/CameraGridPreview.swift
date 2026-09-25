@@ -194,7 +194,8 @@ struct CameraGridPreview: View {
                 quality: CameraLiveQualitySelection(camera.capability.previewQuality),
                 client: client,
                 allowsRetry: false,
-                isStreamEnabled: isActive
+                isStreamEnabled: isActive,
+                artificialFeed: camera.artificialFeed
             )
             .frame(maxWidth: .infinity)
             .background(Color.black)

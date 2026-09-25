@@ -87,18 +87,29 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
         XCTAssertEqual(Set(state.identitySamples).count, 1)
     }
 
-    func testStatusScreenDisablesAllNativeVideoRecognizersAndHitTesting() async throws {
+    func testStatusScreenKeepsSingleTapButDisablesCameraGestures() async throws {
         let surface = CameraLiveGestureUIView()
         surface.onMagnify = { _, _ in }
         surface.videoVisible = false
         let recognizers = try XCTUnwrap(surface.gestureRecognizers)
         XCTAssertEqual(recognizers.count, 4)
-        XCTAssertTrue(recognizers.allSatisfy { !$0.isEnabled })
-        XCTAssertFalse(surface.isUserInteractionEnabled)
+        let pan = try XCTUnwrap(recognizers.compactMap { $0 as? UIPanGestureRecognizer }.first)
+        let pinch = try XCTUnwrap(recognizers.compactMap { $0 as? UIPinchGestureRecognizer }.first)
+        let taps = recognizers.compactMap { $0 as? UITapGestureRecognizer }
+        let singleTap = try XCTUnwrap(taps.first { $0.numberOfTouchesRequired == 1 })
+        let recenter = try XCTUnwrap(taps.first { $0.numberOfTouchesRequired == 2 })
+        XCTAssertTrue(surface.isUserInteractionEnabled)
+        XCTAssertTrue(singleTap.isEnabled)
+        XCTAssertFalse(pan.isEnabled)
+        XCTAssertFalse(pinch.isEnabled)
+        XCTAssertFalse(recenter.isEnabled)
         // Camera capability/callback refreshes must not reactivate the background.
         surface.cameraControlsEnabled = true
         surface.onMagnify = { _, _ in }
-        XCTAssertTrue(recognizers.allSatisfy { !$0.isEnabled })
+        XCTAssertTrue(singleTap.isEnabled)
+        XCTAssertFalse(pan.isEnabled)
+        XCTAssertFalse(pinch.isEnabled)
+        XCTAssertFalse(recenter.isEnabled)
         surface.videoVisible = true
         XCTAssertTrue(surface.isUserInteractionEnabled)
         XCTAssertTrue(recognizers.allSatisfy(\.isEnabled))
