@@ -51,7 +51,7 @@ struct DeviceDetailView: View {
                             quality: CameraLiveQualitySelection(cameraCapability.previewQuality),
                             client: client,
                             allowsRetry: false,
-                            isStreamEnabled: !isShowingFullScreenVideo,
+                            isStreamEnabled: access.canStream && !isShowingFullScreenVideo,
                             restartRequest: videoRestartRequest
                         )
                         .clipShape(RoundedRectangle(cornerRadius: 10))

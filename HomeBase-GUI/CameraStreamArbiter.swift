@@ -44,7 +44,10 @@ nonisolated enum CameraLiveQualitySelection: String, CaseIterable, Comparable, S
 nonisolated final class CameraStreamAuthorization: @unchecked Sendable {
     private let lock = NSLock()
     private var valid = true
+    private let camera: String?
+    init(camera: String? = nil) { self.camera = camera }
     var isValid: Bool { lock.lock(); defer { lock.unlock() }; return valid }
+    func permits(camera: String) -> Bool { isValid && (self.camera == nil || self.camera == camera) }
     func invalidate() { lock.lock(); valid = false; lock.unlock() }
 }
 
@@ -90,10 +93,11 @@ actor CameraStreamArbiter {
     }
     private final class Consumer {
         var quality: CameraLiveQualitySelection
+        let authorization: CameraStreamAuthorization?
         let continuation: AsyncThrowingStream<CameraStreamEvent, Error>.Continuation
         var joinedGeneration: UInt32?
-        init(_ quality: CameraLiveQualitySelection, _ continuation: AsyncThrowingStream<CameraStreamEvent, Error>.Continuation) {
-            self.quality = quality; self.continuation = continuation
+        init(_ quality: CameraLiveQualitySelection, _ continuation: AsyncThrowingStream<CameraStreamEvent, Error>.Continuation, authorization: CameraStreamAuthorization?) {
+            self.quality = quality; self.continuation = continuation; self.authorization = authorization
         }
     }
     private final class Worker {
@@ -110,18 +114,17 @@ actor CameraStreamArbiter {
         init(_ quality: CameraLiveQualitySelection) { self.quality = quality }
     }
     private final class Entry {
-        let authorization: CameraStreamAuthorization?
         var consumers: [UUID: Consumer] = [:]
         var workers: [UUID: Worker] = [:]
         var current: UUID?
         var candidate: UUID?
         var idle: Task<Void, Never>?
         var idleToken: UUID?
+        var idleAuthorization: CameraStreamAuthorization?
         var delayed: Task<Void, Never>?
         var delayToken: UUID?
         var retryCount = 0
         var requested: CameraLiveQualitySelection?
-        init(_ authorization: CameraStreamAuthorization?) { self.authorization = authorization }
     }
     private let open: Open
     private let sleep: Sleep
@@ -138,14 +141,15 @@ actor CameraStreamArbiter {
         try Task.checkCancellation()
         // Keep the advertised address intact: the server's initial device
         // lookup is case-sensitive even though its internal fanout key is not.
-        guard !closed, authorization?.isValid != false else { throw CameraStreamError.closed }
-        if let old = entries[camera], old.authorization !== authorization { remove(camera, error: CancellationError()) }
-        let entry = entries[camera] ?? Entry(authorization)
+        guard !closed, authorization?.permits(camera: camera) != false else { throw CameraStreamError.closed }
+        if let old = entries[camera] { pruneRevokedConsumers(camera, old) }
+        let entry = entries[camera] ?? Entry()
         entries[camera] = entry
         entry.idle?.cancel(); entry.idle = nil; entry.idleToken = nil
+        entry.idleAuthorization = nil
         let id = UUID()
         let pair = AsyncThrowingStream<CameraStreamEvent, Error>.makeStream(bufferingPolicy: .bufferingNewest(policy.consumerQueue))
-        let consumer = Consumer(quality, pair.continuation)
+        let consumer = Consumer(quality, pair.continuation, authorization: authorization)
         entry.consumers[id] = consumer
         pair.continuation.onTermination = { [weak self] _ in Task { await self?.unsubscribe(camera: camera, id: id) } }
         if let current = entry.current.flatMap({ entry.workers[$0] }), !current.gop.isEmpty { prime(consumer, worker: current) }
@@ -161,9 +165,11 @@ actor CameraStreamArbiter {
     func unsubscribe(camera: String, id: UUID, immediately: Bool = false) {
         guard let entry = entries[camera], let consumer = entry.consumers.removeValue(forKey: id) else { return }
         consumer.continuation.finish()
-        guard entry.authorization?.isValid != false else { remove(camera, error: CancellationError()); return }
         if entry.consumers.isEmpty {
-            if immediately { remove(camera, error: CancellationError()); return }
+            if immediately || consumer.authorization?.isValid == false {
+                remove(camera, error: CancellationError()); return
+            }
+            entry.idleAuthorization = consumer.authorization
             entry.delayed?.cancel(); entry.delayed = nil; entry.delayToken = nil
             if let candidate = entry.candidate { retire(entry, id: candidate) }
             entry.candidate = nil
@@ -188,7 +194,24 @@ actor CameraStreamArbiter {
     }
     func revoke(_ authorization: CameraStreamAuthorization) {
         authorization.invalidate()
-        for camera in Array(entries.keys) where entries[camera]?.authorization === authorization { remove(camera, error: CancellationError()) }
+        for (camera, entry) in Array(entries) { reconcile(camera, entry) }
+    }
+
+    /// Authorization belongs to each consumer: an explicit, camera-scoped PiP
+    /// lease may survive while the ordinary foreground lease is revoked.
+    private func pruneRevokedConsumers(_ camera: String, _ entry: Entry) {
+        // A foreground view can disappear just before its access scope locks.
+        // Its handoff-grace stream must not survive that lock with no consumers.
+        if entry.consumers.isEmpty, entry.idleAuthorization?.isValid == false {
+            remove(camera, error: CancellationError()); return
+        }
+        var removed = false
+        for (id, consumer) in Array(entry.consumers) where consumer.authorization?.isValid == false {
+            entry.consumers[id] = nil
+            consumer.continuation.finish(throwing: CancellationError())
+            removed = true
+        }
+        if removed && entry.consumers.isEmpty { remove(camera, error: CancellationError()) }
     }
     func shutdown() {
         closed = true
@@ -209,7 +232,8 @@ actor CameraStreamArbiter {
 
     private func reconcile(_ camera: String, _ entry: Entry, allowDowngrade: Bool = false) {
         guard entries[camera] === entry else { return }
-        guard entry.authorization?.isValid != false else { remove(camera, error: CancellationError()); return }
+        pruneRevokedConsumers(camera, entry)
+        guard entries[camera] === entry else { return }
         guard let desired = entry.consumers.values.map(\.quality).max() else { return }
         if entry.requested != desired {
             entry.requested = desired; entry.retryCount = 0
@@ -292,7 +316,8 @@ actor CameraStreamArbiter {
 
     private func receive(_ incoming: HBMediaFrame, camera: String, entry: Entry, worker: Worker) throws -> Bool {
         guard entries[camera] === entry, !worker.retiring else { return false }
-        guard entry.authorization?.isValid != false else { remove(camera, error: CancellationError()); return false }
+        pruneRevokedConsumers(camera, entry)
+        guard entries[camera] === entry else { return false }
         var frame = incoming
         switch frame.type {
         case .streamConfiguration:
@@ -345,6 +370,7 @@ actor CameraStreamArbiter {
         return true
     }
     private func prime(_ consumer: Consumer, worker: Worker) {
+        guard consumer.authorization?.isValid != false else { return }
         guard let configuration = worker.configuration, !worker.gop.isEmpty else { return }
         consumer.joinedGeneration = worker.generation
         consumer.continuation.yield(.frames([configuration] + worker.gop))
@@ -353,6 +379,11 @@ actor CameraStreamArbiter {
         for (id, consumer) in Array(entry.consumers) { deliver(event, consumer: consumer, camera: camera, id: id) }
     }
     private func deliver(_ event: CameraStreamEvent, consumer: Consumer, camera: String, id: UUID) {
+        guard consumer.authorization?.isValid != false else {
+            consumer.continuation.finish(throwing: CancellationError())
+            unsubscribe(camera: camera, id: id, immediately: true)
+            return
+        }
         switch consumer.continuation.yield(event) {
         case .enqueued: break
         case .dropped:

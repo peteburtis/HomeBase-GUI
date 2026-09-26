@@ -36,6 +36,22 @@ struct CameraAccessPresentation {
     let isAuthenticating: Bool
     let errorMessage: String?
 
+    /// Retained PiP authentication is not permission to restart foreground
+    /// streams during background -> inactive, before the lifecycle resumes them.
+    /// Store this in the snapshot so nested views receive a changed input even
+    /// when every authentication field (and the session reference) is unchanged.
+    let canStream: Bool
+
+    init(session: CameraAccessSession?, isAuthorized: Bool, isUnlocked: Bool,
+         isAuthenticating: Bool, errorMessage: String?) {
+        self.session = session
+        self.isAuthorized = isAuthorized
+        self.isUnlocked = isUnlocked
+        self.isAuthenticating = isAuthenticating
+        self.errorMessage = errorMessage
+        canStream = isAuthorized && session?.streamsSuspended != true
+    }
+
     /// Authentication is normally quick. Keep initial entry, in-flight retries,
     /// and temporary system-UI concealment blank; offer recovery only on failure.
     var showsUnlockRecovery: Bool {
@@ -174,6 +190,13 @@ final class CameraAccessLifecycle: ObservableObject {
     let session: CameraAccessSession
     private var owners: Set<UUID> = []
     private var isBackgrounded = false
+    private var hasActivePictureInPicture = false
+    private var isRestoringPictureInPicture = false
+    private var restorationTimeout: Task<Void, Never>?
+
+    private var retainsAccessForPictureInPicture: Bool {
+        hasActivePictureInPicture || isRestoringPictureInPicture
+    }
 
     init(session: CameraAccessSession? = nil) {
         self.session = session ?? CameraAccessSession()
@@ -184,12 +207,15 @@ final class CameraAccessLifecycle: ObservableObject {
             let wasEmpty = owners.isEmpty
             owners.insert(owner)
             if wasEmpty && !isBackgrounded {
+                session.resumeStreams()
                 session.enter()
             }
+            finishRestorationHandoffIfReady()
         } else {
             let removed = owners.remove(owner) != nil
             if removed && owners.isEmpty {
-                session.lock()
+                session.suspendStreams()
+                lockIfUnowned()
             }
         }
     }
@@ -198,12 +224,15 @@ final class CameraAccessLifecycle: ObservableObject {
         switch phase {
         case .background:
             isBackgrounded = true
-            session.lock()
+            session.suspendStreams()
+            lockIfUnowned()
         case .active:
+            session.resumeStreams()
             if isBackgrounded && !owners.isEmpty {
                 session.enter()
             }
             isBackgrounded = false
+            finishRestorationHandoffIfReady()
         case .inactive:
             break
         @unknown default:
@@ -211,9 +240,66 @@ final class CameraAccessLifecycle: ObservableObject {
         }
     }
 
+    func pictureInPictureStarted() {
+        // Retain an existing grant only; PiP can never manufacture authorization.
+        guard session.isUnlocked else { return }
+        hasActivePictureInPicture = true
+    }
+
+    func pictureInPictureStopped() {
+        hasActivePictureInPicture = false
+        lockIfUnowned()
+    }
+
+    func pictureInPictureWillRestore() {
+        guard hasActivePictureInPicture, session.isUnlocked else { return }
+        isRestoringPictureInPicture = true
+        restorationTimeout?.cancel()
+        restorationTimeout = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(15))
+            guard !Task.isCancelled else { return }
+            self?.pictureInPictureRestorationCompleted(false)
+        }
+    }
+
+    func pictureInPictureRestorationCompleted(_ success: Bool) {
+        if success {
+            finishRestorationHandoffIfReady()
+        } else {
+            endRestorationHandoff()
+            lockIfUnowned()
+        }
+    }
+
+    private func finishRestorationHandoffIfReady() {
+        // Native PiP may stop before the scene is active or the reopened
+        // viewer's access scope appears. Bridge both event orders without a
+        // second Face ID prompt or a temporary release of S3 credentials.
+        guard isRestoringPictureInPicture, !isBackgrounded, !owners.isEmpty else { return }
+        endRestorationHandoff()
+    }
+
+    private func endRestorationHandoff() {
+        restorationTimeout?.cancel()
+        restorationTimeout = nil
+        isRestoringPictureInPicture = false
+    }
+
+    private func lockIfUnowned() {
+        if !retainsAccessForPictureInPicture && (isBackgrounded || owners.isEmpty) {
+            session.lock()
+        }
+    }
+
+    func protectedDataWillBecomeUnavailable() {
+        hasActivePictureInPicture = false
+        endRestorationHandoff()
+        session.lock()
+    }
+
     func reset() {
         owners.removeAll()
-        session.lock()
+        protectedDataWillBecomeUnavailable()
     }
 }
 

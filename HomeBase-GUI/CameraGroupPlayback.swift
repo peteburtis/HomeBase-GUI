@@ -174,7 +174,7 @@ final class CameraGroupSession: ObservableObject, Identifiable {
 #if os(iOS)
     let recordingController: CameraLocalRecordingController
 #endif
-    private let client: HomeBaseWebSocketClient
+    let client: HomeBaseWebSocketClient
     private let resources: CameraSessionResourceCoordinator
     private var observations: Set<AnyCancellable> = []
     private var resourceAccess: CameraAccessSession?

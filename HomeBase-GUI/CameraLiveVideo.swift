@@ -394,6 +394,7 @@ final class CameraH264Renderer: ObservableObject {
     }
 
     let layer = AVSampleBufferDisplayLayer()
+    var suppressesDisplay = false
     private var formatDescription: CMVideoFormatDescription?
     private var generation: UInt32?
     private var timeScale: Int32 = 90_000
@@ -563,7 +564,7 @@ final class CameraH264Renderer: ObservableObject {
         ) as? [NSMutableDictionary],
            let attachment = attachments.first {
             attachment[kCMSampleAttachmentKey_DisplayImmediately] = true
-            attachment[kCMSampleAttachmentKey_DoNotDisplay] = !display
+            attachment[kCMSampleAttachmentKey_DoNotDisplay] = !display || suppressesDisplay
             attachment[kCMSampleAttachmentKey_NotSync] =
                 !frame.flags.contains(.keyFrame)
         }
@@ -732,7 +733,7 @@ final class CameraLiveVideoModel: ObservableObject {
         if let arbiter, let subscription { await arbiter.update(subscription, quality: quality) }
     }
 
-    func run(access: CameraAccessSession? = nil) async {
+    func run(access: CameraAccessSession? = nil, authorization explicitAuthorization: CameraStreamAuthorization? = nil) async {
         guard state == .idle, !Task.isCancelled else { return }
         let token = runOwnership.begin()
         if artificialFeed != nil {
@@ -758,7 +759,7 @@ final class CameraLiveVideoModel: ObservableObject {
             let shared = await client.cameraStreamArbiter()
             knownArbiter = shared
             guard runOwnership.isCurrent(token) else { throw CancellationError() }
-            let authorization = try access?.authorizeStreams(shared)
+            let authorization = try explicitAuthorization ?? access?.authorizeStreams(shared)
             let acquired = try await shared.subscribe(camera: deviceIdentifier, quality: quality, authorization: authorization)
             ownedArbiter = shared; ownedSubscription = acquired
             try Task.checkCancellation()
@@ -1468,13 +1469,16 @@ struct CameraLiveGestureSurface: View {
 
 struct CameraFullScreenLiveVideoView: View {
     let client: HomeBaseWebSocketClient
+    @State private var viewerID: UUID
     @StateObject private var selection: CameraScreenSelection
     @StateObject private var cameraPicker: CameraPickerModel
     @State private var panel = CameraPlayerPanel.off
     @State private var controlsVisible = true
 
-    init(device: HBTopologyDeviceDescriptor, quality: CameraLiveQualitySelection, client: HomeBaseWebSocketClient) {
+    init(device: HBTopologyDeviceDescriptor, quality: CameraLiveQualitySelection, client: HomeBaseWebSocketClient,
+         viewerID: UUID = UUID()) {
         self.client = client
+        _viewerID = State(initialValue: viewerID)
         _selection = StateObject(wrappedValue: CameraScreenSelection(device: device, quality: quality))
         _cameraPicker = StateObject(wrappedValue: CameraPickerModel {
             try await client.reactivate()
@@ -1490,6 +1494,7 @@ struct CameraFullScreenLiveVideoView: View {
             NavigationStack {
                 CameraFullScreenCameraContent(device: selection.session.device,
                 quality: selection.session.quality, client: client,
+                viewerID: viewerID, screenSelection: selection,
                 access: access,
                 initialPosition: selection.session.position, cameraPicker: cameraPicker,
                 panel: $panel, controlsVisible: $controlsVisible,
@@ -1695,10 +1700,13 @@ private struct CameraFullScreenCameraContent: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 #if os(iOS)
+    @Environment(\.cameraPictureInPicture) private var pictureInPicture
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 #endif
     let client: HomeBaseWebSocketClient
+    let viewerID: UUID
+    let screenSelection: CameraScreenSelection
     let access: CameraAccessPresentation
     @StateObject private var initialSession: CameraGroupSession
     @StateObject private var group: CameraGroupPlayback
@@ -1789,6 +1797,8 @@ private struct CameraFullScreenCameraContent: View {
         device: HBTopologyDeviceDescriptor,
         quality: CameraLiveQualitySelection,
         client: HomeBaseWebSocketClient,
+        viewerID: UUID,
+        screenSelection: CameraScreenSelection,
         access: CameraAccessPresentation,
         initialPosition: CameraSwitchPosition,
         cameraPicker: CameraPickerModel,
@@ -1798,6 +1808,8 @@ private struct CameraFullScreenCameraContent: View {
         retainCamera: @escaping (CameraVideoDevice, CameraLiveQualitySelection) -> Void
     ) {
         self.client = client
+        self.viewerID = viewerID
+        self.screenSelection = screenSelection
         self.access = access
         self.initialPosition = initialPosition
         self.cameraPicker = cameraPicker
@@ -1820,7 +1832,7 @@ private struct CameraFullScreenCameraContent: View {
     private var cameraPresentation: some View {
         liveVideo
         .onAppear {
-            if !access.isAuthorized {
+            if !access.canStream {
                 group.suspend()
                 group.suspendResources(stopImmediately: true)
             }
@@ -1851,7 +1863,7 @@ private struct CameraFullScreenCameraContent: View {
         .onChange(
             of: CameraLiveVideoLifecycle.isSuspended(
                 in: scenePhase,
-                isStreamEnabled: access.isAuthorized
+                isStreamEnabled: access.canStream
             ),
             initial: true
         ) { _, isSuspended in
@@ -1860,7 +1872,7 @@ private struct CameraFullScreenCameraContent: View {
             if isSuspended {
                 group.suspend()
                 group.suspendResources(
-                    stopImmediately: scenePhase == .background || !access.isAuthorized
+                    stopImmediately: scenePhase == .background || !access.canStream
                 )
             } else {
                 group.resume()
@@ -1997,6 +2009,10 @@ private struct CameraFullScreenCameraContent: View {
         // Animate the bars and the media canvas's safe-area policy together.
         .animation(reduceMotion ? nil : .snappy, value: controlsVisible)
 #if os(iOS)
+        .modifier(CameraPiPViewerRegistration(id: viewerID,
+            cameraIDs: Set(group.sessions.map(\.camera.id)),
+            owner: screenSelection,
+            showControls: { controlsVisible = true }))
         .background {
             CameraToolbarScrubBridge(
                 isEnabled: verticalSizeClass == .compact
@@ -2015,6 +2031,7 @@ private struct CameraFullScreenCameraContent: View {
         CameraGroupVideo(group: group, cameraControlsEnabled: cameraControlsEnabled,
                 controlsVisible: visiblePlayerControls,
                 isAccessAllowed: access.isAuthorized,
+                allowsPictureInPicture: playbackActionsEnabled,
                 onSingleTap: toggleControls)
 
             if visiblePlayerControls && panel == .ptz && panelAvailability.enablesPTZ {
@@ -2092,22 +2109,29 @@ private struct CameraFullScreenCameraContent: View {
         }
     }
 
+    private func closeViewer() {
+#if os(iOS)
+        pictureInPicture?.unregisterViewer(viewerID)
+#endif
+        dismiss()
+    }
+
     @ToolbarContentBuilder
     private var cameraToolbar: some ToolbarContent {
 #if os(iOS)
         if toolbarArrangement.navigationItemsInBottomToolbar {
             ToolbarItem(placement: .bottomBar) {
-                CameraPlayerCloseButton { dismiss() }
+                CameraPlayerCloseButton(action: closeViewer)
             }
             ToolbarSpacer(.fixed, placement: .bottomBar)
         } else {
             ToolbarItem(placement: .navigation) {
-                CameraPlayerCloseButton { dismiss() }
+                CameraPlayerCloseButton(action: closeViewer)
             }
         }
 #else
         ToolbarItem(placement: .navigation) {
-            CameraPlayerCloseButton { dismiss() }
+            CameraPlayerCloseButton(action: closeViewer)
         }
 #endif
 

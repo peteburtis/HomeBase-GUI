@@ -550,6 +550,7 @@ struct CameraGroupVideo: View {
     let cameraControlsEnabled: Bool
     let controlsVisible: Bool
     var isAccessAllowed = true
+    var allowsPictureInPicture = false
     let onSingleTap: () -> Void
 
     var body: some View {
@@ -625,6 +626,7 @@ struct CameraGroupVideo: View {
                         CameraGroupPane(session: session, group: group, cameraControlsEnabled: cameraControlsEnabled,
                             controlsVisible: controlsVisible,
                             isAccessAllowed: isAccessAllowed,
+                            allowsPictureInPicture: allowsPictureInPicture,
                             safeBounds: safeBounds.offsetBy(dx: -cells[index].minX, dy: -cells[index].minY),
                             videoGravity: gravity,
                             labelAnchor: labelAnchor,
@@ -652,6 +654,7 @@ private struct CameraGroupPane: View {
     let cameraControlsEnabled: Bool
     let controlsVisible: Bool
     let isAccessAllowed: Bool
+    let allowsPictureInPicture: Bool
     let safeBounds: CGRect
     let videoGravity: CameraGroupLayout.VideoGravity
     let labelAnchor: CameraGroupLayout.LabelAnchor
@@ -661,6 +664,7 @@ private struct CameraGroupPane: View {
     init(session: CameraGroupSession, group: CameraGroupPlayback, cameraControlsEnabled: Bool,
          controlsVisible: Bool,
          isAccessAllowed: Bool,
+         allowsPictureInPicture: Bool,
          safeBounds: CGRect,
          videoGravity: CameraGroupLayout.VideoGravity,
          labelAnchor: CameraGroupLayout.LabelAnchor,
@@ -673,6 +677,7 @@ private struct CameraGroupPane: View {
         self.cameraControlsEnabled = cameraControlsEnabled
         self.controlsVisible = controlsVisible
         self.isAccessAllowed = isAccessAllowed
+        self.allowsPictureInPicture = allowsPictureInPicture
         self.safeBounds = safeBounds
         self.videoGravity = videoGravity
         self.labelAnchor = labelAnchor
@@ -733,6 +738,11 @@ private struct CameraGroupPane: View {
             }
         }
         .background(Color.black)
+#if os(iOS)
+        .modifier(CameraPiPPane(session: session, isLive: isLive,
+            canStart: isAccessAllowed && allowsPictureInPicture,
+            alignment: videoGravity.alignment))
+#endif
         .overlay {
             if group.hasMultipleCameras && controlsVisible {
                 CameraGroupLabelLayout(

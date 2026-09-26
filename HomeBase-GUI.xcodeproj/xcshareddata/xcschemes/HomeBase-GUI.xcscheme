@@ -65,6 +65,11 @@
       </BuildableProductRunnable>
       <EnvironmentVariables>
          <EnvironmentVariable
+            key = "HOMEBASE_CAMERA_PIP_TEST_FIXTURE"
+            value = "1"
+            isEnabled = "NO">
+         </EnvironmentVariable>
+         <EnvironmentVariable
             key = "HOMEBASE_ARTIFICIAL_CAMERAS"
             value = "1"
             isEnabled = "YES">

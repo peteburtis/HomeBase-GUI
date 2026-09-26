@@ -5,6 +5,35 @@ import LocalAuthentication
 
 @MainActor
 final class CameraAccessSessionTests: XCTestCase {
+    func testExplicitPiPLeaseSurvivesUILockWithoutUnlockingCredentialsOrOtherCameras() async throws {
+        let fixture = Fixture(presence: .biometricProtected)
+        let arbiter = CameraStreamArbiter { _, _ in throw CameraStreamError.ended }
+        XCTAssertThrowsError(try fixture.session.authorizePictureInPicture(camera: "BedroomCamera"))
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        XCTAssertNotNil(fixture.session.unlockedCredentials)
+        let foreground = try fixture.session.authorizeStreams(arbiter)
+        let pip = try fixture.session.authorizePictureInPicture(camera: "BedroomCamera")
+        XCTAssertTrue(pip.permits(camera: "BedroomCamera"))
+        XCTAssertFalse(pip.permits(camera: "OtherCamera"))
+        XCTAssertThrowsError(try fixture.session.authorizePictureInPicture(camera: ""))
+
+        fixture.session.lock()
+        XCTAssertFalse(foreground.isValid)
+        XCTAssertFalse(fixture.session.isUnlocked)
+        XCTAssertNil(fixture.session.unlockedCredentials)
+        XCTAssertTrue(pip.permits(camera: "BedroomCamera"))
+        XCTAssertThrowsError(try fixture.session.authorizePictureInPicture(camera: "OtherCamera"))
+        XCTAssertThrowsError(try fixture.session.authorizeStreams(arbiter))
+        do {
+            _ = try await fixture.session.unlockCredentials()
+            XCTFail("The PiP exception must not authorize Keychain access")
+        } catch { XCTAssertEqual(error as? CameraAccessError, .sessionClosed) }
+        pip.invalidate()
+        XCTAssertFalse(pip.permits(camera: "BedroomCamera"))
+        await arbiter.shutdown()
+    }
+
     func testCameraLockSynchronouslyRevokesStreamsAndReentryGetsFreshAuthorization() async throws {
         let fixture = Fixture()
         let arbiter = CameraStreamArbiter { _, _ in throw CameraStreamError.ended }
@@ -44,6 +73,113 @@ final class CameraAccessSessionTests: XCTestCase {
         XCTAssertEqual(fixture.session.unlockedCredentials, fixture.store.bundle)
         XCTAssertEqual(fixture.store.loads.count, 1)
         XCTAssertTrue(fixture.store.loads.first === fixture.authenticator.attempts.first)
+    }
+
+    func testCurrentEnvironmentMatchesBuildTarget() {
+#if targetEnvironment(simulator)
+        XCTAssertEqual(CameraAccessEnvironment.current, .simulator)
+#else
+        XCTAssertEqual(CameraAccessEnvironment.current, .device)
+#endif
+    }
+
+    func testSimulatorMissingCredentialsUnlockWithoutBiometricsOrCredentialDataAccess() async {
+        let fixture = Fixture(environment: .simulator)
+        fixture.authenticator.failure = .biometryNotEnrolled
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        XCTAssertTrue(fixture.session.isUnlocked)
+        XCTAssertEqual(fixture.store.inspections, 1)
+        XCTAssertTrue(fixture.authenticator.attempts.isEmpty)
+        XCTAssertTrue(fixture.store.loads.isEmpty)
+        XCTAssertTrue(fixture.store.saved.isEmpty)
+        XCTAssertNil(fixture.session.unlockedCredentials)
+        XCTAssertNil(fixture.session.errorMessage)
+        XCTAssertFalse(fixture.session.canRetrySavedCredentials)
+    }
+
+    func testSimulatorExistingCredentialsStillRequireBiometrics() async {
+        for presence in [CameraS3CredentialPresence.unprotected, .biometricProtected, .authenticationRequired] {
+            let fixture = Fixture(presence: presence, environment: .simulator)
+            fixture.authenticator.failure = .authenticationCancelled
+            fixture.session.enter()
+            await waitUntil { !fixture.session.isAuthenticating }
+            XCTAssertFalse(fixture.session.isUnlocked)
+            XCTAssertEqual(fixture.authenticator.attempts.count, 1)
+            XCTAssertTrue(fixture.store.loads.isEmpty)
+            XCTAssertTrue(fixture.store.saved.isEmpty)
+            XCTAssertNil(fixture.session.unlockedCredentials)
+
+            fixture.authenticator.failure = nil
+            fixture.session.unlock()
+            await waitUntil { !fixture.session.isAuthenticating }
+            XCTAssertTrue(fixture.session.isUnlocked)
+            XCTAssertEqual(fixture.session.unlockedCredentials, fixture.store.bundle)
+            XCTAssertEqual(fixture.authenticator.attempts.count, 2)
+            XCTAssertEqual(fixture.store.loads.count, 1)
+            XCTAssertTrue(fixture.store.loads.first === fixture.authenticator.attempts.last)
+        }
+    }
+
+    func testSimulatorInspectionFailureDoesNotBypassAuthentication() async {
+        let fixture = Fixture(environment: .simulator)
+        fixture.store.inspectionError = CameraAccessError.keychain(errSecNotAvailable)
+        fixture.authenticator.failure = .authenticationCancelled
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        XCTAssertFalse(fixture.session.isUnlocked)
+        XCTAssertEqual(fixture.authenticator.attempts.count, 1)
+        XCTAssertTrue(fixture.store.loads.isEmpty)
+        XCTAssertNil(fixture.session.credentialPresence)
+        XCTAssertNotNil(fixture.session.credentialErrorMessage)
+    }
+
+    func testSimulatorViewingExemptionDoesNotAuthorizeCredentialSaveOrRetry() async throws {
+        let fixture = Fixture(environment: .simulator)
+        fixture.authenticator.failure = .authenticationCancelled
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        XCTAssertTrue(fixture.session.isUnlocked)
+        XCTAssertTrue(fixture.authenticator.attempts.isEmpty)
+        do {
+            try await fixture.session.saveCredentials(fixture.store.bundle)
+            XCTFail("Simulator credential setup must still authenticate")
+        } catch { XCTAssertEqual(error as? CameraAccessError, .authenticationCancelled) }
+        do {
+            try await fixture.session.unlockCredentials()
+            XCTFail("Simulator credential retry must still authenticate")
+        } catch { XCTAssertEqual(error as? CameraAccessError, .authenticationCancelled) }
+        XCTAssertEqual(fixture.authenticator.attempts.count, 2)
+        XCTAssertTrue(fixture.store.loads.isEmpty)
+        XCTAssertTrue(fixture.store.saved.isEmpty)
+        XCTAssertNil(fixture.session.unlockedCredentials)
+        XCTAssertTrue(fixture.session.isUnlocked)
+
+        fixture.authenticator.failure = nil
+        try await fixture.session.saveCredentials(fixture.store.bundle)
+        XCTAssertEqual(fixture.authenticator.attempts.count, 3)
+        XCTAssertEqual(fixture.store.saved, [fixture.store.bundle])
+        XCTAssertTrue(fixture.store.saveAttempts.first === fixture.authenticator.attempts.last)
+    }
+
+    func testSimulatorReentryRechecksCredentialsAndRevokesOldStreamAccess() async throws {
+        let fixture = Fixture(environment: .simulator)
+        let arbiter = CameraStreamArbiter { _, _ in throw CameraStreamError.ended }
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        let authorization = try fixture.session.authorizeStreams(arbiter)
+        fixture.session.lock()
+        XCTAssertFalse(authorization.isValid)
+        XCTAssertFalse(fixture.session.isUnlocked)
+        fixture.store.presence = .biometricProtected
+        fixture.authenticator.failure = .authenticationCancelled
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        XCTAssertEqual(fixture.store.inspections, 2)
+        XCTAssertEqual(fixture.authenticator.attempts.count, 1)
+        XCTAssertFalse(fixture.session.isUnlocked)
+        XCTAssertTrue(fixture.store.loads.isEmpty)
+        await arbiter.shutdown()
     }
 
     func testNotAvailableAllowsCameraPageButNeverReadsProtectedCredentials() async {
@@ -425,16 +561,16 @@ private struct Fixture {
     let authenticator: TestBiometricAuthenticator
     let session: CameraAccessSession
 
-    init(presence: CameraS3CredentialPresence = .missing) {
+    init(presence: CameraS3CredentialPresence = .missing, environment: CameraAccessEnvironment = .device) {
         store = TestCredentialStore(presence: presence)
         authenticator = TestBiometricAuthenticator()
-        session = CameraAccessSession(credentials: store, authenticator: authenticator)
+        session = CameraAccessSession(credentials: store, authenticator: authenticator, environment: environment)
     }
 }
 
 @MainActor
 private final class TestCredentialStore: CameraS3CredentialStoring {
-    let presence: CameraS3CredentialPresence
+    var presence: CameraS3CredentialPresence
     let bundle = CameraS3Credentials(destinationID: "test-server/store/bucket/prefix", accessKeyID: "TEST-ID", secretAccessKey: "TEST-SECRET", encryptionPassword: "TEST-PASSWORD")
     var inspections = 0
     var inspectionError: Error?

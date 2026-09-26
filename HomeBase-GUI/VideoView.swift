@@ -29,7 +29,7 @@ struct VideoView: View {
 
     var body: some View {
         CameraAccessGate { access in
-            let previewsActive = access.isAuthorized
+            let previewsActive = access.canStream
                 && scenePhase == .active
                 && selectedCamera == nil
             ScrollView {

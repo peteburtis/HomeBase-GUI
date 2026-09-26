@@ -257,6 +257,90 @@ final class CameraStreamArbiterTests: XCTestCase {
         await f.end()
     }
 
+    func testPiPAndForegroundShareUpstreamButRevokeIndependently() async throws {
+        let f = Fixture()
+        let foregroundAuthorization = CameraStreamAuthorization()
+        let pipAuthorization = CameraStreamAuthorization(camera: "a")
+        let foreground = Collector(try await f.arbiter.subscribe(camera: "a", quality: .low,
+            authorization: foregroundAuthorization))
+        let otherCamera = Collector(try await f.arbiter.subscribe(camera: "b", quality: .low,
+            authorization: foregroundAuthorization))
+        await eventually { await f.wire.count == 2 }
+        // Acquisition ordering is actor-scheduled, so discover the wire indices.
+        let cameras = await f.wire.cameras
+        let a = try XCTUnwrap(cameras.firstIndex(of: "a"))
+        let b = try XCTUnwrap(cameras.firstIndex(of: "b"))
+        await f.wire.ready(a); await f.wire.ready(b)
+        await eventually { foreground.video.count == 1 && otherCamera.video.count == 1 }
+        let pip = Collector(try await f.arbiter.subscribe(camera: "a", quality: .low,
+            authorization: pipAuthorization))
+        await eventually { pip.video.count == 1 }
+        let opens = await f.wire.count
+        XCTAssertEqual(opens, 2, "PiP should reuse the selected camera's upstream")
+
+        await f.arbiter.revoke(foregroundAuthorization)
+        await eventually { foreground.error != nil && otherCamera.error != nil }
+        await eventually { await f.wire.closed.contains(b) }
+        await f.wire.video(a, sequence: 2)
+        await eventually { pip.video.last?.sequence == 2 }
+        XCTAssertEqual(foreground.video.count, 1)
+        XCTAssertNil(pip.error)
+
+        let returning = Collector(try await f.arbiter.subscribe(camera: "a", quality: .low,
+            authorization: CameraStreamAuthorization()))
+        await eventually { returning.video.count == 2 }
+        await f.arbiter.revoke(pipAuthorization)
+        await eventually { pip.error != nil }
+        await f.wire.video(a, sequence: 3)
+        await eventually { returning.video.last?.sequence == 3 }
+        XCTAssertEqual(pip.video.count, 2)
+        XCTAssertNil(returning.error)
+        await f.end()
+    }
+
+    func testPiPLeaseCannotSubscribeToAnotherCamera() async throws {
+        let f = Fixture()
+        let authorization = CameraStreamAuthorization(camera: "a")
+        do {
+            _ = try await f.arbiter.subscribe(camera: "b", quality: .low, authorization: authorization)
+            XCTFail("Camera-scoped permission must reject a different camera")
+        } catch { XCTAssertEqual(error as? CameraStreamError, .closed) }
+        let opens = await f.wire.count
+        XCTAssertEqual(opens, 0)
+        await f.end()
+    }
+
+    func testSynchronousPiPRevocationRejectsFramesBeforeAsyncCleanup() async throws {
+        let f = Fixture()
+        let pipAuthorization = CameraStreamAuthorization(camera: "a")
+        let pip = Collector(try await f.arbiter.subscribe(camera: "a", quality: .low,
+            authorization: pipAuthorization))
+        await eventually { await f.wire.count == 1 }
+        await f.wire.ready(0)
+        await eventually { pip.video.count == 1 }
+        pipAuthorization.invalidate()
+        await f.wire.video(0, sequence: 2)
+        await eventually { pip.error != nil }
+        await eventually { await f.wire.closed.contains(0) }
+        XCTAssertEqual(pip.video.count, 1)
+        await f.end()
+    }
+
+    func testForegroundRevocationAlsoClosesItsIdleHandoffStream() async throws {
+        let f = Fixture()
+        let authorization = CameraStreamAuthorization()
+        let consumer = Collector(try await f.arbiter.subscribe(camera: "a", quality: .low,
+            authorization: authorization))
+        await eventually { await f.wire.count == 1 }
+        await f.wire.ready(0)
+        await eventually { consumer.video.count == 1 }
+        await f.leave(consumer)
+        await f.arbiter.revoke(authorization)
+        await eventually { await f.wire.closed.contains(0) }
+        // No advance of the grace-period clock was needed.
+        await f.end()
+    }
+
     func testImmediateReleaseAndShutdownSkipGrace() async throws {
         let f = Fixture()
         let c = try await f.join("a", .low)

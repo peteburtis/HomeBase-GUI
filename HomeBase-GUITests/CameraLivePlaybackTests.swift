@@ -6,6 +6,28 @@ import XCTest
 
 @MainActor
 final class CameraLivePlaybackTests: XCTestCase {
+    func testLivePiPPauseDecodesWithoutDisplayingAndResumeDisplaysCurrentFrame() async throws {
+        let clip = try video()
+        let renderer = CameraH264Renderer()
+        _ = try renderer.configure(clip.configuration)
+        let first = try XCTUnwrap(renderer.enqueue(clip.frames[0]))
+        renderer.suppressesDisplay = true
+        let paused = try XCTUnwrap(renderer.enqueue(clip.frames[1]))
+        renderer.suppressesDisplay = false
+        let resumed = try XCTUnwrap(renderer.enqueue(clip.frames[2]))
+        func isHidden(_ sample: CMSampleBuffer) -> Bool? {
+            let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
+                as? [[String: Any]]
+            return attachments?.first?[kCMSampleAttachmentKey_DoNotDisplay as String] as? Bool
+        }
+        XCTAssertEqual(isHidden(first), false)
+        XCTAssertEqual(isHidden(paused), true)
+        XCTAssertEqual(isHidden(resumed), false)
+        XCTAssertGreaterThan(CMSampleBufferGetPresentationTimeStamp(resumed),
+            CMSampleBufferGetPresentationTimeStamp(paused))
+        renderer.reset()
+    }
+
     func testLiveImmediatelyBuffersAndPauseKeepsReceiving() {
         var timeline = configured()
         for second in 0...120 { timeline.receive(frame(second)) }

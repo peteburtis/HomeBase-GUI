@@ -68,6 +68,14 @@ late acquisitions, clears the arbiter's compressed-media cache, and closes
 pending replacement streams. Inactive system dialogs only conceal the existing
 camera UI; they retain the existing camera-section lifecycle policy.
 
+An explicitly active iOS Picture in Picture session (see below) retains the
+camera access session and already-unlocked S3 credentials in memory, including
+across background/foreground transitions. Foreground stream leases are still
+revoked in the background. Stream authorization is per consumer, so PiP's
+one-camera lease can share encoded media without retaining ordinary streams.
+Revoking either lease never revokes the other; an idle handoff
+stream still closes immediately when its own authorization is revoked.
+
 Backgrounding releases live video and history connections. Non-live playback
 (the live buffer or NVR history) pauses at its current position, including the
 shared timeline in Multiple mode, and stays paused when the screen resumes.
@@ -505,12 +513,119 @@ Unauthorized chips do nothing when tapped and do not create preview streams.
 The S3 setup padlock on missing footage is a separate action and is unchanged. The same
 gate covers camera video opened from device details; fullscreen players cannot
 bypass it. One session spans the camera list, fullscreen player, and camera
-switches. Leaving the section or backgrounding locks the session and releases
-its credential references. Inactive transitions conceal imagery for system
+switches. Unless explicit PiP is active, leaving the section or backgrounding
+locks the session and releases its credential references. Inactive transitions conceal imagery for system
 snapshots, but do not cancel the authentication prompt itself. History stays
-paused at its existing position after backgrounding, behind the lock.
+paused at its existing position after backgrounding.
 
-Authentication follows the system on every entry, without a saved consent flag:
+### Picture in Picture (iOS)
+
+Long-press a real camera pane in the viewer to choose **Picture in Picture**.
+In history the action is named **Start Live Picture in Picture**: PiP has an
+independent live-only renderer, not the group's history cursor, replay buffer,
+recording controller, or S3 credentials. Artificial color-only cameras are not
+offered because they do not supply encoded media. While PiP is active, another
+camera's menu says **Swap Picture in Picture** with the `arrow.triangle.swap`
+symbol. Its live-only replacement stream prepares in the foreground while the
+current camera keeps playing. Once the new source is attached and its sample
+buffer layer reports `isReadyForDisplay`, the same native controller switches
+`contentSource` without stopping/restarting PiP or its audio/authorization session.
+AVKit owns the transition; no camera snapshots or custom window animations are
+used. Now Playing and full-screen restoration then refer to the new camera, and
+the old camera's PiP lease is revoked. A swap starts the new camera playing even
+if the previous one was paused. Failure/timeout keeps the previous camera; going
+to the background, closing the target viewer, or restoring full screen cancels
+an unfinished swap. Stopping PiP tears down both sources. Further starts/swaps
+are disabled while a start, swap, stop, or full-screen restoration is pending.
+New PiP actions are unavailable while recording locks stream configuration.
+
+An app-owned `AVPictureInPictureController` uses the camera's native
+`AVSampleBufferDisplayLayer`. Its inline source view stays mounted throughout
+PiP's transition and active phase so AVKit's own PiP placeholder remains visible;
+the app does not cover it with a custom message. `requiresLinearPlayback` suppresses seeking;
+Pause freezes the displayed live frame while decoding continues, and Play
+returns to the current live picture. The app declares the `audio` background
+mode required for media PiP. Its `.playback`/`.moviePlayback` audio session
+mixes with other apps for silent video. `CameraPiPAudioPolicy` isolates that
+choice so future audible cameras can take audio focus without changing the
+authorization/restoration design. Now Playing contains **only the camera name**
+and supports play/pause: no artwork, thumbnails, URLs, or other camera metadata.
+
+PiP can start only from the explicit foreground menu action while camera access
+is unlocked. `canStartPictureInPictureAutomaticallyFromInline` is always false.
+Backgrounding cancels a pending start; only an already active PiP stream can
+continue. Active PiP preserves the existing camera authorization and any S3
+credentials already loaded in memory; returning does not repeat Face ID or
+read Keychain again. It does not unlock credentials that were locked before PiP.
+Ordinary camera imagery is still concealed while inactive; ordinary streams,
+controls, and history remain suspended in the background. The independent,
+exact-camera stream authorization is revoked on
+PiP stop/failure, audio interruption, protected-data unavailability, or server
+change. Ending PiP while backgrounded (or with no camera UI open) also clears
+the retained camera session and credentials. Protected-data loss and server
+changes always clear them. There is no persisted background authorization or
+automatic PiP restart.
+
+If the PiP stream ends, the window closes silently using the normal stop/cleanup
+path. No stream-ended alert is retained for the next time the viewer opens.
+Failures of an explicit start or swap still provide immediate feedback.
+
+Foreground stream readiness is published separately from retained authentication.
+The viewer, camera-grid previews, and device-detail previews wait for that gate
+before restarting. A background -> inactive transition alone cannot restart a
+stream; when the access lifecycle resumes it, the observed readiness change
+automatically restarts media even if the view already saw the active scene phase.
+Transient inactivity from an already-active scene still only conceals the UI.
+
+Only the system's return-to-app/full-screen action restores the viewer.
+If the originating viewer still contains the camera, its existing group and
+pane order remain untouched. If it was closed (or the camera was removed), a
+new viewer opens with just that camera, reusing the retained camera session.
+A bounded restoration hold bridges native PiP stopping, scene activation, and
+the reopened viewer taking ownership, regardless of callback order. Failed or
+timed-out restoration releases that hold; normal locking resumes afterward.
+Close explicitly unregisters the viewer; SwiftUI retaining a dismissed screen's
+model must not make restoration target that invisible screen. Weak ownership
+also removes screens discarded by other presentation changes.
+Merely foregrounding the app leaves PiP alone. Closing the viewer while PiP
+is active does not stop its selected stream; closing the system PiP does.
+Explicitly opening that camera in a new viewer stops PiP and resumes inline
+playback, including when SwiftUI reuses a previously closed viewer's ID. Adding
+the PiP camera back to a viewer also resumes it inline. Opening another camera,
+returning to the still-open original viewer, or dismissing a covering sheet does
+not stop PiP. Native full-screen restoration keeps its own stop/completion path.
+The same bounded authorization handoff protects explicit reopening regardless
+of whether viewer registration or its access scope appears first; it does not
+re-prompt for Face ID or reload already-retained S3 credentials.
+
+Focused tests cover the scoped lease, independent foreground/PiP revocation,
+late acquisition and idle-handoff teardown, minimal metadata, native controller
+flags, restoration selection, background-start policy, retained credentials,
+foreground-stream revocation, and restoration-handoff ordering. On a device, also
+check native start/stop and pause/resume, background playback, return with the
+viewer open and closed, switching PiP cameras, lock-screen teardown, and that
+backgrounding without an explicit PiP action never opens the system window.
+
+Verified on Parkaboy through iPhone Mirroring (2026-09-25): native start/stop,
+pause/resume to the current live frame, continuing playback on the Home Screen,
+return to the original two-camera order, and reopening a dismissed viewer with
+one camera. Repeated starts and backgrounding without automatic PiP also passed.
+The dismissed-viewer check caught retained SwiftUI state; explicit Close now
+unregisters it, covered by a regression test and a successful device retest.
+
+For iPhone Mirroring tests, launch a **Debug** build with
+`HOMEBASE_CAMERA_PIP_TEST_FIXTURE=1`. This launch-only fixture uses a camera-only
+authentication substitute and a credential store that always reports missing
+and rejects every read/write. It never creates a real Keychain store or reads,
+changes, or deletes the phone's S3 credentials. S3 history is unavailable.
+Normal launches are unchanged; Release builds ignore the variable and exclude
+the fixture's authentication/credential implementations. Do not enable this
+variable in a shared scheme. Relaunch without it after testing.
+
+### Authentication and credentials
+
+Authentication follows the system on each new camera session, without a saved
+consent flag. Active PiP keeps the existing session alive as described above:
 
 - Camera-page access and S3-credential access are independent. One successful
   biometric prompt satisfies the UI lock and is reused for a protected Keychain
@@ -672,8 +787,12 @@ On-device authentication smoke checks:
 
 - With no saved S3 credentials, enter Cameras: chips stay black until the system
   authentication decision. Cancel should leave them locked; Unlock retries.
-- Background and return, and leave/re-enter Cameras. Each starts a fresh lock
-  session. Opening fullscreen and switching cameras should not ask again.
+- Without PiP, background and return, and leave/re-enter Cameras. Each starts a
+  fresh lock session. Opening fullscreen and switching cameras should not ask again.
+- With active PiP, background and return (including the system full-screen
+  action after closing the viewer). No additional Face ID prompt should appear,
+  and previously unlocked S3 history should remain available without another
+  Keychain read. Closing PiP while backgrounded must restore normal locking.
 - With HBNVR 0.15.1 advertising S3, seek to missing local video. Check the leading
   padlock and credential sheet. Cancel must save nothing. Saving a test reader
   key requires biometrics and reports only a Keychain save, not AWS validation.

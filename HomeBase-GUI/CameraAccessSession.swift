@@ -69,8 +69,21 @@ final class CameraSystemBiometricAuthenticator: CameraBiometricAuthenticating {
     }
 }
 
+nonisolated enum CameraAccessEnvironment: Sendable {
+    case device
+    case simulator
+
+    static var current: Self {
+#if targetEnvironment(simulator)
+        .simulator
+#else
+        .device
+#endif
+    }
+}
+
 /// Ephemeral camera-section state. There is deliberately no persisted consent
-/// preference: the current OS result is authoritative on every fresh entry.
+/// preference. Simulator-only camera viewing is exempt when S3 credentials are absent.
 @MainActor
 final class CameraAccessSession: ObservableObject {
     @Published private(set) var isUnlocked = false
@@ -79,6 +92,10 @@ final class CameraAccessSession: ObservableObject {
     @Published private(set) var unlockedCredentials: CameraS3Credentials?
     @Published private(set) var credentialPresence: CameraS3CredentialPresence?
     @Published private(set) var credentialErrorMessage: String?
+    // Authentication can survive a PiP background transition independently of
+    // ordinary stream readiness. Publish both sides of that transition so the
+    // viewer can resume even when its authorization never changed.
+    @Published private(set) var streamsSuspended = false
 
     var canRetrySavedCredentials: Bool {
         isUnlocked && credentialPresence != .missing && unlockedCredentials == nil
@@ -86,6 +103,7 @@ final class CameraAccessSession: ObservableObject {
 
     private let credentials: any CameraS3CredentialStoring
     private let authenticator: any CameraBiometricAuthenticating
+    private let environment: CameraAccessEnvironment
     private var hasEntered = false
     private var generation: UInt64 = 0
     private var attempt: CameraAuthenticationAttempt?
@@ -94,18 +112,28 @@ final class CameraAccessSession: ObservableObject {
     private var streamArbiters: [ObjectIdentifier: CameraStreamArbiter] = [:]
 
     func authorizeStreams(_ arbiter: CameraStreamArbiter) throws -> CameraStreamAuthorization {
-        guard isUnlocked else { throw CameraAccessError.sessionClosed }
+        guard isUnlocked, !streamsSuspended else { throw CameraAccessError.sessionClosed }
         if !streamAuthorization.isValid { streamAuthorization = CameraStreamAuthorization() }
         streamArbiters[ObjectIdentifier(arbiter)] = arbiter
         return streamAuthorization
     }
 
+    /// Only an explicit foreground PiP action may create this lease. It grants
+    /// no UI, control, history, or Keychain access. The PiP owner must revoke it
+    /// on stop/failure, server changes, and protected-data loss.
+    func authorizePictureInPicture(camera: String) throws -> CameraStreamAuthorization {
+        guard isUnlocked, !camera.isEmpty else { throw CameraAccessError.sessionClosed }
+        return CameraStreamAuthorization(camera: camera)
+    }
+
     init(
         credentials: (any CameraS3CredentialStoring)? = nil,
-        authenticator: (any CameraBiometricAuthenticating)? = nil
+        authenticator: (any CameraBiometricAuthenticating)? = nil,
+        environment: CameraAccessEnvironment = .current
     ) {
         self.credentials = credentials ?? CameraKeychainCredentialStore()
         self.authenticator = authenticator ?? CameraSystemBiometricAuthenticator()
+        self.environment = environment
     }
 
     /// Call on camera-section entry, not when moving between its list/player.
@@ -132,7 +160,18 @@ final class CameraAccessSession: ObservableObject {
         }
     }
 
-    func lock() {
+    /// PiP may retain authentication and loaded credentials, but ordinary
+    /// foreground media must still lose its lease while the app is backgrounded.
+    func suspendStreams() {
+        streamsSuspended = true
+        revokeStreams()
+    }
+
+    func resumeStreams() {
+        streamsSuspended = false
+    }
+
+    private func revokeStreams() {
         // Revoke synchronously, including subscriptions still being acquired.
         // Privacy locking never keeps the ordinary view-handoff grace period.
         let authorization = streamAuthorization
@@ -140,6 +179,10 @@ final class CameraAccessSession: ObservableObject {
         let arbiters = Array(streamArbiters.values)
         streamArbiters.removeAll()
         Task { for arbiter in arbiters { await arbiter.revoke(authorization) } }
+    }
+
+    func lock() {
+        revokeStreams()
         generation &+= 1
         task?.cancel()
         task = nil
@@ -246,6 +289,13 @@ final class CameraAccessSession: ObservableObject {
             try requireCurrent(requestGeneration)
             credentialPresence = presence
             credentialErrorMessage = inspectionError.map(Self.safeCredentialMessage)
+            // Only the standalone viewing gate is optional in the simulator.
+            // Unknown/present credentials follow the normal authentication path;
+            // credential save/retry never use this exemption or an unlocked context.
+            if environment == .simulator, presence == .missing {
+                isUnlocked = true
+                return
+            }
             var authenticated = false
             do {
                 try await authenticator.authenticate(using: request)
