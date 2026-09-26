@@ -280,7 +280,12 @@ combination; safe-area behavior changes through modifier values rather than an
 On iOS 27.1 and later, compact-width camera layouts additionally query active
 `.occlusion` reserved regions. Even when ignoring safe areas, the camera canvas
 uses the largest single axis-aligned rectangle that avoids every returned
-region. The reported frames already contain the system's avoidance margins;
+region. If a visible occlusion lies wholly within the top 25% of the canvas,
+the rectangle must also be vertically centered: top and bottom reserve equal
+space, as though the cutout were mirrored at the bottom. Other real occlusions
+are still avoided; a larger bottom obstruction increases both insets. Cutouts
+below that threshold and side-only landscape cutouts keep the previous policy.
+The reported frames already contain the system's avoidance margins;
 they are not expanded again. This changes camera layout, not native toolbar or
 timeline placement. Regular-width layouts and systems returning no occlusions
 are unchanged. A closed Duo is explicitly exempt: the existing `onHingeChange`
@@ -288,6 +293,14 @@ capability check now also tracks `.closed`, without device-name guesses. An open
 Duo still follows the compact-width rule and reserves its fold independently.
 Safe label bounds and the fold are translated into the resized canvas's local
 coordinates. Changes retain the same mounted camera views and playback resources.
+Before iOS 27.1, compact-width, regular-height iPhone canvases that ignore safe
+areas reserve a fixed **64 layout points at both top and bottom** instead.
+Compact-height landscape is excluded even when it still reports compact width.
+This is a conservative cutout approximation, not a physical-pixel measurement or model-specific island
+frame. Layouts already inside the native safe area aren't inset again. iPad,
+Mac, and other platforms don't receive this phone fallback. On iOS 27.1 and later
+the actual reserved regions remain authoritative, including an empty result;
+the fallback never overrides them or the closed-Duo exemption.
 Camera labels stay inside the screen's safe area without moving or shrinking
 the video panes; interior grid edges do not gain extra safe-area padding. In
 side-by-side two-up they touch the bottom of the actual video rectangle from immediately

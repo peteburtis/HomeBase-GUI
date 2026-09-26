@@ -1,5 +1,8 @@
 import SwiftUI
 import HomeBaseProtocol
+#if os(iOS)
+import UIKit
+#endif
 
 struct CameraDeviceHingeState: Equatable {
     var isPresent = false
@@ -115,7 +118,30 @@ enum CameraGroupLayout {
         horizontal == .compact && !(hinge.isPresent && hinge.isClosed)
     }
 
+    /// Pre-iOS 27.1 has no reserved-region geometry. This is deliberately a
+    /// conservative layout-point allowance, not a measured hardware cutout.
+    static let legacyOcclusionInset: CGFloat = 64
+
+    static func legacyOcclusionFrames(
+        in size: CGSize, isPhone: Bool, ignoresSafeArea: Bool, vertical: UserInterfaceSizeClass?
+    ) -> [CGRect] {
+        // Native safe areas already avoid the hardware. Only protect the
+        // full-bleed phone canvas; don't double-inset normal layouts or iPads.
+        // Compact width can persist in landscape. This top/bottom approximation
+        // is only for regular height; it must not shrink compact-height video.
+        guard isPhone, ignoresSafeArea, vertical == .regular,
+              size.width.isFinite, size.height.isFinite,
+              size.width > 0, size.height > 0 else { return [] }
+        let inset = min(legacyOcclusionInset, size.height / 2)
+        return [
+            CGRect(x: 0, y: 0, width: size.width, height: inset),
+            CGRect(x: 0, y: size.height - inset, width: size.width, height: inset),
+        ]
+    }
+
     /// Largest axis-aligned rectangle outside every reported obstruction.
+    /// A cutout wholly within the top quarter also reserves matching space
+    /// below, keeping the content vertically centered rather than bottom-heavy.
     /// Unlike safe-area insets, this doesn't reserve space for system bars.
     /// Region frames already include the system's interactive-content margins.
     static func unobscuredContentRect(in size: CGSize, occlusions: [CGRect]) -> CGRect {
@@ -128,6 +154,7 @@ enum CameraGroupLayout {
             return clipped.isNull || clipped.isEmpty ? nil : clipped
         }
         guard !obstacles.isEmpty else { return bounds }
+        let balancesVertically = obstacles.contains { $0.maxY <= bounds.height * 0.25 }
 
         // Every maximal rectangle's left/right edges lie on the canvas or an
         // obstacle edge. For each such span, merge blocked vertical intervals
@@ -135,7 +162,17 @@ enum CameraGroupLayout {
         let xs = Set([bounds.minX, bounds.maxX]
             + obstacles.flatMap { [$0.minX, $0.maxX] }).sorted()
         var best = CGRect.zero
-        func consider(_ candidate: CGRect) {
+        func consider(_ available: CGRect) {
+            var candidate = available
+            if balancesVertically {
+                // Reflect the larger inset onto the opposite edge. This stays
+                // inside the unobscured candidate, even if another obstruction
+                // needs more room at the bottom than the top cutout does.
+                let inset = max(available.minY, bounds.maxY - available.maxY)
+                guard inset < bounds.height / 2 else { return }
+                candidate.origin.y = inset
+                candidate.size.height = bounds.height - 2 * inset
+            }
             guard candidate.width > 0, candidate.height > 0 else { return }
             let area = candidate.width * candidate.height
             let bestArea = best.width * best.height
@@ -447,9 +484,10 @@ struct CameraGroupLabelLayout: Layout {
 
 /// Optionally extend the media canvas outside the safe area. Capture the
 /// protected layout before expanding, then translate it into the full canvas
-/// coordinates. Both modes follow window and toolbar changes without hard-coded
-/// insets.
+/// coordinates. Both modes follow window and toolbar changes. Older iPhones
+/// additionally use a fixed cutout allowance when the media is full-bleed.
 struct CameraGroupCanvas<Content: View>: View {
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     let ignoresSafeArea: Bool
     let avoidsOcclusions: Bool
     let content: (CGSize, CGRect, CameraGroupLayout.Division?) -> Content
@@ -502,8 +540,12 @@ struct CameraGroupCanvas<Content: View>: View {
         if #available(iOS 27.1, *) {
             return proxy.reservedRegions(kind: .occlusion).map(\.frame)
         }
-#endif
+        return CameraGroupLayout.legacyOcclusionFrames(in: proxy.size,
+            isPhone: UIDevice.current.userInterfaceIdiom == .phone, ignoresSafeArea: ignoresSafeArea,
+            vertical: verticalSizeClass)
+#else
         return []
+#endif
     }
 
     private func firstActiveDivision(in proxy: GeometryProxy) -> CameraGroupLayout.Division? {

@@ -761,7 +761,7 @@ final class CameraGroupTests: XCTestCase {
         XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(
             in: CGSize(width: 400, height: 800),
             occlusions: [CGRect(x: 140, y: 10, width: 120, height: 40)]),
-            CGRect(x: 0, y: 50, width: 400, height: 750))
+            CGRect(x: 0, y: 50, width: 400, height: 700))
         for left in [true, false] {
             XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(
                 in: CGSize(width: 800, height: 400),
@@ -770,13 +770,93 @@ final class CameraGroupTests: XCTestCase {
         }
     }
 
+    func testLegacyOcclusionFallbackReservesSixtyFourPointsAtTopAndBottom() {
+        for size in [CGSize(width: 393, height: 852), CGSize(width: 402, height: 874)] {
+            let regions = CameraGroupLayout.legacyOcclusionFrames(in: size, isPhone: true,
+                ignoresSafeArea: true, vertical: .regular)
+            let frame = CameraGroupLayout.unobscuredContentRect(in: size, occlusions: regions)
+            XCTAssertEqual(frame, CGRect(x: 0, y: 64, width: size.width, height: size.height - 128))
+            XCTAssertEqual(frame.midY, size.height / 2)
+            XCTAssertTrue(regions.allSatisfy { frame.intersection($0).isEmpty })
+        }
+    }
+
+    func testLegacyOcclusionFallbackDoesNotInsetCompactHeightEvenWithCompactWidth() {
+        XCTAssertTrue(CameraGroupLayout.avoidsOcclusions(horizontal: .compact, hinge: CameraDeviceHingeState()))
+        let classes: [UserInterfaceSizeClass?] = [.compact, nil]
+        for vertical in classes {
+            let size = CGSize(width: 852, height: 393)
+            let regions = CameraGroupLayout.legacyOcclusionFrames(in: size, isPhone: true,
+                ignoresSafeArea: true, vertical: vertical)
+            XCTAssertTrue(regions.isEmpty)
+            XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: size, occlusions: regions),
+                CGRect(origin: .zero, size: size))
+        }
+    }
+
+    func testLegacyOcclusionFallbackDoesNotDoubleInsetSafeAreasOrAffectOtherDevices() {
+        let size = CGSize(width: 393, height: 852)
+        for (isPhone, ignoresSafeArea) in [(true, false), (false, false), (false, true)] {
+            XCTAssertTrue(CameraGroupLayout.legacyOcclusionFrames(in: size,
+                isPhone: isPhone, ignoresSafeArea: ignoresSafeArea, vertical: .regular).isEmpty)
+        }
+        XCTAssertTrue(CameraGroupLayout.legacyOcclusionFrames(in: .zero,
+            isPhone: true, ignoresSafeArea: true, vertical: .regular).isEmpty)
+        let tiny = CGSize(width: 200, height: 100)
+        let regions = CameraGroupLayout.legacyOcclusionFrames(in: tiny, isPhone: true,
+            ignoresSafeArea: true, vertical: .regular)
+        XCTAssertTrue(regions.allSatisfy { CGRect(origin: .zero, size: tiny).contains($0) })
+        XCTAssertTrue(CameraGroupLayout.unobscuredContentRect(in: tiny, occlusions: regions).isEmpty)
+    }
+
+    func testTopQuarterOcclusionsBalanceAtBoundaryButNotBelowIt() {
+        let size = CGSize(width: 400, height: 800)
+        XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: size,
+            occlusions: [CGRect(x: 0, y: 100, width: 400, height: 100)]),
+            CGRect(x: 0, y: 200, width: 400, height: 400),
+            "The complete occlusion must fit within the top quarter, including its boundary")
+        let belowQuarter = CameraGroupLayout.unobscuredContentRect(in: size,
+            occlusions: [CGRect(x: 0, y: 100, width: 400, height: 101)])
+        XCTAssertEqual(belowQuarter, CGRect(x: 0, y: 201, width: 400, height: 599))
+        XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: size,
+            occlusions: [CGRect(x: 140, y: 750, width: 120, height: 40)]),
+            CGRect(x: 0, y: 0, width: 400, height: 750),
+            "A bottom-only obstruction does not enable the top-cutout heuristic")
+    }
+
+    func testTopOcclusionBalancesAgainstLargerBottomObstruction() {
+        let size = CGSize(width: 400, height: 800)
+        let obstacles = [CGRect(x: 140, y: -10, width: 120, height: 60),
+                         CGRect(x: 100, y: 720, width: 200, height: 80)]
+        for regions in [obstacles, Array(obstacles.reversed())] {
+            let actual = CameraGroupLayout.unobscuredContentRect(in: size, occlusions: regions)
+            XCTAssertEqual(actual, CGRect(x: 0, y: 80, width: 400, height: 640))
+            XCTAssertEqual(actual.midY, size.height / 2)
+            XCTAssertTrue(regions.allSatisfy { actual.intersection($0).isEmpty })
+        }
+    }
+
+    func testTopCornerOcclusionCanKeepFullHeightWhenSideAvoidanceIsLarger() {
+        XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: CGSize(width: 400, height: 800),
+            occlusions: [CGRect(x: 0, y: 10, width: 20, height: 40)]),
+            CGRect(x: 20, y: 0, width: 380, height: 800),
+            "Balance is vertical; don't force top/bottom padding if the best rectangle already avoids the cutout")
+    }
+
+    func testBalancedRectangleNeverExpandsAGapThatDoesNotCrossTheCenter() {
+        XCTAssertTrue(CameraGroupLayout.unobscuredContentRect(in: CGSize(width: 400, height: 800),
+            occlusions: [CGRect(x: 140, y: 0, width: 120, height: 40),
+                         CGRect(x: 0, y: 350, width: 400, height: 100)]).isEmpty,
+            "If no centered rectangle is possible, don't turn negative height into an overlapping rectangle")
+    }
+
     func testUnobscuredRectangleAvoidsEveryRegionRegardlessOfEnumerationOrder() {
         let size = CGSize(width: 400, height: 800)
         let obstacles = [CGRect(x: 140, y: -10, width: 120, height: 60),
                          CGRect(x: 0, y: 300, width: 30, height: 100),
                          CGRect(x: 380, y: 500, width: 40, height: 80),
                          CGRect(x: 80, y: 780, width: 100, height: 40)]
-        let expected = CGRect(x: 30, y: 50, width: 350, height: 730)
+        let expected = CGRect(x: 30, y: 50, width: 350, height: 700)
         XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: size, occlusions: obstacles), expected)
         XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: size, occlusions: obstacles.reversed()), expected)
         for count in 1...4 {
@@ -809,7 +889,7 @@ final class CameraGroupTests: XCTestCase {
             occlusions: [CGRect(x: 0, y: 350, width: 40, height: 100),
                          CGRect(x: 100, y: 0, width: 100, height: 50)]
         )
-        XCTAssertEqual(placement.frame, CGRect(x: 40, y: 50, width: 960, height: 750))
+        XCTAssertEqual(placement.frame, CGRect(x: 40, y: 50, width: 960, height: 700))
         XCTAssertEqual(placement.safeBounds, CGRect(x: -30, y: 20, width: 940, height: 660))
         XCTAssertEqual(placement.division?.frame, CGRect(x: 450, y: -50, width: 20, height: 800))
         guard let division = placement.division else { return XCTFail("Lost the fold") }
@@ -826,13 +906,15 @@ final class CameraGroupTests: XCTestCase {
             let obstacles = (0..<3).map { index in
                 CGRect(x: (seed + index * 3) % 7, y: (seed * 3 + index * 2) % 7, width: 2, height: 2)
             }
+            let balancesVertically = obstacles.contains { $0.maxY <= size.height / 4 }
             var largestArea = 0
             for x in 0..<8 {
                 for y in 0..<8 {
                     for right in (x + 1)...8 {
                         for bottom in (y + 1)...8 {
                             let candidate = CGRect(x: x, y: y, width: right - x, height: bottom - y)
-                            if obstacles.allSatisfy({ candidate.intersection($0).isEmpty }) {
+                            if (!balancesVertically || candidate.midY == size.height / 2),
+                               obstacles.allSatisfy({ candidate.intersection($0).isEmpty }) {
                                 largestArea = max(largestArea, (right - x) * (bottom - y))
                             }
                         }
@@ -842,6 +924,7 @@ final class CameraGroupTests: XCTestCase {
             let actual = CameraGroupLayout.unobscuredContentRect(in: size, occlusions: obstacles)
             XCTAssertEqual(actual.width * actual.height, CGFloat(largestArea), "Obstacle set \(seed)")
             XCTAssertTrue(obstacles.allSatisfy { actual.intersection($0).isEmpty })
+            if balancesVertically, !actual.isEmpty { XCTAssertEqual(actual.midY, size.height / 2) }
         }
     }
 

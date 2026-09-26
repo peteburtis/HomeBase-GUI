@@ -7,6 +7,51 @@ import XCTest
 
 @MainActor
 final class CameraLivePlaybackPresentationTests: XCTestCase {
+    func testLegacyPhoneCanvasReservesBalancedCutoutSpaceWithoutDoubleInsets() async throws {
+        if #available(iOS 27.1, *) { throw XCTSkip("Exercises the pre-27.1 fallback on an older iPhone runtime") }
+        guard UIDevice.current.userInterfaceIdiom == .phone else { throw XCTSkip("iPhone-only fallback") }
+        let state = LegacyCameraCanvasState()
+        let host = UIHostingController(rootView: LegacyCameraCanvasHarness(state: state))
+        host.additionalSafeAreaInsets = UIEdgeInsets(top: 80, left: 0, bottom: 80, right: 0)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host; window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+        let fullBleed = try XCTUnwrap(state.frame)
+        XCTAssertEqual(fullBleed.minY, 64, accuracy: 0.5)
+        XCTAssertEqual(fullBleed.height, host.view.bounds.height - 128, accuracy: 0.5)
+        XCTAssertEqual(fullBleed.width, host.view.bounds.width, accuracy: 0.5)
+
+        state.ignoresSafeArea = false
+        try await Task.sleep(for: .milliseconds(100))
+        host.view.layoutIfNeeded()
+        let safeFrame = try XCTUnwrap(state.frame)
+        XCTAssertEqual(safeFrame.minY, host.view.safeAreaLayoutGuide.layoutFrame.minY, accuracy: 0.5)
+        XCTAssertEqual(safeFrame.height, host.view.safeAreaLayoutGuide.layoutFrame.height, accuracy: 0.5,
+            "Don't put another 64 points inside a canvas already protected by native safe areas")
+
+        state.ignoresSafeArea = true
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(state.frame, fullBleed)
+
+        state.verticalSizeClass = .compact
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(try XCTUnwrap(state.frame).height, host.view.bounds.height, accuracy: 0.5,
+            "Compact-height landscape must not get the top/bottom fallback, even when width is compact")
+        state.verticalSizeClass = .regular
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(state.frame, fullBleed, "Returning to regular height restores the balanced allowance")
+
+        state.avoidsOcclusions = false
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(try XCTUnwrap(state.frame).height, host.view.bounds.height, accuracy: 0.5,
+            "The existing compact-width policy remains the gate for occlusion avoidance")
+        XCTAssertEqual(state.appearances, 1)
+        XCTAssertEqual(state.disappearances, 0)
+    }
+
     func testFullScreenFocusZoomsAndRestoresMountedPanesWithoutRestartingResources() async throws {
         let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
         let client = HomeBaseWebSocketClient(endpoint: endpoint)
@@ -625,6 +670,31 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
         XCTAssertTrue(selections.isEmpty)
         host.dismiss(animated: false)
         XCTAssertTrue(selections.isEmpty)
+    }
+}
+
+@MainActor
+private final class LegacyCameraCanvasState: ObservableObject {
+    @Published var ignoresSafeArea = true
+    @Published var avoidsOcclusions = true
+    @Published var verticalSizeClass: UserInterfaceSizeClass = .regular
+    var frame: CGRect?
+    var appearances = 0
+    var disappearances = 0
+}
+
+private struct LegacyCameraCanvasHarness: View {
+    @ObservedObject var state: LegacyCameraCanvasState
+
+    var body: some View {
+        CameraGroupCanvas(ignoresSafeArea: state.ignoresSafeArea, avoidsOcclusions: state.avoidsOcclusions) { _, _ in
+            Color.blue
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { state.frame = $0 }
+                .onAppear { state.appearances += 1 }
+                .onDisappear { state.disappearances += 1 }
+        }
+        .environment(\.horizontalSizeClass, .compact)
+        .environment(\.verticalSizeClass, state.verticalSizeClass)
     }
 }
 
