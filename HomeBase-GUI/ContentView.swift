@@ -114,7 +114,8 @@ private struct ServerSelectionView: View {
     let onPaired: (PairedServer) -> Void
 
     @State private var isShowingScanner = false
-    @State private var scannedServer: PairedServer?
+    @State private var isShowingManualEntry = false
+    @State private var pairedServer: PairedServer?
 
     var body: some View {
         NavigationStack {
@@ -140,7 +141,7 @@ private struct ServerSelectionView: View {
 
                 ToolbarItem(placement: .primaryAction) {
                     Button("Pair a Server", systemImage: "plus") {
-                        isShowingScanner = true
+                        beginPairing()
                     }
                 }
             }
@@ -149,11 +150,21 @@ private struct ServerSelectionView: View {
 #if os(iOS)
         .fullScreenCover(
             isPresented: $isShowingScanner,
-            onDismiss: scannerDidDismiss
+            onDismiss: pairingDidDismiss
         ) {
             PairingScannerView { endpoint in
-                scannedServer = serverStore.add(endpoint)
+                pairedServer = serverStore.add(endpoint)
                 isShowingScanner = false
+            }
+        }
+#else
+        .sheet(
+            isPresented: $isShowingManualEntry,
+            onDismiss: pairingDidDismiss
+        ) {
+            ManualServerEntryView { endpoint in
+                pairedServer = serverStore.add(endpoint)
+                isShowingManualEntry = false
             }
         }
 #endif
@@ -163,10 +174,10 @@ private struct ServerSelectionView: View {
         ContentUnavailableView {
             Label("No Paired Servers", systemImage: "server.rack")
         } description: {
-            Text("Scan a HomeBase pairing code to add a server.")
+            Text("Scan a HomeBase pairing code or enter its LAN address to add a server.")
         } actions: {
             Button("Pair a Server", systemImage: "qrcode.viewfinder") {
-                isShowingScanner = true
+                beginPairing()
             }
         }
     }
@@ -219,11 +230,19 @@ private struct ServerSelectionView: View {
         }
     }
 
-    private func scannerDidDismiss() {
-        guard let scannedServer else { return }
-        self.scannedServer = nil
-        serverStore.select(scannedServer)
-        onPaired(scannedServer)
+    private func beginPairing() {
+#if os(iOS)
+        isShowingScanner = true
+#else
+        isShowingManualEntry = true
+#endif
+    }
+
+    private func pairingDidDismiss() {
+        guard let pairedServer else { return }
+        self.pairedServer = nil
+        serverStore.select(pairedServer)
+        onPaired(pairedServer)
         dismiss()
     }
 }

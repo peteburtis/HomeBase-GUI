@@ -6,6 +6,8 @@
 import Foundation
 
 struct HomeBaseEndpoint: Codable, Hashable, Sendable {
+    static let defaultPort = 10_503
+
     let host: String
     let port: Int
 
@@ -17,6 +19,13 @@ struct HomeBaseEndpoint: Codable, Hashable, Sendable {
 
         self.host = trimmedHost
         self.port = port
+
+        // Manual entry reaches this initializer without first passing through
+        // URL parsing. Reject hosts that could not produce a usable WebSocket
+        // URL rather than persisting an endpoint that can never connect.
+        guard webSocketURL != nil else {
+            return nil
+        }
     }
 
     nonisolated var webSocketURL: URL? {
