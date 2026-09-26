@@ -1710,13 +1710,20 @@ private struct CameraFullScreenCameraContent: View {
     let access: CameraAccessPresentation
     @StateObject private var initialSession: CameraGroupSession
     @StateObject private var group: CameraGroupPlayback
-    private var primary: CameraGroupSession { group.sessions.first ?? initialSession }
+    @State private var focusedCameraID: String?
+    private var presentation: CameraGroupPresentation {
+        CameraGroupPresentation(sessions: group.sessions, focusedCameraID: focusedCameraID)
+    }
+    private var primary: CameraGroupSession { presentation.focusedSession ?? group.sessions.first ?? initialSession }
     private var device: HBTopologyDeviceDescriptor { primary.camera.device }
     private var controlsModel: LiveDeviceControlsModel { primary.controls }
     private var playbackController: CameraLivePlaybackController { primary.playback }
     private var selectedQuality: CameraLiveQualitySelection {
-        get { group.quality }
-        nonmutating set { group.setQuality(newValue) }
+        get { presentation.focusedSession?.quality ?? group.quality }
+        nonmutating set {
+            if let focused = presentation.focusedSession { focused.setQuality(newValue) }
+            else { group.setQuality(newValue) }
+        }
     }
     @Binding var panel: CameraPlayerPanel
     @Binding var controlsVisible: Bool
@@ -1851,6 +1858,11 @@ private struct CameraFullScreenCameraContent: View {
         }
         .onChange(of: cameraControlsEnabled) { _, enabled in
             if !enabled { stopLiveCameraGestures() }
+        }
+        .onChange(of: group.sessions.map(\.id)) { _, _ in
+            // Removing the focused camera (or collapsing to one) ends only the
+            // presentation override. Never change the selection to enter/exit it.
+            if presentation.focusedSession == nil { focusedCameraID = nil }
         }
         .onChange(of: panelAvailability, initial: true) { _, availability in
             panel = availability.validated(panel)
@@ -2012,7 +2024,15 @@ private struct CameraFullScreenCameraContent: View {
         .modifier(CameraPiPViewerRegistration(id: viewerID,
             cameraIDs: Set(group.sessions.map(\.camera.id)),
             owner: screenSelection,
-            showControls: { controlsVisible = true }))
+            showControls: {
+                // If PiP restores a different, currently faded-out pane, reveal
+                // its original position in the group rather than hiding it.
+                if let focusedCameraID,
+                   pictureInPicture?.restoration?.session.camera.id != focusedCameraID {
+                    self.focusedCameraID = nil
+                }
+                controlsVisible = true
+            }))
         .background {
             CameraToolbarScrubBridge(
                 isEnabled: verticalSizeClass == .compact
@@ -2032,6 +2052,8 @@ private struct CameraFullScreenCameraContent: View {
                 controlsVisible: visiblePlayerControls,
                 isAccessAllowed: access.isAuthorized,
                 allowsPictureInPicture: playbackActionsEnabled,
+                focusedCameraID: presentation.focusedSession?.id,
+                onFullScreen: focusCamera,
                 onSingleTap: toggleControls)
 
             if visiblePlayerControls && panel == .ptz && panelAvailability.enablesPTZ {
@@ -2110,10 +2132,29 @@ private struct CameraFullScreenCameraContent: View {
     }
 
     private func closeViewer() {
+        if presentation.focusedSession != nil {
+            setCameraFocus(nil)
+            return
+        }
 #if os(iOS)
         pictureInPicture?.unregisterViewer(viewerID)
 #endif
         dismiss()
+    }
+
+    private func focusCamera(_ id: String) {
+        guard access.isUnlocked, !switchingCamera,
+              group.hasMultipleCameras, group.sessions.contains(where: { $0.id == id }) else { return }
+        setCameraFocus(id)
+    }
+
+    private func setCameraFocus(_ id: String?) {
+        stopLiveCameraGestures()
+        withAnimation(reduceMotion ? nil : .snappy) {
+            focusedCameraID = id
+            panel = .off
+            controlsVisible = true
+        }
     }
 
     @ToolbarContentBuilder
@@ -2121,17 +2162,17 @@ private struct CameraFullScreenCameraContent: View {
 #if os(iOS)
         if toolbarArrangement.navigationItemsInBottomToolbar {
             ToolbarItem(placement: .bottomBar) {
-                CameraPlayerCloseButton(action: closeViewer)
+                CameraPlayerCloseButton(returnsToCameras: presentation.focusedSession != nil, action: closeViewer)
             }
             ToolbarSpacer(.fixed, placement: .bottomBar)
         } else {
             ToolbarItem(placement: .navigation) {
-                CameraPlayerCloseButton(action: closeViewer)
+                CameraPlayerCloseButton(returnsToCameras: presentation.focusedSession != nil, action: closeViewer)
             }
         }
 #else
         ToolbarItem(placement: .navigation) {
-            CameraPlayerCloseButton(action: closeViewer)
+            CameraPlayerCloseButton(returnsToCameras: presentation.focusedSession != nil, action: closeViewer)
         }
 #endif
 
@@ -2469,8 +2510,8 @@ private struct CameraFullScreenCameraContent: View {
             recordingIsBusy
                 || (!recordingIsActive
                     && pendingRecordings.isEmpty
-                    && (recordingControllers.isEmpty
-                        || !recordingControllers.allSatisfy(\.isStreamAvailable)
+                    && (presentation.visibleSessions.isEmpty
+                        || !presentation.visibleSessions.allSatisfy({ $0.recordingController.isStreamAvailable })
                         || !cameraControlsEnabled))
         )
         .accessibilityLabel(
@@ -2522,7 +2563,7 @@ private struct CameraFullScreenCameraContent: View {
     }
 
     private func startRecording() async {
-        for session in group.sessions {
+        for session in presentation.visibleSessions {
             await session.recordingController.start(
                 suggestedFilename: session.camera.device.displayName
             )
@@ -2604,16 +2645,15 @@ private struct CameraFullScreenCameraContent: View {
 
     private var panelAvailability: CameraPlayerPanelAvailability {
         CameraPlayerPanelAvailability(
-            historyAvailable: group.active
-                ? group.hasHistory
-                : primary.historyAvailable,
+            historyAvailable: timelineSession != nil,
             ptzSupported: CameraDetailControlSet(controls: controlsModel.controls).hasPTZ,
-            isLive: cameraControlsEnabled, isMultiple: group.hasMultipleCameras)
+            isLive: cameraControlsEnabled, isMultiple: presentation.showsMultipleCameras)
     }
 
     private var timelineVisible: Bool { !isLive }
     private var timelinePresented: Bool { timelineVisible && visiblePlayerControls }
     private var timelineSession: CameraGroupSession? {
+        if let focused = presentation.focusedSession { return focused.historyAvailable ? focused : nil }
         if group.active { return group.historySourceSession }
         return primary.historyAvailable ? primary : nil
     }
@@ -2761,15 +2801,18 @@ private struct CameraFullScreenCameraContent: View {
     private var isLive: Bool { group.active ? group.isLive : playbackController.isLive }
     private var isPaused: Bool { group.active ? group.isPaused : playbackController.isPaused }
     private var canControlPlayback: Bool { group.active ? group.canControlPlayback : playbackController.canControlPlayback }
-    private var activeControls: LiveDeviceControlsModel { group.hasMultipleCameras ? group.sharedControls : controlsModel }
-    private var isShowingVideo: Bool { group.active ? group.allPanesShowVideo : interactionPresentation.showsVideo }
+    private var activeControls: LiveDeviceControlsModel { presentation.showsMultipleCameras ? group.sharedControls : controlsModel }
+    private var isShowingVideo: Bool {
+        if let focused = presentation.focusedSession { return group.showsVideo(focused) }
+        return group.active ? group.allPanesShowVideo : interactionPresentation.showsVideo
+    }
     private var visiblePlayerControls: Bool {
         access.isUnlocked
             && interactionPresentation.controlsVisible(requested: controlsVisible)
     }
 
     private var lockedS3Destination: CameraS3Destination? {
-        for session in group.sessions {
+        for session in presentation.visibleSessions {
             let destination = CameraS3Destination.advertised(in: session.controls.deviceMetadata)
             if CameraS3AccessPolicy.showsPadlock(isLive: isLive,
                 showsVideo: group.showsVideo(session), historyState: session.playback.historyState,
@@ -2858,7 +2901,7 @@ private struct CameraFullScreenCameraContent: View {
         return CameraDayNightModeToolbarControl(
             target: target,
             model: activeControls,
-            appliesRepeatedSelections: group.hasMultipleCameras
+            appliesRepeatedSelections: presentation.showsMultipleCameras
         )
     }
 
@@ -2871,16 +2914,21 @@ private struct CameraFullScreenCameraContent: View {
     private var qualityControl: some View {
         Menu {
             Picker("Video quality", selection: Binding(
-                get: { selectedQuality },
+                get: { displayedQuality },
                 set: { quality in
-                    guard cameraControlsEnabled,
+                    guard let quality, cameraControlsEnabled,
                           playbackActionsEnabled else { return }
                     selectedQuality = quality
                 }
             )) {
+                if displayedQuality == nil {
+                    Text("Mixed")
+                        .tag(Optional<CameraLiveQualitySelection>.none)
+                        .disabled(true)
+                }
                 ForEach(availableQualities, id: \.self) { quality in
                     Text(CameraLiveQualityPresentation.title(for: quality))
-                        .tag(quality)
+                        .tag(Optional(quality))
                 }
             }
         } label: {
@@ -2888,13 +2936,23 @@ private struct CameraFullScreenCameraContent: View {
         }
         .accessibilityLabel("Video quality")
         .accessibilityValue(
-            CameraLiveQualityPresentation.title(for: selectedQuality)
+            displayedQuality.map(CameraLiveQualityPresentation.title(for:)) ?? "Mixed"
         )
         .disabled(!cameraControlsEnabled)
     }
 
+    private var displayedQuality: CameraLiveQualitySelection? {
+        if let focused = presentation.focusedSession { return focused.quality }
+        guard Set(group.sessions.map(\.quality)).count <= 1 else { return nil }
+        return group.sessions.first?.quality ?? group.quality
+    }
+
     private var availableQualities: [CameraLiveQualitySelection] {
-        CameraLiveQualityPresentation.options(
+        if let focused = presentation.focusedSession {
+            let capability = CameraLiveVideoCapability(metadata: focused.controls.deviceMetadata) ?? focused.camera.capability
+            return CameraLiveQualityPresentation.options(in: capability.qualities, includesDefault: capability.supportsDefaultQuality)
+        }
+        return CameraLiveQualityPresentation.options(
             in: group.availableConcreteQualities,
             includesDefault: group.supportsDefaultQuality
         )

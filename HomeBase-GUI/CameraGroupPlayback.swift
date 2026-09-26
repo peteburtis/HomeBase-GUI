@@ -443,7 +443,9 @@ final class CameraGroupPlayback: ObservableObject {
     }
 
     func setQuality(_ value: CameraLiveQualitySelection) {
-        guard value != quality else { return }
+        // A focused pane can change its own quality without changing the group
+        // preference. Reapplying that preference must still update that pane.
+        guard value != quality || sessions.contains(where: { $0.quality != value }) else { return }
         guard availableQualities.contains(value) else {
             error = "This video quality is not supported by every selected camera."
             return

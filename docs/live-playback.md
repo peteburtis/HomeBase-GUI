@@ -528,6 +528,28 @@ locks the session and releases its credential references. Inactive transitions c
 snapshots, but do not cancel the authentication prompt itself. History stays
 paused at its existing position after backgrounding.
 
+### Full Screen camera focus
+
+With multiple cameras open, a pane's long-press menu starts with **Full Screen**,
+including artificial cameras and systems where PiP is unavailable. This is a
+presentation override: the chosen pane animates to the existing single-camera
+layout while the other panes fade out, stop accepting gestures, and leave the
+accessibility tree. Their views, sessions, live streams, renderers, buffers, and
+shared playback clock remain intact. Reduce Motion disables the zoom/fade.
+The existing safe-area, occlusion, and fold rules still apply.
+
+The native Close button becomes **Back to cameras**, returning to the original
+order and layout. No camera selection or playback state changes on focus/back.
+The camera label disappears, and configuration, quality, history thumbnails,
+and new recordings target the focused camera. Transport continues to use the
+group's synchronized clock, so returning to the grid never exposes a split
+timeline. Already-running recordings remain stoppable/exportable even after a
+focus change. Reapplying a group quality updates every camera, including a pane
+whose quality was changed while focused. The camera picker still retains the
+complete open selection; removing the focused camera clears the override.
+Native PiP restoration reveals the grid if the restored camera was hidden by a
+different focused pane.
+
 ### Picture in Picture (iOS)
 
 Long-press a real camera pane in the viewer to choose **Picture in Picture**.

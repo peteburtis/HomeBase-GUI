@@ -7,6 +7,65 @@ import XCTest
 
 @MainActor
 final class CameraLivePlaybackPresentationTests: XCTestCase {
+    func testFullScreenFocusZoomsAndRestoresMountedPanesWithoutRestartingResources() async throws {
+        let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
+        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let cameras = CameraVideoCatalog.cameras(in: [], includesArtificial: true)
+        let initial = CameraGroupSession(camera: cameras[0], client: client)
+        let group = CameraGroupPlayback(client: client, initialSession: initial)
+        for camera in cameras.dropFirst() { group.toggle(camera) }
+        group.activateResources(access: nil)
+        let state = CameraFocusHarnessState()
+        let host = UIHostingController(rootView: CameraFocusHarness(group: group, state: state))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host; window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil; group.deactivate() }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(250))
+
+        func gestureViews(_ view: UIView) -> [CameraLiveGestureUIView] {
+            (view as? CameraLiveGestureUIView).map { [$0] } ?? view.subviews.flatMap(gestureViews)
+        }
+        func capture(_ name: String) {
+            let image = UIGraphicsImageRenderer(size: host.view.bounds.size).image { _ in
+                host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+            }
+            let attachment = XCTAttachment(image: image)
+            attachment.name = name; attachment.lifetime = .keepAlways; add(attachment)
+        }
+        let panes = gestureViews(host.view)
+        XCTAssertEqual(panes.count, 4)
+        let identities = Set(panes.map(ObjectIdentifier.init))
+        let originalFrames = panes.map { $0.convert($0.bounds, to: host.view) }
+        let sessions = group.sessions.map(ObjectIdentifier.init)
+        let renderers = group.sessions.map { ObjectIdentifier($0.playback.renderer) }
+        capture("Camera focus — original grid")
+        for id in [cameras[2].id, nil, cameras[1].id, nil] {
+            withAnimation(.snappy) { state.focusedCameraID = id }
+            try await Task.sleep(for: .milliseconds(650))
+            host.view.layoutIfNeeded()
+            XCTAssertEqual(Set(gestureViews(host.view).map(ObjectIdentifier.init)), identities,
+                "All panes stay mounted, including those faded out")
+            XCTAssertEqual(group.sessions.map(ObjectIdentifier.init), sessions)
+            XCTAssertEqual(group.sessions.map { ObjectIdentifier($0.playback.renderer) }, renderers)
+            XCTAssertTrue(group.sessions.allSatisfy(\.resourcesActive))
+            let frames = panes.map { $0.convert($0.bounds, to: host.view) }
+            if id != nil {
+                XCTAssertGreaterThan(frames.map { $0.width * $0.height }.max() ?? 0,
+                    (originalFrames.map { $0.width * $0.height }.max() ?? 0) * 1.5)
+            } else {
+                for (frame, original) in zip(frames, originalFrames) {
+                    XCTAssertEqual(frame.minX, original.minX, accuracy: 1)
+                    XCTAssertEqual(frame.minY, original.minY, accuracy: 1)
+                    XCTAssertEqual(frame.width, original.width, accuracy: 1)
+                    XCTAssertEqual(frame.height, original.height, accuracy: 1)
+                }
+            }
+            capture(id == nil ? "Camera focus — restored grid" : "Camera focus — single camera")
+        }
+    }
+
     func testNativePlaybackSpeedMenuSupportsAllRates() async throws {
         XCTAssertEqual(CameraPlaybackSpeed.allCases.map(\.label), ["1×", "2×", "4×"])
         for speed in CameraPlaybackSpeed.allCases {
@@ -566,6 +625,34 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
         XCTAssertTrue(selections.isEmpty)
         host.dismiss(animated: false)
         XCTAssertTrue(selections.isEmpty)
+    }
+}
+
+@MainActor
+private final class CameraFocusHarnessState: ObservableObject {
+    @Published var focusedCameraID: String?
+}
+
+private struct CameraFocusHarness: View {
+    @ObservedObject var group: CameraGroupPlayback
+    @ObservedObject var state: CameraFocusHarnessState
+
+    var body: some View {
+        NavigationStack {
+            CameraGroupVideo(group: group, cameraControlsEnabled: true, controlsVisible: true,
+                focusedCameraID: state.focusedCameraID,
+                onFullScreen: { state.focusedCameraID = $0 }, onSingleTap: {})
+                .toolbar {
+                    ToolbarItem(placement: .navigation) {
+                        CameraPlayerCloseButton(returnsToCameras: state.focusedCameraID != nil) {
+                            state.focusedCameraID = nil
+                        }
+                    }
+                }
+        }
+        .environment(\.horizontalSizeClass, .regular)
+        .environment(\.verticalSizeClass, .regular)
+        .preferredColorScheme(.dark)
     }
 }
 

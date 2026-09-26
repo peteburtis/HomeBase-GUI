@@ -71,11 +71,17 @@ struct CameraLiveModeButton: View {
 
 /// Let the toolbar provide the dismissal button's label, sizing, and glass.
 struct CameraPlayerCloseButton: View {
+    var returnsToCameras = false
     let action: () -> Void
 
-    var body: some View {
-        Button(role: .close, action: action)
-            .accessibilityLabel("Close live video")
-            .accessibilityIdentifier("camera.close")
+    @ViewBuilder var body: some View {
+        if returnsToCameras {
+            Button("Back to cameras", systemImage: "chevron.backward", action: action)
+                .accessibilityIdentifier("camera.backToCameras")
+        } else {
+            Button(role: .close, action: action)
+                .accessibilityLabel("Close live video")
+                .accessibilityIdentifier("camera.close")
+        }
     }
 }

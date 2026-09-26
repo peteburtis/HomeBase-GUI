@@ -543,6 +543,7 @@ struct CameraDeviceHingeObserver: ViewModifier {
 }
 
 struct CameraGroupVideo: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var deviceHinge = CameraDeviceHingeState()
@@ -551,9 +552,12 @@ struct CameraGroupVideo: View {
     let controlsVisible: Bool
     var isAccessAllowed = true
     var allowsPictureInPicture = false
+    var focusedCameraID: String?
+    var onFullScreen: ((String) -> Void)?
     let onSingleTap: () -> Void
 
     var body: some View {
+        let presentation = CameraGroupPresentation(sessions: group.sessions, focusedCameraID: focusedCameraID)
         let ignoresSafeArea = CameraGroupLayout.ignoresSafeArea(
             horizontal: horizontalSizeClass,
             vertical: verticalSizeClass,
@@ -587,7 +591,11 @@ struct CameraGroupVideo: View {
                 Color.black
                 ForEach(Array(group.sessions.enumerated()), id: \.element.id) { index, session in
                     if cells.indices.contains(index) {
-                        let gravity = if let division {
+                        let isFocused = presentation.focusedSession === session
+                        let frame = presentation.frame(for: session, normal: cells[index], size: size, division: division)
+                        let gravity = if isFocused {
+                            CameraGroupLayout.VideoGravity.center
+                        } else if let division {
                             CameraGroupLayout.videoGravity(
                                 index: index,
                                 count: group.sessions.count,
@@ -623,24 +631,27 @@ struct CameraGroupVideo: View {
                                 arrangement: arrangement
                             )
                         }
-                        CameraGroupPane(session: session, group: group, cameraControlsEnabled: cameraControlsEnabled,
+                        CameraGroupPane(session: session, group: group,
+                            cameraControlsEnabled: cameraControlsEnabled && presentation.isVisible(session),
                             controlsVisible: controlsVisible,
                             isAccessAllowed: isAccessAllowed,
                             allowsPictureInPicture: allowsPictureInPicture,
-                            safeBounds: safeBounds.offsetBy(dx: -cells[index].minX, dy: -cells[index].minY),
+                            showsCameraLabel: presentation.showsMultipleCameras,
+                            onFullScreen: presentation.showsMultipleCameras ? onFullScreen.map { action in { action(session.id) } } : nil,
+                            safeBounds: safeBounds.offsetBy(dx: -frame.minX, dy: -frame.minY),
                             videoGravity: gravity,
                             labelAnchor: labelAnchor,
                             labelBelowVideo: labelBelowVideo,
                             onSingleTap: onSingleTap)
-                            .frame(width: cells[index].width, height: cells[index].height)
-                            .clipped()
-                            .position(x: cells[index].midX, y: cells[index].midY)
+                            .modifier(CameraFocusedPanePlacement(frame: frame,
+                                isVisible: presentation.isVisible(session), isFocused: isFocused))
                     }
                 }
             }
         }
         .modifier(CameraDeviceHingeObserver(state: $deviceHinge))
-        .animation(.snappy, value: group.sessions.map(\.id))
+        .animation(reduceMotion ? nil : .snappy, value: group.sessions.map(\.id))
+        .animation(reduceMotion ? nil : .snappy, value: presentation.focusedSession?.id)
     }
 }
 
@@ -655,6 +666,8 @@ private struct CameraGroupPane: View {
     let controlsVisible: Bool
     let isAccessAllowed: Bool
     let allowsPictureInPicture: Bool
+    let showsCameraLabel: Bool
+    let onFullScreen: (() -> Void)?
     let safeBounds: CGRect
     let videoGravity: CameraGroupLayout.VideoGravity
     let labelAnchor: CameraGroupLayout.LabelAnchor
@@ -665,6 +678,8 @@ private struct CameraGroupPane: View {
          controlsVisible: Bool,
          isAccessAllowed: Bool,
          allowsPictureInPicture: Bool,
+         showsCameraLabel: Bool,
+         onFullScreen: (() -> Void)?,
          safeBounds: CGRect,
          videoGravity: CameraGroupLayout.VideoGravity,
          labelAnchor: CameraGroupLayout.LabelAnchor,
@@ -678,6 +693,8 @@ private struct CameraGroupPane: View {
         self.controlsVisible = controlsVisible
         self.isAccessAllowed = isAccessAllowed
         self.allowsPictureInPicture = allowsPictureInPicture
+        self.showsCameraLabel = showsCameraLabel
+        self.onFullScreen = onFullScreen
         self.safeBounds = safeBounds
         self.videoGravity = videoGravity
         self.labelAnchor = labelAnchor
@@ -739,12 +756,19 @@ private struct CameraGroupPane: View {
         }
         .background(Color.black)
 #if os(iOS)
-        .modifier(CameraPiPPane(session: session, isLive: isLive,
-            canStart: isAccessAllowed && allowsPictureInPicture,
-            alignment: videoGravity.alignment))
+        .modifier(CameraPiPPane(session: session, alignment: videoGravity.alignment))
 #endif
+        .contextMenu {
+            if let onFullScreen {
+                Button("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right", action: onFullScreen)
+            }
+#if os(iOS)
+            CameraPiPMenuItems(session: session, isLive: isLive,
+                canStart: isAccessAllowed && allowsPictureInPicture)
+#endif
+        }
         .overlay {
-            if group.hasMultipleCameras && controlsVisible {
+            if showsCameraLabel && controlsVisible {
                 CameraGroupLabelLayout(
                     safeBounds: safeBounds,
                     aspectRatio: liveVideo.aspectRatio,
@@ -764,6 +788,9 @@ private struct CameraGroupPane: View {
         .onChange(of: gesturesEnabled, initial: true) { _, enabled in session.gestures.update(enabled: enabled) }
         .onChange(of: panTiltTarget?.observedPosition, initial: true) { _, _ in session.gestures.update(enabled: gesturesEnabled) }
         .onChange(of: controls.state) { _, _ in session.gestures.update(enabled: gesturesEnabled) }
+        .accessibilityActions {
+            if let onFullScreen { Button("Full Screen", action: onFullScreen) }
+        }
         .accessibilityAction(named: "Recenter \(session.camera.device.displayName)") {
             if gesturesEnabled { session.gestures.recenter() }
         }

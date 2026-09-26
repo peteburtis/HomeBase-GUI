@@ -632,17 +632,14 @@ private struct ObservedCameraPiPViewerRegistration: ViewModifier {
 struct CameraPiPPane: ViewModifier {
     @Environment(\.cameraPictureInPicture) private var controller
     @Environment(\.cameraPiPViewerID) private var viewerID
-    @Environment(\.cameraAccessSession) private var access
     let session: CameraGroupSession
-    let isLive: Bool
-    let canStart: Bool
     let alignment: Alignment
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if let controller, let viewerID, let access {
+        if let controller, let viewerID {
             content.modifier(ObservedCameraPiPPane(controller: controller, viewerID: viewerID,
-                access: access, cameraSession: session, isLive: isLive, canStart: canStart,
+                cameraSession: session,
                 alignment: alignment))
         } else { content }
     }
@@ -651,10 +648,7 @@ struct CameraPiPPane: ViewModifier {
 private struct ObservedCameraPiPPane: ViewModifier {
     @ObservedObject var controller: CameraPictureInPictureController
     let viewerID: UUID
-    let access: CameraAccessSession
     let cameraSession: CameraGroupSession
-    let isLive: Bool
-    let canStart: Bool
     let alignment: Alignment
 
     private var isSource: Bool {
@@ -666,10 +660,6 @@ private struct ObservedCameraPiPPane: ViewModifier {
         if let pending = controller.pendingSwap, pending.originViewerID == viewerID,
            pending.camera.id == cameraSession.camera.id { return pending }
         return isSource ? controller.session : nil
-    }
-
-    private var menuAction: CameraPiPMenuAction {
-        .init(isSource: isSource, isActive: controller.phase == .active, isLive: isLive)
     }
 
     func body(content: Content) -> some View {
@@ -688,18 +678,49 @@ private struct ObservedCameraPiPPane: ViewModifier {
                         .onDisappear { controller.sourceAttachmentChanged(sessionID: session.id, attached: false) }
                 }
             }
-            .contextMenu {
-                if isSource {
-                    Button(menuAction.title, systemImage: menuAction.systemImage) { controller.stop() }
-                } else if controller.isSupported, canStart, cameraSession.camera.artificialFeed == nil {
-                    Button(menuAction.title, systemImage: menuAction.systemImage) {
-                        controller.start(camera: cameraSession.camera, quality: cameraSession.quality,
-                            client: cameraSession.client, viewerID: viewerID, access: access)
-                    }
-                    .disabled(!controller.canStartOrSwap)
-                    .accessibilityHint("Shows this camera's live video in Picture in Picture")
-                }
+    }
+}
+
+/// Menu actions are separate from AVKit's inline attachment so the shared
+/// camera menu also works when PiP is unavailable (including artificial feeds).
+struct CameraPiPMenuItems: View {
+    @Environment(\.cameraPictureInPicture) private var controller
+    @Environment(\.cameraPiPViewerID) private var viewerID
+    @Environment(\.cameraAccessSession) private var access
+    let session: CameraGroupSession
+    let isLive: Bool
+    let canStart: Bool
+
+    var body: some View {
+        if let controller, let viewerID, let access {
+            ObservedCameraPiPMenuItems(controller: controller, viewerID: viewerID,
+                access: access, cameraSession: session, isLive: isLive, canStart: canStart)
+        }
+    }
+}
+
+private struct ObservedCameraPiPMenuItems: View {
+    @ObservedObject var controller: CameraPictureInPictureController
+    let viewerID: UUID
+    let access: CameraAccessSession
+    let cameraSession: CameraGroupSession
+    let isLive: Bool
+    let canStart: Bool
+
+    var body: some View {
+        let isSource = controller.session?.originViewerID == viewerID
+            && controller.session?.camera.id == cameraSession.id
+        let action = CameraPiPMenuAction(isSource: isSource, isActive: controller.phase == .active, isLive: isLive)
+        if isSource {
+            Button(action.title, systemImage: action.systemImage) { controller.stop() }
+        } else if controller.isSupported, canStart, cameraSession.camera.artificialFeed == nil {
+            Button(action.title, systemImage: action.systemImage) {
+                controller.start(camera: cameraSession.camera, quality: cameraSession.quality,
+                    client: cameraSession.client, viewerID: viewerID, access: access)
             }
+            .disabled(!controller.canStartOrSwap)
+            .accessibilityHint("Shows this camera's live video in Picture in Picture")
+        }
     }
 }
 #endif

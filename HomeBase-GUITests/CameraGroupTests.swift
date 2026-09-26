@@ -5,6 +5,79 @@ import XCTest
 
 @MainActor
 final class CameraGroupTests: XCTestCase {
+    func testFullScreenFocusPreservesGroupSessionsAndPausedHistory() async throws {
+        let group = try makeGroup()
+        defer { group.deactivate() }
+        group.activate(camera: try camera("A"), position: .canonical(500, paused: true))
+        group.toggle(try camera("B"))
+        group.toggle(try camera("C", history: false))
+        for session in group.sessions where session.historyAvailable {
+            session.playback.history.configure(cameraID: session.id, transport: GroupHistoryFetcher())
+            try await settled(session.playback.history)
+        }
+        let ids = group.sessions.map(\.id)
+        let sessions = group.sessions.map(ObjectIdentifier.init)
+        let renderers = group.sessions.map { ObjectIdentifier($0.playback.renderer) }
+        let batches = group.sessions.map { $0.playback.history.buffer.batches.map(\.batch.id) }
+        for focusedID in [nil, ids[1], ids[2], nil, ids[0], nil] {
+            let presentation = CameraGroupPresentation(sessions: group.sessions, focusedCameraID: focusedID)
+            XCTAssertEqual(presentation.focusedSession?.id, focusedID)
+            XCTAssertEqual(presentation.visibleSessions.map(\.id), focusedID.map { [$0] } ?? ids)
+            XCTAssertEqual(presentation.showsMultipleCameras, focusedID == nil)
+            XCTAssertEqual(group.sessions.map(ObjectIdentifier.init), sessions)
+            XCTAssertEqual(group.sessions.map { ObjectIdentifier($0.playback.renderer) }, renderers)
+            XCTAssertEqual(group.sessions.map { $0.playback.history.buffer.batches.map(\.batch.id) }, batches)
+            XCTAssertEqual(group.cursor, 500)
+            XCTAssertTrue(group.isPaused)
+            XCTAssertTrue(group.active)
+        }
+        let invalid = CameraGroupPresentation(sessions: group.sessions, focusedCameraID: "removed")
+        XCTAssertNil(invalid.focusedSession)
+        XCTAssertEqual(invalid.visibleSessions.map(\.id), ids)
+        group.toggle(try camera("C", history: false))
+        group.toggle(try camera("B"))
+        XCTAssertNil(CameraGroupPresentation(sessions: group.sessions, focusedCameraID: ids[0]).focusedSession,
+            "Collapsing to one camera removes the Back override")
+    }
+
+    func testFullScreenUsesSingleCameraFrameWhileHiddenPanesRetainTheirFrames() throws {
+        let client = try makeClient()
+        let sessions = try ["A", "B", "C", "D"].map { CameraGroupSession(camera: try camera($0), client: client) }
+        defer { sessions.forEach { $0.close() } }
+        let size = CGSize(width: 900, height: 600)
+        let divisions: [CameraGroupLayout.Division?] = [nil,
+            .init(frame: CGRect(x: 440, y: 0, width: 20, height: 600), margins: EdgeInsets()),
+            .init(frame: CGRect(x: 0, y: 290, width: 900, height: 20), margins: EdgeInsets())]
+        for division in divisions {
+            let cells = division.map { CameraGroupLayout.cells(count: 4, in: size, division: $0) }
+                ?? CameraGroupLayout.cells(count: 4, in: size)
+            for focused in sessions {
+                let presentation = CameraGroupPresentation(sessions: sessions, focusedCameraID: focused.id)
+                for (index, session) in sessions.enumerated() {
+                    let expected = session === focused
+                        ? (division.map { CameraGroupLayout.cells(count: 1, in: size, division: $0)[0] }
+                            ?? CGRect(origin: .zero, size: size)) : cells[index]
+                    XCTAssertEqual(presentation.frame(for: session, normal: cells[index], size: size, division: division), expected)
+                    XCTAssertEqual(presentation.isVisible(session), session === focused)
+                }
+            }
+        }
+    }
+
+    func testFocusedQualityDoesNotChangeOtherCamerasAndGroupCanReapplyItsPreference() throws {
+        let group = try makeGroup()
+        defer { group.deactivate() }
+        group.activate(camera: try camera("A"), position: .live)
+        group.toggle(try camera("B"))
+        group.setQuality(.high)
+        let presentation = CameraGroupPresentation(sessions: group.sessions, focusedCameraID: "B")
+        try XCTUnwrap(presentation.focusedSession).setQuality(.medium)
+        XCTAssertEqual(group.sessions.map(\.quality), [.high, .medium])
+        XCTAssertEqual(group.quality, .high)
+        group.setQuality(.high)
+        XCTAssertEqual(group.sessions.map(\.quality), [.high, .high])
+    }
+
     func testPickerDefaultsToMultipleWithoutChangingSingleCameraPlayback() async throws {
         let client = try makeClient()
         let session = CameraGroupSession(camera: try camera("A"), client: client, quality: .high)
