@@ -17,6 +17,44 @@ final class CameraTimelineTests: XCTestCase {
         )
     }
 
+    func testFoldPlayheadSitsBeyondReservedDivisionAndItsMargins() {
+        let bounds = CGRect(x: 20, y: 40, width: 800, height: 500)
+        let vertical = CameraGroupLayout.Division(
+            frame: CGRect(x: 405, y: 0, width: 30, height: 600),
+            margins: EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 18))
+        XCTAssertEqual(CameraTimelinePlayheadPlacement.position(in: bounds, division: vertical), 434,
+            "The complete two-point marker belongs beyond the trailing margin, in local coordinates")
+        XCTAssertNil(CameraTimelinePlayheadPlacement.position(in: bounds, division: nil))
+        let horizontal = CameraGroupLayout.Division(
+            frame: CGRect(x: 0, y: 290, width: 850, height: 20), margins: EdgeInsets())
+        XCTAssertNil(CameraTimelinePlayheadPlacement.position(in: bounds, division: horizontal),
+            "A horizontal fold does not move the top timeline's playhead sideways")
+        XCTAssertNil(CameraTimelinePlayheadPlacement.position(
+            in: CGRect(x: 500, y: 40, width: 300, height: 500), division: vertical))
+    }
+
+    func testOffCenterPlayheadFetchesLongerVisibleSideAndMovingItDoesNotSeek() async throws {
+        let model = CameraTimelineModel(clock: { 100 })
+        let fetcher = TimelineFetcher()
+        model.setViewport(800, cellWidth: 64, playhead: 650)
+        await model.open(cameraID: camera, transport: fetcher)
+        defer { model.close() }
+        let target = TimelineFetcher.anchor - 12 * 3600
+        model.follow(.canonical(target, paused: true))
+        let tile = Int(floor(target / CameraTimelineScale.seconds))
+        try await wait { model.previews[tile - 11] != nil }
+        XCTAssertLessThanOrEqual(model.previews.count, 48)
+        model.beginDrag()
+        model.setViewport(800, cellWidth: 64, playhead: 400)
+        XCTAssertFalse(model.dragging, "Unfolding cancels an obsolete gesture, even at the same width")
+        XCTAssertNil(model.endDrag())
+        XCTAssertEqual(model.cursor, target)
+        XCTAssertEqual(model.feedbackTick, 0)
+        model.beginDrag()
+        model.scrub(offset: CameraTimelineScale.offset(time: target - 1200, start: model.start, cellWidth: 64))
+        XCTAssertEqual(try XCTUnwrap(model.endDrag()), target - 1200, accuracy: 0.001)
+    }
+
     func testDynamicScaleRoundTripsAndKeepsSnapDistanceInPoints() async throws {
         let model = CameraTimelineModel(clock: { 100 })
         let fetcher = TimelineFetcher()
@@ -80,11 +118,35 @@ final class CameraTimelineTests: XCTestCase {
         XCTAssertEqual(CameraHistoryTimestamp.timelineString(for: latest.addingTimeInterval(-86401), latest: latest, timeZone: zone), "23:59:59 2026-03-07")
     }
 
-    func testIntervalLabelMustFitEntirelyBeforeThePlayhead() {
-        XCTAssertTrue(CameraTimelineScale.intervalLabelIsVisible(trailingEdge: 198.9, playhead: 200))
-        XCTAssertFalse(CameraTimelineScale.intervalLabelIsVisible(trailingEdge: 199, playhead: 200), "Touching the line hides the whole label")
-        XCTAssertFalse(CameraTimelineScale.intervalLabelIsVisible(trailingEdge: 208, playhead: 200), "Crossing labels are not partially clipped")
-        XCTAssertFalse(CameraTimelineScale.intervalLabelIsVisible(trailingEdge: 350, playhead: 200), "The trailing half belongs to the current timestamp")
+    func testIntervalLabelsAppearOnBothSidesButAvoidPlayheadAndTimestamp() {
+        func visible(_ x: CGFloat, width: CGFloat = 30, timestampWidth: CGFloat = 50) -> Bool {
+            CameraTimelineScale.intervalLabelIsVisible(
+                frame: CGRect(x: x, y: 0, width: width, height: 10),
+                playhead: 200, timestampWidth: timestampWidth)
+        }
+        XCTAssertTrue(visible(168.9))
+        XCTAssertFalse(visible(169), "Touching the playhead hides the whole label")
+        XCTAssertFalse(visible(180), "Labels crossing the marker are not partially clipped")
+        XCTAssertFalse(visible(204), "An interval overlapping the current time is hidden")
+        XCTAssertFalse(visible(250), "Partial overlap is also hidden")
+        XCTAssertFalse(visible(262), "Leave six points after the current timestamp")
+        XCTAssertTrue(visible(262.1))
+        XCTAssertTrue(visible(350), "The remainder of the trailing side shows interval labels")
+        XCTAssertFalse(visible(270, timestampWidth: 120), "The full date needs more space than time alone")
+        XCTAssertTrue(visible(332.1, timestampWidth: 120))
+        XCTAssertFalse(visible(350, timestampWidth: 0), "Wait for the first timestamp measurement")
+        XCTAssertTrue(visible(100, timestampWidth: 0), "Leading labels need no timestamp measurement")
+    }
+
+    func testIntervalLabelCollisionFollowsFoldOffset() {
+        for playhead: CGFloat in [200, 450, 620] {
+            XCTAssertFalse(CameraTimelineScale.intervalLabelIsVisible(
+                frame: CGRect(x: playhead + 20, y: 0, width: 30, height: 10),
+                playhead: playhead, timestampWidth: 50))
+            XCTAssertTrue(CameraTimelineScale.intervalLabelIsVisible(
+                frame: CGRect(x: playhead + 80, y: 0, width: 30, height: 10),
+                playhead: playhead, timestampWidth: 50))
+        }
     }
 
     func testThumbnailAspectAndGentleSnapZone() {
@@ -370,6 +432,138 @@ final class CameraTimelineTests: XCTestCase {
     }
 
 #if os(iOS)
+    func testMountedTimelineShowsTrailingIntervalsBesideShortAndDatedTimestamps() async throws {
+        let fetcher = TimelineFetcher(jpeg: try sampleJPEG())
+        let recent = floor((TimelineFetcher.anchor - 3600) / 1200) * 1200 + 60
+        var target = recent
+        let host = UIHostingController(rootView: CameraHistoryTimeline(
+            makeTransport: { fetcher }, cameraID: camera,
+            timeZone: TimeZone(secondsFromGMT: 0)!,
+            position: { .canonical(target, paused: true) },
+            onBegin: { XCTFail("Label changes are not scrubbing") },
+            onSeek: { _ in XCTFail("Label changes cannot seek") })
+            .environment(\.cameraTimelinePlayhead, 140)
+            .environment(\.scenePhase, .active)
+            .frame(width: 400)
+            .padding(.top, 24)
+            .frame(width: 400, height: 200, alignment: .top)
+            .background(.black)
+            .preferredColorScheme(.dark))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host; window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(500))
+        let scroll = try XCTUnwrap(findScroll(in: host.view))
+        for age in [0.0, 86400.0, 0.0] {
+            target = recent - age
+            try await Task.sleep(for: .milliseconds(500))
+            host.view.layoutIfNeeded()
+            let frame = scroll.convert(scroll.bounds, to: host.view)
+            let image = UIGraphicsImageRenderer(size: scroll.bounds.size).image { context in
+                context.cgContext.translateBy(x: -frame.minX, y: -frame.minY)
+                host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+            }
+            let attachment = XCTAttachment(image: image)
+            attachment.name = age == 0 ? "Trailing labels — time only" : "Trailing labels — date collision"
+            attachment.lifetime = .keepAlways; add(attachment)
+            let cgImage = try XCTUnwrap(image.cgImage)
+            var pixels = [UInt8](repeating: 0, count: cgImage.width * cgImage.height * 4)
+            try pixels.withUnsafeMutableBytes { buffer in
+                let context = try XCTUnwrap(CGContext(data: buffer.baseAddress, width: cgImage.width, height: cgImage.height,
+                    bitsPerComponent: 8, bytesPerRow: cgImage.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue))
+                context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+            }
+            // The next mark is 19 minutes ahead. Its label fits after a short
+            // timestamp; with a date, the following mark is the first clear one.
+            let intervalX = 140 + (age == 0 ? 19.0 / 20 : 39.0 / 20) * CameraTimelineScale.cellWidth
+            let columns = Int(intervalX * image.scale)..<Int((intervalX + 30) * image.scale)
+            let rows = (cgImage.height - Int(10 * image.scale))..<cgImage.height
+            XCTAssertTrue(rows.contains { y in columns.contains { x in
+                let index = (y * cgImage.width + x) * 4
+                return pixels[index] > 180 && pixels[index + 1] > 140 && pixels[index + 2] < 100
+            } }, "Clear interval labels remain visible beyond either timestamp width")
+        }
+    }
+
+    func testMountedFoldPlayheadMovesWithTimestampWithoutResizingOrSeeking() async throws {
+        let fetcher = TimelineFetcher(jpeg: try sampleJPEG())
+        let relay = CameraToolbarScrubRelay()
+        var target = TimelineFetcher.anchor - 3600
+        var seeks: [Date] = []
+        var begins = 0
+        func timeline(playhead: CGFloat?) -> some View {
+            CameraHistoryTimeline(makeTransport: { fetcher }, cameraID: camera,
+                timeZone: TimeZone(secondsFromGMT: 0)!,
+                position: { .canonical(target, paused: true) },
+                onBegin: { begins += 1 }, onSeek: { seeks.append($0); target = $0.timeIntervalSince1970 },
+                toolbarScrubRelay: relay)
+                .environment(\.cameraTimelinePlayhead, playhead)
+                .environment(\.scenePhase, .active)
+                .frame(width: 800)
+                .padding(.top, 24)
+                .frame(width: 800, height: 200, alignment: .top)
+                .background(.black)
+                .preferredColorScheme(.dark)
+        }
+        let host = UIHostingController(rootView: timeline(playhead: nil))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host; window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(500))
+        let scroll = try XCTUnwrap(findScroll(in: host.view))
+        let height = scroll.bounds.height
+        let start = CameraTimelineScale.windowStart(at: target, latest: TimelineFetcher.anchor)
+        for playhead: CGFloat? in [nil, 450, 620, nil] {
+            host.rootView = timeline(playhead: playhead)
+            host.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(350))
+            XCTAssertEqual(scroll.bounds.width, 800, accuracy: 1)
+            XCTAssertEqual(scroll.bounds.height, height, accuracy: 0.5)
+            XCTAssertEqual(scroll.contentOffset.x + scroll.adjustedContentInset.left,
+                CameraTimelineScale.offset(time: target, start: start), accuracy: 2,
+                "Folding moves the content and marker together without changing the selected time")
+            XCTAssertEqual(begins, 0)
+            XCTAssertTrue(seeks.isEmpty)
+            let frame = scroll.convert(scroll.bounds, to: host.view)
+            let image = UIGraphicsImageRenderer(size: scroll.bounds.size).image { context in
+                context.cgContext.translateBy(x: -frame.minX, y: -frame.minY)
+                host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+            }
+            let attachment = XCTAttachment(image: image)
+            attachment.name = "Full-width timeline — playhead \(playhead ?? 400)"
+            attachment.lifetime = .keepAlways; add(attachment)
+            let cgImage = try XCTUnwrap(image.cgImage)
+            var pixels = [UInt8](repeating: 0, count: cgImage.width * cgImage.height * 4)
+            try pixels.withUnsafeMutableBytes { buffer in
+                let context = try XCTUnwrap(CGContext(data: buffer.baseAddress, width: cgImage.width, height: cgImage.height,
+                    bitsPerComponent: 8, bytesPerRow: cgImage.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue))
+                context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+            }
+            let x = Int((playhead ?? 400) * image.scale), y = cgImage.height / 2
+            let index = (y * cgImage.width + x) * 4
+            XCTAssertGreaterThan(pixels[index], 180, "The yellow marker moves beyond the fold")
+            XCTAssertGreaterThan(pixels[index + 1], 140)
+            XCTAssertLessThan(pixels[index + 2], 100)
+        }
+        host.rootView = timeline(playhead: 450)
+        try await Task.sleep(for: .milliseconds(350))
+        let beforeScrub = target
+        relay.events.send(.began)
+        relay.events.send(.changed(translation: CameraTimelineScale.cellWidth))
+        relay.events.send(.ended(translation: CameraTimelineScale.cellWidth))
+        try await wait { seeks.count == 1 }
+        XCTAssertEqual(begins, 1)
+        XCTAssertEqual(try XCTUnwrap(seeks.first).timeIntervalSince1970, beforeScrub - 1200, accuracy: 0.001)
+        let availability = await fetcher.availability.count
+        XCTAssertEqual(availability, 1, "Moving the playhead does not reopen the timeline connection")
+    }
+
     func testToolbarScrubRelayDrivesTheMountedTimeline() async throws {
         let relay = CameraToolbarScrubRelay()
         let fetcher = TimelineFetcher()
@@ -734,8 +928,8 @@ final class CameraTimelineTests: XCTestCase {
         XCTAssertTrue(labelRows.contains { y in currentTimeColumns.contains { x in isYellow(x: x, y: y) } },
             "Current playback time is yellow alongside the interval labels", file: file, line: line)
         let trailingLabels = min(width, centerColumn + Int(120 * image.scale))..<width
-        XCTAssertFalse(labelRows.contains { y in trailingLabels.contains { x in isYellow(x: x, y: y) } },
-            "No interval labels remain to the right of the timestamp", file: file, line: line)
+        XCTAssertTrue(labelRows.contains { y in trailingLabels.contains { x in isYellow(x: x, y: y) } },
+            "Interval labels resume to the right of the timestamp", file: file, line: line)
         if intervalCrossesPlayhead {
             let overlapColumns = centerColumn - Int(20 * image.scale)..<centerColumn - Int(2 * image.scale)
             XCTAssertFalse(labelRows.contains { y in overlapColumns.contains { x in isYellow(x: x, y: y) } },
@@ -830,7 +1024,8 @@ private struct TimelineTestCanvas: View {
     @ObservedObject var layout: TimelineTestLayout
     var body: some View {
         let ignoresSafeArea = CameraGroupLayout.ignoresSafeArea(
-            horizontal: horizontalSizeClass, vertical: verticalSizeClass
+            horizontal: horizontalSizeClass,
+            vertical: verticalSizeClass
         )
         CameraGroupCanvas(ignoresSafeArea: ignoresSafeArea) { size, safe in
             let arrangement = CameraGroupLayout.arrangement(count: layout.count, in: size)

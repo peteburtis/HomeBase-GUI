@@ -424,7 +424,7 @@ vertically on the timeline while keeping its horizontal safe-area anchor;
 horizontal scrolling still scrubs time. The timeline and PTZ panel cannot both
 be open. Hiding the timeline closes its thumbnail
 connection and stops follow/fetch work. It also hides with all player chrome,
-preserving its chosen visibility when chrome returns. A fixed center marker is the
+preserving its chosen visibility when chrome returns. A normally centered marker is the
 playback position. With a **compact vertical size class**, the timeline itself
 extends through the side and bottom safe areas to the screen edges; regular
 height keeps its safe-area layout. Compact width alone does not mean portrait.
@@ -432,6 +432,16 @@ The playhead reaches the bottom edge, with no bottom container padding;
 the numeric label row leaves just two physical pixels below its text baseline.
 The playhead and timeline labels are yellow, with semibold monospaced digits
 for the current playback timestamp and thumbnail interval times.
+Interval labels appear on both sides of the playhead. A label is hidden in full
+only when it touches the marker or overlaps the current timestamp (including a
+six-point breathing gap). The exclusion uses the timestamp's rendered width,
+so it grows when older footage adds the date and shrinks again for time alone.
+With an active vertical fold division, the strip remains full-width across the
+top of both panels. The playhead sits immediately beyond the division's trailing
+reserved margin, with its timestamp alongside it. Asymmetric scroll padding
+keeps that instant under the marker; folding/unfolding is not a seek. A horizontal
+division or no active division leaves the playhead centered. Thumbnail prefetch
+covers the longer visible side while retaining the same bounded cache.
 The toolbar and camera-label safe areas are unchanged. The
 past is left, future is right. Each thumbnail cell
 represents 20 minutes, but scrolling seeks continuously, not in 20-minute steps.
@@ -462,7 +472,7 @@ sizing reference within Multiple mode. Native toolbars/popovers retain system ad
 the explicitly requested popover behavior in compact layouts).
 
 Each interval label is left-aligned to its interval's start, but is hidden in
-full if it touches or crosses the playhead or lies to its right. The current
+full if it touches or crosses the playhead or conflicts with the current timestamp. The current
 playback timestamp owns the bottom label row just to the right of the playhead,
 on the same baseline as the remaining interval labels. It stays visible during
 scrubbing, with no fade mask. It shows `HH:mm:ss` within the last 24 elapsed hours

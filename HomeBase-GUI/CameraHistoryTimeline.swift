@@ -4,13 +4,14 @@ import HomeBaseProtocol
 import ImageIO
 
 /// One cell represents twenty minutes, not one seek step. The
-/// continuous center cursor can land anywhere inside a cell.
+/// continuous cursor can land anywhere inside a cell.
 nonisolated enum CameraTimelineScale {
     static let seconds: Double = 20 * 60
     static let cellWidth: Double = 112
     static let thumbnailHeight = cellWidth * 9 / 16
     static let snapDistance: Double = 3
     static let playheadWidth: CGFloat = 2
+    static let timestampSpacing: CGFloat = 6
     static let windowCells = 72
     static func offset(time: Double, start: Double, cellWidth: Double = cellWidth) -> Double { (time - start) / seconds * cellWidth }
     static func time(offset: Double, start: Double, end: Double, cellWidth: Double = cellWidth) -> Double {
@@ -25,8 +26,13 @@ nonisolated enum CameraTimelineScale {
               abs(mark - time) / seconds * cellWidth <= snapDistance + 0.000_001 else { return time }
         return mark
     }
-    static func intervalLabelIsVisible(trailingEdge: CGFloat, playhead: CGFloat) -> Bool {
-        trailingEdge < playhead - playheadWidth / 2
+    static func intervalLabelIsVisible(frame: CGRect, playhead: CGFloat, timestampWidth: CGFloat) -> Bool {
+        if frame.maxX < playhead - playheadWidth / 2 { return true }
+        // Wait for the rendered timestamp's width before showing labels on
+        // its side. Older footage includes a date, so a fixed exclusion width
+        // would either overlap it or unnecessarily hide nearby interval labels.
+        return timestampWidth > 0
+            && frame.minX > playhead + timestampSpacing + timestampWidth + timestampSpacing
     }
 }
 
@@ -42,10 +48,30 @@ private struct CameraTimelineThumbnailSizeKey: EnvironmentKey {
     static let defaultValue = CameraTimelineSizing.standard
 }
 
+private struct CameraTimelinePlayheadKey: EnvironmentKey {
+    static let defaultValue: CGFloat? = nil
+}
+
+enum CameraTimelinePlayheadPlacement {
+    /// Coordinates are relative to the timeline, not the full media canvas.
+    /// Keep the entire marker beyond the fold's frame and recommended margins.
+    static func position(in bounds: CGRect, division: CameraGroupLayout.Division?) -> CGFloat? {
+        guard let division, division.axis == .vertical,
+              division.reservedFrame.intersects(bounds) else { return nil }
+        return min(bounds.width, max(0,
+            division.reservedFrame.maxX - bounds.minX + CameraTimelineScale.playheadWidth / 2))
+    }
+}
+
 extension EnvironmentValues {
     var cameraTimelineThumbnailSize: CGSize {
         get { self[CameraTimelineThumbnailSizeKey.self] }
         set { self[CameraTimelineThumbnailSizeKey.self] = newValue }
+    }
+
+    var cameraTimelinePlayhead: CGFloat? {
+        get { self[CameraTimelinePlayheadKey.self] }
+        set { self[CameraTimelinePlayheadKey.self] = newValue }
     }
 }
 
@@ -100,6 +126,7 @@ final class CameraTimelineModel: ObservableObject {
     private var generation = UUID()
     private var wanted: [Int] = []
     private var viewport: Double = 700
+    private var viewportPlayhead: Double = 350
     private(set) var cellWidth: Double = CameraTimelineScale.cellWidth
     private var unsupported = false
     private let clock: () -> Double
@@ -157,12 +184,14 @@ final class CameraTimelineModel: ObservableObject {
         if cursor! < start + 6 * CameraTimelineScale.seconds || cursor! > end { recenter() }
         updateWanted()
     }
-    func setViewport(_ width: Double, cellWidth: Double = CameraTimelineScale.cellWidth) {
+    func setViewport(_ width: Double, cellWidth: Double = CameraTimelineScale.cellWidth, playhead: Double? = nil) {
         let newWidth = max(1, cellWidth), newViewport = max(1, width)
+        let newPlayhead = min(newViewport, max(0, playhead ?? newViewport / 2))
         // Rotation/resizing is layout, not a user seek. Cancel any obsolete
         // scroll gesture before interpreting offsets in the new scale.
-        if self.cellWidth != newWidth || viewport != newViewport { dragging = false }
+        if self.cellWidth != newWidth || viewport != newViewport || viewportPlayhead != newPlayhead { dragging = false }
         self.cellWidth = newWidth
+        viewportPlayhead = newPlayhead
         viewport = newViewport; updateWanted()
     }
     func beginDrag() {
@@ -203,7 +232,9 @@ final class CameraTimelineModel: ObservableObject {
         let center = Int(floor(cursor / CameraTimelineScale.seconds))
         // Keep the visible-work set below the cache cap even in a very wide
         // desktop window, so eviction can never cause a perpetual refetch loop.
-        let radius = min(23, Int(ceil(viewport / cellWidth / 2)) + 2)
+        // A fold shifts the playhead off-center. Cover the longer visible
+        // side as well as the shorter one, without exceeding the cache cap.
+        let radius = min(23, Int(ceil(max(viewportPlayhead, viewport - viewportPlayhead) / cellWidth)) + 2)
         let lower = max(tiles.lowerBound, center - radius)
         let upper = max(lower, min(tiles.upperBound, center + radius + 1))
         wanted = (lower..<upper)
@@ -273,7 +304,8 @@ enum CameraTimelinePlacementEdge {
 
 /// Compact height is a layout trait, not an orientation or device-name test.
 /// It uses the full canvas under the system bars. Regular height respects the
-/// safe bounds, while the timeline itself keeps the same size in both.
+/// safe bounds, while the timeline itself keeps the same size in both. An active
+/// fold keeps the strip full-width and moves only its playhead beyond the fold.
 struct CameraTimelinePlacement<Content: View>: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     let edge: CameraTimelinePlacementEdge
@@ -287,13 +319,15 @@ struct CameraTimelinePlacement<Content: View>: View {
     }
 
     var body: some View {
-        CameraGroupCanvas { size, safeBounds in
+        CameraGroupCanvas { size, safeBounds, division in
             let compact = verticalSizeClass == .compact
             let bounds = compact
                 ? CGRect(origin: .zero, size: size)
                 : safeBounds
             content
                 .environment(\.cameraTimelineThumbnailSize, CameraTimelineSizing.standard)
+                .environment(\.cameraTimelinePlayhead,
+                    CameraTimelinePlayheadPlacement.position(in: bounds, division: division))
                 .frame(
                     width: bounds.width,
                     height: bounds.height,
@@ -327,10 +361,12 @@ struct CameraHistoryTimeline: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.displayScale) private var displayScale
     @Environment(\.cameraTimelineThumbnailSize) private var thumbnailSize
+    @Environment(\.cameraTimelinePlayhead) private var preferredPlayhead
     @StateObject private var model = CameraTimelineModel()
     @State private var scroll = ScrollPosition(x: 0)
     @State private var attempt = 0
     @State private var viewportWidth: CGFloat = 0
+    @State private var timestampWidth: CGFloat = 0
 #if os(iOS)
     @State private var toolbarDragStartOffset: Double?
 #endif
@@ -349,6 +385,10 @@ struct CameraHistoryTimeline: View {
     var onCancel: () -> Void = {}
     var toolbarScrubRelay: CameraToolbarScrubRelay?
 
+    private var playhead: CGFloat {
+        min(viewportWidth, max(0, preferredPlayhead ?? viewportWidth / 2))
+    }
+
     var body: some View {
         ScrollView(.horizontal) {
             // At most 72 cells. Eager geometry avoids lazy-stack estimates
@@ -363,7 +403,10 @@ struct CameraHistoryTimeline: View {
                     }
                 }
             }
-            .padding(.horizontal, viewportWidth / 2)
+            // Asymmetric padding keeps content offsets in time coordinates:
+            // the same instant stays under the marker when the fold changes.
+            .padding(.leading, playhead)
+            .padding(.trailing, viewportWidth - playhead)
         }
         // The invisible reference cell gives the scroll view its final height
         // before availability or thumbnails arrive.
@@ -398,9 +441,11 @@ struct CameraHistoryTimeline: View {
             onSeek(Date(timeIntervalSince1970: min(model.latest ?? cursor,
                 cursor + (direction == .increment ? 1 : -1) * CameraTimelineScale.seconds)))
         }
-        .overlay {
+        .overlay(alignment: .leading) {
             if model.cursor != nil {
-                Rectangle().fill(.yellow).frame(width: CameraTimelineScale.playheadWidth).allowsHitTesting(false)
+                Rectangle().fill(.yellow).frame(width: CameraTimelineScale.playheadWidth)
+                    .offset(x: playhead - CameraTimelineScale.playheadWidth / 2)
+                    .allowsHitTesting(false)
             }
         }
         .overlay(alignment: .bottomLeading) {
@@ -411,7 +456,8 @@ struct CameraHistoryTimeline: View {
                         .font(.system(size: 10, weight: .semibold).monospacedDigit())
                         .lineLimit(1)
                 }
-                .padding(.leading, viewportWidth / 2 + 6)
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { timestampWidth = $0 }
+                .padding(.leading, playhead + CameraTimelineScale.timestampSpacing)
                 .allowsHitTesting(false)
                 .accessibilityHidden(true) // The adjustable timeline announces the full timestamp.
             }
@@ -427,6 +473,7 @@ struct CameraHistoryTimeline: View {
         .foregroundStyle(.yellow)
         .sensoryFeedback(.selection, trigger: model.feedbackTick)
         .onChange(of: thumbnailSize, initial: true) { _, _ in updateScale() }
+        .onChange(of: preferredPlayhead) { _, _ in updateScale() }
 #if os(iOS)
         .onReceive(toolbarScrubEvents) { handleToolbarScrub($0) }
 #endif
@@ -503,7 +550,15 @@ struct CameraHistoryTimeline: View {
         scroll.scrollTo(x: CameraTimelineScale.offset(time: cursor, start: model.start, cellWidth: model.cellWidth))
     }
     private func updateScale() {
-        model.setViewport(viewportWidth, cellWidth: thumbnailSize.width)
+        let wasDragging = model.dragging
+        model.setViewport(viewportWidth, cellWidth: thumbnailSize.width, playhead: playhead)
+        if wasDragging, !model.dragging {
+#if os(iOS)
+            toolbarDragStartOffset = nil
+#endif
+            onCancel()
+            model.follow(position())
+        }
         alignScroll()
     }
     private func finishDrag(offset: Double? = nil) {
@@ -558,7 +613,7 @@ struct CameraHistoryTimeline: View {
     private func cell(_ tile: Int) -> some View {
         let start = Double(tile) * CameraTimelineScale.seconds
         let width = min(thumbnailSize.width, max(0, (model.end - start) / CameraTimelineScale.seconds * thumbnailSize.width))
-        let space = timelineSpace, playhead = viewportWidth / 2
+        let space = timelineSpace, playhead = self.playhead, timestampWidth = self.timestampWidth
         return VStack(spacing: CameraTimelineSizing.thumbnailToScrubberSpacing) {
             ZStack {
                 thumbnailGridCell
@@ -579,8 +634,8 @@ struct CameraHistoryTimeline: View {
                     .fixedSize()
                     .visualEffect { content, geometry in
                         content.opacity(CameraTimelineScale.intervalLabelIsVisible(
-                            trailingEdge: geometry.frame(in: .named(space)).maxX,
-                            playhead: playhead) ? 1 : 0)
+                            frame: geometry.frame(in: .named(space)),
+                            playhead: playhead, timestampWidth: timestampWidth) ? 1 : 0)
                     }
                     .frame(width: thumbnailSize.width, alignment: .leading)
             }
