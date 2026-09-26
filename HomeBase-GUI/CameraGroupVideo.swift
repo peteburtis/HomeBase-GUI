@@ -1,9 +1,49 @@
 import SwiftUI
 import HomeBaseProtocol
 
+struct CameraDeviceHingeState: Equatable {
+    var isPresent = false
+    var isClosed = false
+}
+
 enum CameraGroupLayout {
     enum Arrangement: Equatable { case grid, column }
     enum LabelAnchor: Equatable { case leading, trailing }
+
+    struct Division: Equatable {
+        enum Axis: Equatable { case vertical, horizontal }
+
+        let frame: CGRect
+        let margins: EdgeInsets
+
+        var axis: Axis {
+            frame.height >= frame.width ? .vertical : .horizontal
+        }
+
+        var reservedFrame: CGRect {
+            CGRect(
+                x: frame.minX - margins.leading,
+                y: frame.minY - margins.top,
+                width: frame.width + margins.leading + margins.trailing,
+                height: frame.height + margins.top + margins.bottom
+            )
+        }
+    }
+
+    struct CanvasPlacement {
+        let frame: CGRect
+        let safeBounds: CGRect
+        let division: Division?
+
+        init(size: CGSize, safeBounds: CGRect, division: Division?, occlusions: [CGRect]) {
+            let frame = unobscuredContentRect(in: size, occlusions: occlusions)
+            self.frame = frame
+            self.safeBounds = safeBounds.offsetBy(dx: -frame.minX, dy: -frame.minY)
+            self.division = division.map {
+                Division(frame: $0.frame.offsetBy(dx: -frame.minX, dy: -frame.minY), margins: $0.margins)
+            }
+        }
+    }
 
     struct VideoGravity: Equatable {
         enum Horizontal: Equatable { case leading, center, trailing }
@@ -58,8 +98,70 @@ enum CameraGroupLayout {
         return columnArea > gridArea ? .column : .grid
     }
 
-    static func ignoresSafeArea(horizontal: UserInterfaceSizeClass?, vertical: UserInterfaceSizeClass?) -> Bool {
-        horizontal == .regular && vertical == .compact
+    static func ignoresSafeArea(
+        horizontal: UserInterfaceSizeClass?,
+        vertical: UserInterfaceSizeClass?,
+        controlsVisible: Bool = true,
+        hasDeviceHinge: Bool = false
+    ) -> Bool {
+        !controlsVisible || vertical == .compact
+            || (hasDeviceHinge && horizontal == .compact)
+    }
+
+    static func avoidsOcclusions(
+        horizontal: UserInterfaceSizeClass?,
+        hinge: CameraDeviceHingeState
+    ) -> Bool {
+        horizontal == .compact && !(hinge.isPresent && hinge.isClosed)
+    }
+
+    /// Largest axis-aligned rectangle outside every reported obstruction.
+    /// Unlike safe-area insets, this doesn't reserve space for system bars.
+    /// Region frames already include the system's interactive-content margins.
+    static func unobscuredContentRect(in size: CGSize, occlusions: [CGRect]) -> CGRect {
+        let bounds = CGRect(origin: .zero, size: size)
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 0, size.height > 0 else { return .zero }
+        let obstacles = occlusions.compactMap { frame -> CGRect? in
+            guard !frame.isNull, !frame.isEmpty else { return nil }
+            let clipped = frame.intersection(bounds)
+            return clipped.isNull || clipped.isEmpty ? nil : clipped
+        }
+        guard !obstacles.isEmpty else { return bounds }
+
+        // Every maximal rectangle's left/right edges lie on the canvas or an
+        // obstacle edge. For each such span, merge blocked vertical intervals
+        // and consider the remaining gaps. No per-device cutout dimensions.
+        let xs = Set([bounds.minX, bounds.maxX]
+            + obstacles.flatMap { [$0.minX, $0.maxX] }).sorted()
+        var best = CGRect.zero
+        func consider(_ candidate: CGRect) {
+            guard candidate.width > 0, candidate.height > 0 else { return }
+            let area = candidate.width * candidate.height
+            let bestArea = best.width * best.height
+            let distance = pow(candidate.midX - bounds.midX, 2) + pow(candidate.midY - bounds.midY, 2)
+            let bestDistance = pow(best.midX - bounds.midX, 2) + pow(best.midY - bounds.midY, 2)
+            // Equal areas prefer the more centered result, then the first
+            // (leading/top) candidate, independent of API enumeration order.
+            if area > bestArea || (area == bestArea && distance < bestDistance) {
+                best = candidate
+            }
+        }
+        for left in xs.indices.dropLast() {
+            for right in (left + 1)..<xs.count {
+                let blocked = obstacles.filter { $0.minX < xs[right] && $0.maxX > xs[left] }
+                    .sorted { $0.minY < $1.minY }
+                var y = bounds.minY
+                for obstacle in blocked {
+                    if obstacle.minY > y {
+                        consider(CGRect(x: xs[left], y: y, width: xs[right] - xs[left], height: obstacle.minY - y))
+                    }
+                    y = max(y, obstacle.maxY)
+                }
+                consider(CGRect(x: xs[left], y: y, width: xs[right] - xs[left], height: bounds.maxY - y))
+            }
+        }
+        return best
     }
 
     private static func displayedVideoArea(
@@ -109,6 +211,100 @@ enum CameraGroupLayout {
         let width = size.width / CGFloat(columns), height = size.height / CGFloat(rows)
         return (0..<count).map { index in
             CGRect(x: CGFloat(index % columns) * width, y: CGFloat(index / columns) * height, width: width, height: height)
+        }
+    }
+
+    /// Divides the media canvas around the first active fold region. A vertical
+    /// fold fills leading then trailing; a horizontal fold is the transpose and
+    /// fills top then bottom. Once a third camera is present, each side is split
+    /// along its remaining axis.
+    static func cells(count: Int, in size: CGSize, division: Division) -> [CGRect] {
+        guard (1...4).contains(count), size.width > 0, size.height > 0 else { return [] }
+        let bounds = CGRect(origin: .zero, size: size)
+        let reserved = division.reservedFrame
+
+        switch division.axis {
+        case .vertical:
+            let leadingEdge = min(max(reserved.minX, bounds.minX), bounds.maxX)
+            let trailingEdge = min(max(reserved.maxX, leadingEdge), bounds.maxX)
+            let leading = CGRect(x: bounds.minX, y: bounds.minY,
+                                 width: leadingEdge - bounds.minX, height: bounds.height)
+            let trailing = CGRect(x: trailingEdge, y: bounds.minY,
+                                  width: bounds.maxX - trailingEdge, height: bounds.height)
+            if count <= 2 {
+                return Array([leading, trailing].prefix(count))
+            }
+            let leadingHalves = splitVertically(leading)
+            let trailingHalves = splitVertically(trailing)
+            return Array([
+                leadingHalves.0, trailingHalves.0,
+                leadingHalves.1, trailingHalves.1,
+            ].prefix(count))
+
+        case .horizontal:
+            let topEdge = min(max(reserved.minY, bounds.minY), bounds.maxY)
+            let bottomEdge = min(max(reserved.maxY, topEdge), bounds.maxY)
+            let top = CGRect(x: bounds.minX, y: bounds.minY,
+                             width: bounds.width, height: topEdge - bounds.minY)
+            let bottom = CGRect(x: bounds.minX, y: bottomEdge,
+                                width: bounds.width, height: bounds.maxY - bottomEdge)
+            if count <= 2 {
+                return Array([top, bottom].prefix(count))
+            }
+            let topHalves = splitHorizontally(top)
+            let bottomHalves = splitHorizontally(bottom)
+            return Array([
+                topHalves.0, bottomHalves.0,
+                topHalves.1, bottomHalves.1,
+            ].prefix(count))
+        }
+    }
+
+    private static func splitVertically(_ frame: CGRect) -> (CGRect, CGRect) {
+        let firstHeight = frame.height / 2
+        return (
+            CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: firstHeight),
+            CGRect(x: frame.minX, y: frame.minY + firstHeight,
+                   width: frame.width, height: frame.height - firstHeight)
+        )
+    }
+
+    private static func splitHorizontally(_ frame: CGRect) -> (CGRect, CGRect) {
+        let firstWidth = frame.width / 2
+        return (
+            CGRect(x: frame.minX, y: frame.minY, width: firstWidth, height: frame.height),
+            CGRect(x: frame.minX + firstWidth, y: frame.minY,
+                   width: frame.width - firstWidth, height: frame.height)
+        )
+    }
+
+    static func labelAnchor(index: Int, count: Int, divisionAxis: Division.Axis) -> LabelAnchor {
+        switch divisionAxis {
+        case .vertical:
+            return index.isMultiple(of: 2) ? .leading : .trailing
+        case .horizontal:
+            guard count > 2 else { return .leading }
+            return index < 2 ? .leading : .trailing
+        }
+    }
+
+    static func labelsBelowVideo(count: Int, divisionAxis: Division.Axis) -> Bool {
+        count == 2 && divisionAxis == .vertical
+    }
+
+    static func videoGravity(
+        index: Int,
+        count: Int,
+        divisionAxis: Division.Axis
+    ) -> VideoGravity {
+        guard count > 2 else { return .center }
+        // Keep each pair touching along its shared edge within a fold pane.
+        // Only the reserved division should separate the two fold panes.
+        switch divisionAxis {
+        case .vertical:
+            return VideoGravity(horizontal: .center, vertical: index < 2 ? .bottom : .top)
+        case .horizontal:
+            return VideoGravity(horizontal: index < 2 ? .trailing : .leading, vertical: .center)
         }
     }
 
@@ -255,28 +451,101 @@ struct CameraGroupLabelLayout: Layout {
 /// insets.
 struct CameraGroupCanvas<Content: View>: View {
     let ignoresSafeArea: Bool
-    let content: (CGSize, CGRect) -> Content
+    let avoidsOcclusions: Bool
+    let content: (CGSize, CGRect, CameraGroupLayout.Division?) -> Content
 
-    init(ignoresSafeArea: Bool = true,
+    init(ignoresSafeArea: Bool = true, avoidsOcclusions: Bool = false,
+         @ViewBuilder content: @escaping (CGSize, CGRect, CameraGroupLayout.Division?) -> Content) {
+        self.ignoresSafeArea = ignoresSafeArea
+        self.avoidsOcclusions = avoidsOcclusions
+        self.content = content
+    }
+
+    init(ignoresSafeArea: Bool = true, avoidsOcclusions: Bool = false,
          @ViewBuilder content: @escaping (CGSize, CGRect) -> Content) {
         self.ignoresSafeArea = ignoresSafeArea
-        self.content = content
+        self.avoidsOcclusions = avoidsOcclusions
+        self.content = { size, safeBounds, _ in
+            content(size, safeBounds)
+        }
     }
 
     var body: some View {
         GeometryReader { safe in
+            let hasActiveDivision = firstActiveDivision(in: safe) != nil
             GeometryReader { canvas in
                 let origin = canvas.frame(in: .global).origin
-                content(canvas.size, safe.frame(in: .global).offsetBy(dx: -origin.x, dy: -origin.y))
+                let placement = CameraGroupLayout.CanvasPlacement(
+                    size: canvas.size,
+                    safeBounds: safe.frame(in: .global).offsetBy(dx: -origin.x, dy: -origin.y),
+                    division: firstActiveDivision(in: canvas),
+                    occlusions: avoidsOcclusions ? activeOcclusionFrames(in: canvas) : []
+                )
+                content(
+                    placement.frame.size,
+                    placement.safeBounds,
+                    placement.division
+                )
+                .frame(width: placement.frame.width, height: placement.frame.height)
+                .clipped()
+                .position(x: placement.frame.midX, y: placement.frame.midY)
             }
-            .ignoresSafeArea(.container, edges: ignoresSafeArea ? .all : [])
+            .ignoresSafeArea(
+                .container,
+                edges: ignoresSafeArea || hasActiveDivision ? .all : []
+            )
         }
+    }
+
+    private func activeOcclusionFrames(in proxy: GeometryProxy) -> [CGRect] {
+#if os(iOS)
+        if #available(iOS 27.1, *) {
+            return proxy.reservedRegions(kind: .occlusion).map(\.frame)
+        }
+#endif
+        return []
+    }
+
+    private func firstActiveDivision(in proxy: GeometryProxy) -> CameraGroupLayout.Division? {
+        if #available(iOS 27.1, macOS 27.1, tvOS 27.1, watchOS 27.1, visionOS 27.1, *) {
+            guard let region = proxy.reservedRegions(kind: .division).first else { return nil }
+            return CameraGroupLayout.Division(
+                frame: region.frame,
+                margins: region.margins
+            )
+        }
+        return nil
+    }
+}
+
+/// Observe the scene's hardware capability, not a model name or hinge angle.
+/// A Duo still has a hinge when closed or fully open (without an active division).
+struct CameraDeviceHingeObserver: ViewModifier {
+    @Binding var state: CameraDeviceHingeState
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+#if os(iOS)
+        if #available(iOS 27.1, *) {
+            content.onHingeChange { _, context in
+                state = CameraDeviceHingeState(
+                    isPresent: context.hinge != nil,
+                    isClosed: context.hinge?.status == .closed
+                )
+            }
+        } else {
+            content
+        }
+#else
+        content
+#endif
     }
 }
 
 struct CameraGroupVideo: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @State private var deviceHinge = CameraDeviceHingeState()
     @ObservedObject var group: CameraGroupPlayback
     let cameraControlsEnabled: Bool
     let controlsVisible: Bool
@@ -285,35 +554,81 @@ struct CameraGroupVideo: View {
 
     var body: some View {
         let ignoresSafeArea = CameraGroupLayout.ignoresSafeArea(
-            horizontal: horizontalSizeClass, vertical: verticalSizeClass
+            horizontal: horizontalSizeClass,
+            vertical: verticalSizeClass,
+            controlsVisible: controlsVisible,
+            hasDeviceHinge: deviceHinge.isPresent
         )
-        CameraGroupCanvas(ignoresSafeArea: ignoresSafeArea) { size, safeBounds in
-            let arrangement = CameraGroupLayout.arrangement(
-                count: group.sessions.count,
-                in: size,
-                aspectRatios: group.sessions.map { $0.liveVideo.aspectRatio }
-            )
-            let cells = CameraGroupLayout.cells(count: group.sessions.count, in: size, arrangement: arrangement)
+        CameraGroupCanvas(ignoresSafeArea: ignoresSafeArea, avoidsOcclusions: CameraGroupLayout.avoidsOcclusions(
+            horizontal: horizontalSizeClass, hinge: deviceHinge
+        )) { size, safeBounds, division in
+            let arrangement = division == nil
+                ? CameraGroupLayout.arrangement(
+                    count: group.sessions.count,
+                    in: size,
+                    aspectRatios: group.sessions.map { $0.liveVideo.aspectRatio }
+                )
+                : .grid
+            let cells = if let division {
+                CameraGroupLayout.cells(
+                    count: group.sessions.count,
+                    in: size,
+                    division: division
+                )
+            } else {
+                CameraGroupLayout.cells(
+                    count: group.sessions.count,
+                    in: size,
+                    arrangement: arrangement
+                )
+            }
             ZStack(alignment: .topLeading) {
                 Color.black
                 ForEach(Array(group.sessions.enumerated()), id: \.element.id) { index, session in
                     if cells.indices.contains(index) {
-                        let gravity = CameraGroupLayout.videoGravity(
-                            index: index,
-                            count: group.sessions.count,
-                            arrangement: arrangement
-                        )
-                        let labelAnchor = CameraGroupLayout.labelAnchor(
-                            index: index,
-                            arrangement: arrangement
-                        )
+                        let gravity = if let division {
+                            CameraGroupLayout.videoGravity(
+                                index: index,
+                                count: group.sessions.count,
+                                divisionAxis: division.axis
+                            )
+                        } else {
+                            CameraGroupLayout.videoGravity(
+                                index: index,
+                                count: group.sessions.count,
+                                arrangement: arrangement
+                            )
+                        }
+                        let labelAnchor = if let division {
+                            CameraGroupLayout.labelAnchor(
+                                index: index,
+                                count: group.sessions.count,
+                                divisionAxis: division.axis
+                            )
+                        } else {
+                            CameraGroupLayout.labelAnchor(
+                                index: index,
+                                arrangement: arrangement
+                            )
+                        }
+                        let labelBelowVideo = if let division {
+                            CameraGroupLayout.labelsBelowVideo(
+                                count: group.sessions.count,
+                                divisionAxis: division.axis
+                            )
+                        } else {
+                            CameraGroupLayout.labelsBelowVideo(
+                                count: group.sessions.count,
+                                arrangement: arrangement
+                            )
+                        }
                         CameraGroupPane(session: session, group: group, cameraControlsEnabled: cameraControlsEnabled,
                             controlsVisible: controlsVisible,
                             isAccessAllowed: isAccessAllowed,
                             safeBounds: safeBounds.offsetBy(dx: -cells[index].minX, dy: -cells[index].minY),
                             videoGravity: gravity,
                             labelAnchor: labelAnchor,
-                            labelBelowVideo: CameraGroupLayout.labelsBelowVideo(count: group.sessions.count, arrangement: arrangement),
+                            labelBelowVideo: labelBelowVideo,
                             onSingleTap: onSingleTap)
                             .frame(width: cells[index].width, height: cells[index].height)
                             .clipped()
@@ -322,6 +637,7 @@ struct CameraGroupVideo: View {
                 }
             }
         }
+        .modifier(CameraDeviceHingeObserver(state: $deviceHinge))
         .animation(.snappy, value: group.sessions.map(\.id))
     }
 }

@@ -1,5 +1,22 @@
 import SwiftUI
 
+extension ToolbarContent {
+    /// Keep related playback controls on the horizontal bar when iPhone Duo
+    /// moves the remaining toolbar items to a vertical edge.
+    @ToolbarContentBuilder
+    func cameraPlaybackHorizontalAxis() -> some ToolbarContent {
+#if os(iOS)
+        if #available(iOS 27.1, *) {
+            axisBehavior(.horizontalOnly)
+        } else {
+            self
+        }
+#else
+        self
+#endif
+    }
+}
+
 /// Native toolbar styling owns the glass, sizing, and foreground contrast.
 struct CameraLiveModeButton: View {
     let isLive: Bool

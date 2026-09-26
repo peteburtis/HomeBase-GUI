@@ -87,6 +87,111 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
         XCTAssertEqual(Set(state.identitySamples).count, 1)
     }
 
+    func testCompactWidthCanvasRespectsSafeAreaUnlessDeviceHasHinge() async throws {
+        let state = CameraGroupCanvasRotationState()
+        state.traits = .portrait
+        let host = UIHostingController(rootView: CameraGroupCanvasRotationHarness(state: state))
+        host.additionalSafeAreaInsets = UIEdgeInsets(top: 20, left: 50, bottom: 25, right: 40)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(50))
+        let standardPhoneSize = try XCTUnwrap(state.canvasSizes.last)
+        XCTAssertLessThan(standardPhoneSize.width, host.view.bounds.width)
+        XCTAssertLessThan(standardPhoneSize.height, host.view.bounds.height)
+
+        state.hasDeviceHinge = true
+        try await Task.sleep(for: .milliseconds(50))
+        let hingedDeviceSize = try XCTUnwrap(state.canvasSizes.last)
+        XCTAssertEqual(hingedDeviceSize.width, host.view.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(hingedDeviceSize.height, host.view.bounds.height, accuracy: 0.5)
+
+        state.hasDeviceHinge = false
+        try await Task.sleep(for: .milliseconds(50))
+        let restoredSize = try XCTUnwrap(state.canvasSizes.last)
+        XCTAssertEqual(restoredSize.width, standardPhoneSize.width, accuracy: 0.5)
+        XCTAssertEqual(restoredSize.height, standardPhoneSize.height, accuracy: 0.5)
+
+        state.controlsVisible = false
+        try await Task.sleep(for: .milliseconds(50))
+        let hiddenSize = try XCTUnwrap(state.canvasSizes.last)
+        XCTAssertEqual(hiddenSize.width, host.view.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(hiddenSize.height, host.view.bounds.height, accuracy: 0.5)
+        XCTAssertEqual(state.appearances, 1)
+        XCTAssertEqual(state.disappearances, 0)
+    }
+
+    func testHidingControlsExpandsRegularCanvasWithoutReplacingVideo() async throws {
+        let state = CameraGroupCanvasRotationState()
+        state.traits = .init(horizontal: .regular, vertical: .regular, sample: 0)
+        let host = UIHostingController(rootView: CameraGroupCanvasRotationHarness(state: state))
+        host.additionalSafeAreaInsets = UIEdgeInsets(top: 20, left: 50, bottom: 25, right: 40)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(50))
+        let visibleSize = try XCTUnwrap(state.canvasSizes.last)
+        XCTAssertLessThan(visibleSize.width, host.view.bounds.width)
+        XCTAssertLessThan(visibleSize.height, host.view.bounds.height)
+
+        withAnimation(.snappy) { state.controlsVisible = false }
+        try await Task.sleep(for: .milliseconds(600))
+        let hiddenSize = try XCTUnwrap(state.canvasSizes.last)
+        XCTAssertEqual(hiddenSize.width, host.view.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(hiddenSize.height, host.view.bounds.height, accuracy: 0.5)
+
+        withAnimation(.snappy) { state.controlsVisible = true }
+        try await Task.sleep(for: .milliseconds(600))
+        let restoredSize = try XCTUnwrap(state.canvasSizes.last)
+        XCTAssertEqual(restoredSize.width, visibleSize.width, accuracy: 0.5)
+        XCTAssertEqual(restoredSize.height, visibleSize.height, accuracy: 0.5)
+        XCTAssertEqual(state.appearances, 1)
+        XCTAssertEqual(state.disappearances, 0)
+    }
+
+    func testPlayerChromeVisibilityHidesAndRestoresStatusBar() async throws {
+        func statusBarHidden(in controller: UIViewController) -> Bool {
+            if let child = controller.childForStatusBarHidden {
+                return statusBarHidden(in: child)
+            }
+            return controller.prefersStatusBarHidden
+        }
+
+        func content(visible: Bool) -> some View {
+            NavigationStack {
+                Color.black.modifier(CameraPlayerChromeVisibility(
+                    isVisible: visible,
+                    hidesNavigationBar: false
+                ))
+            }
+        }
+        let host = UIHostingController(rootView: content(visible: true))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(statusBarHidden(in: host))
+
+        host.rootView = content(visible: false)
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertTrue(statusBarHidden(in: host))
+
+        host.rootView = content(visible: true)
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(statusBarHidden(in: host))
+    }
+
     func testStatusScreenKeepsSingleTapButDisablesCameraGestures() async throws {
         let surface = CameraLiveGestureUIView()
         surface.onMagnify = { _, _ in }
@@ -189,8 +294,10 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
             compactWidth: true,
             compactHeight: false
         )
+        XCTAssertTrue(liveCompactWidth.usesCompactWidthLayout)
         XCTAssertTrue(liveCompactWidth.configurationControlsInBottomTrailing)
-        XCTAssertFalse(liveCompactWidth.pauseInBottomTrailing)
+        XCTAssertTrue(liveCompactWidth.playbackControlsInOverflow)
+        XCTAssertFalse(liveCompactWidth.playbackControlsInBottomTrailing)
         XCTAssertFalse(liveCompactWidth.navigationItemsInBottomToolbar)
         XCTAssertTrue(liveCompactWidth.recordInTrailingNavigationBar)
         XCTAssertFalse(liveCompactWidth.recordInBottomTrailing)
@@ -200,10 +307,12 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
             compactWidth: true,
             compactHeight: false
         )
+        XCTAssertTrue(historyCompactWidth.usesCompactWidthLayout)
         XCTAssertFalse(historyCompactWidth.configurationControlsInBottomTrailing)
-        XCTAssertTrue(historyCompactWidth.pauseInBottomTrailing)
+        XCTAssertFalse(historyCompactWidth.playbackControlsInOverflow,
+            "History transport moves together to the toolbar without leaving an overflow menu")
+        XCTAssertTrue(historyCompactWidth.playbackControlsInBottomTrailing)
         XCTAssertFalse(historyCompactWidth.navigationItemsInBottomToolbar)
-        XCTAssertFalse(historyCompactWidth.compactTransportInBottomLeading)
         XCTAssertFalse(historyCompactWidth.recordInTrailingNavigationBar)
         XCTAssertFalse(historyCompactWidth.recordInBottomTrailing)
 
@@ -212,8 +321,9 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
             compactWidth: false,
             compactHeight: true
         )
+        XCTAssertFalse(liveCompactHeight.usesCompactWidthLayout)
+        XCTAssertFalse(liveCompactHeight.playbackControlsInOverflow)
         XCTAssertTrue(liveCompactHeight.navigationItemsInBottomToolbar)
-        XCTAssertFalse(liveCompactHeight.compactTransportInBottomLeading)
         XCTAssertFalse(liveCompactHeight.recordInTrailingNavigationBar)
         XCTAssertTrue(liveCompactHeight.recordInBottomTrailing)
 
@@ -222,8 +332,10 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
             compactWidth: true,
             compactHeight: true
         )
+        XCTAssertFalse(fullyCompactLive.usesCompactWidthLayout)
+        XCTAssertFalse(fullyCompactLive.playbackControlsInOverflow)
         XCTAssertTrue(fullyCompactLive.navigationItemsInBottomToolbar)
-        XCTAssertTrue(fullyCompactLive.compactTransportInBottomLeading)
+        XCTAssertFalse(fullyCompactLive.configurationControlsInBottomTrailing)
         XCTAssertFalse(fullyCompactLive.recordInTrailingNavigationBar)
         XCTAssertTrue(fullyCompactLive.recordInBottomTrailing)
 
@@ -233,16 +345,17 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
             compactHeight: true
         )
         XCTAssertTrue(historyCompactHeight.navigationItemsInBottomToolbar)
-        XCTAssertFalse(historyCompactHeight.compactTransportInBottomLeading)
+        XCTAssertFalse(historyCompactHeight.playbackControlsInOverflow)
 
         let fullyCompactHistory = CameraToolbarArrangement(
             isLive: false,
             compactWidth: true,
             compactHeight: true
         )
-        XCTAssertTrue(fullyCompactHistory.pauseInBottomTrailing)
+        XCTAssertFalse(fullyCompactHistory.usesCompactWidthLayout)
+        XCTAssertFalse(fullyCompactHistory.playbackControlsInOverflow)
+        XCTAssertFalse(fullyCompactHistory.playbackControlsInBottomTrailing)
         XCTAssertTrue(fullyCompactHistory.navigationItemsInBottomToolbar)
-        XCTAssertTrue(fullyCompactHistory.compactTransportInBottomLeading)
     }
 
     func testToolbarScrubBridgeUsesRealNavigationBarAndExcludesToolbarControls() async throws {
@@ -468,9 +581,12 @@ private final class CameraGroupCanvasRotationState: ObservableObject {
     }
 
     @Published var traits = Traits.portrait
+    @Published var controlsVisible = true
+    @Published var hasDeviceHinge = false
     var appearances = 0
     var disappearances = 0
     var identitySamples: [ObjectIdentifier] = []
+    var canvasSizes: [CGSize] = []
 
     nonisolated deinit {}
 }
@@ -498,9 +614,11 @@ private struct CameraGroupCanvasEnvironmentHarness: View {
     var body: some View {
         CameraGroupCanvas(ignoresSafeArea: CameraGroupLayout.ignoresSafeArea(
             horizontal: horizontalSizeClass,
-            vertical: verticalSizeClass
-        )) { _, _ in
-            CameraGroupCanvasIdentityProbe(state: state, sample: state.traits.sample)
+            vertical: verticalSizeClass,
+            controlsVisible: state.controlsVisible,
+            hasDeviceHinge: state.hasDeviceHinge
+        )) { size, _ in
+            CameraGroupCanvasIdentityProbe(state: state, sample: state.traits.sample, size: size)
         }
     }
 }
@@ -509,6 +627,7 @@ private struct CameraGroupCanvasIdentityProbe: View {
     @ObservedObject var state: CameraGroupCanvasRotationState
     @StateObject private var ownedState = CameraGroupCanvasOwnedState()
     let sample: Int
+    let size: CGSize
 
     var body: some View {
         Color.black
@@ -516,6 +635,9 @@ private struct CameraGroupCanvasIdentityProbe: View {
             .onDisappear { state.disappearances += 1 }
             .onChange(of: sample, initial: true) { _, _ in
                 state.identitySamples.append(ObjectIdentifier(ownedState))
+            }
+            .onChange(of: size, initial: true) { _, size in
+                state.canvasSizes.append(size)
             }
     }
 }

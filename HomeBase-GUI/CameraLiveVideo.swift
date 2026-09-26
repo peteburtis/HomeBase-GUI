@@ -1178,7 +1178,7 @@ private struct CameraTransparentToolbar: ViewModifier {
     }
 }
 
-private struct CameraToolbarVisibility: ViewModifier {
+struct CameraPlayerChromeVisibility: ViewModifier {
     let isVisible: Bool
     let hidesNavigationBar: Bool
 
@@ -1186,6 +1186,7 @@ private struct CameraToolbarVisibility: ViewModifier {
     func body(content: Content) -> some View {
 #if os(iOS)
         content
+            .statusBarHidden(!isVisible)
             .toolbarVisibility(
                 isVisible && !hidesNavigationBar ? .visible : .hidden,
                 for: .navigationBar
@@ -1210,20 +1211,24 @@ nonisolated struct CameraToolbarArrangement: Equatable {
     let compactWidth: Bool
     let compactHeight: Bool
 
-    var configurationControlsInBottomTrailing: Bool {
-        isLive && compactWidth
+    var usesCompactWidthLayout: Bool {
+        compactWidth && !compactHeight
     }
 
-    var pauseInBottomTrailing: Bool {
-        !isLive && compactWidth
+    var configurationControlsInBottomTrailing: Bool {
+        isLive && usesCompactWidthLayout
+    }
+
+    var playbackControlsInOverflow: Bool {
+        isLive && usesCompactWidthLayout
+    }
+
+    var playbackControlsInBottomTrailing: Bool {
+        !isLive && usesCompactWidthLayout
     }
 
     var navigationItemsInBottomToolbar: Bool {
         compactHeight
-    }
-
-    var compactTransportInBottomLeading: Bool {
-        compactWidth && navigationItemsInBottomToolbar
     }
 
     var recordInTrailingNavigationBar: Bool {
@@ -1985,10 +1990,12 @@ private struct CameraFullScreenCameraContent: View {
         }
         .toolbar { cameraToolbar }
         .modifier(CameraTransparentToolbar())
-        .modifier(CameraToolbarVisibility(
+        .modifier(CameraPlayerChromeVisibility(
             isVisible: !access.isUnlocked || visiblePlayerControls,
             hidesNavigationBar: hidesNavigationBarInCompactHeight
         ))
+        // Animate the bars and the media canvas's safe-area policy together.
+        .animation(reduceMotion ? nil : .snappy, value: controlsVisible)
 #if os(iOS)
         .background {
             CameraToolbarScrubBridge(
@@ -2078,7 +2085,6 @@ private struct CameraFullScreenCameraContent: View {
             }
         }
         .background(Color.black.ignoresSafeArea())
-        .animation(.snappy, value: controlsVisible)
         .animation(reduceMotion ? nil : .snappy, value: panel)
         .animation(reduceMotion ? nil : .snappy, value: timelineVisible)
         .accessibilityActions {
@@ -2107,25 +2113,15 @@ private struct CameraFullScreenCameraContent: View {
 
 #if os(iOS)
         if access.isUnlocked {
-            if horizontalSizeClass == .compact {
+            if toolbarArrangement.usesCompactWidthLayout {
                 if !recordingLocksStreamConfiguration {
-                    if toolbarArrangement.compactTransportInBottomLeading {
-                        ToolbarItemGroup(placement: .bottomBar) {
-                            if isLive {
-                                pauseControl.disabled(!playbackActionsEnabled)
-                            } else {
-                                backControl.disabled(!playbackActionsEnabled)
-                                forwardControl.disabled(!playbackActionsEnabled)
-                            }
-                        }
-                    } else {
+                    if toolbarArrangement.playbackControlsInOverflow {
                         ToolbarItemGroup(placement: .secondaryAction) {
                             backControl.disabled(!playbackActionsEnabled)
-                            if isLive {
-                                pauseControl.disabled(!playbackActionsEnabled)
-                            }
+                            pauseControl.disabled(!playbackActionsEnabled)
                             forwardControl.disabled(!playbackActionsEnabled)
                         }
+                        .cameraPlaybackHorizontalAxis()
                     }
                     ToolbarItem(placement: .bottomBar) {
                         CameraLiveModeButton(
@@ -2135,6 +2131,7 @@ private struct CameraFullScreenCameraContent: View {
                         )
                             .disabled(!playbackActionsEnabled || (isLive && !canControlPlayback))
                     }
+                    .cameraPlaybackHorizontalAxis()
                     if !isLive {
                         ToolbarSpacer(.fixed, placement: .bottomBar)
                         ToolbarItem(placement: .bottomBar) {
@@ -2166,13 +2163,16 @@ private struct CameraFullScreenCameraContent: View {
                         ToolbarItem(placement: .bottomBar) { privacyControl }
                     }
                 }
-                if toolbarArrangement.pauseInBottomTrailing,
+                if toolbarArrangement.playbackControlsInBottomTrailing,
                    !recordingLocksStreamConfiguration {
-                    ToolbarItem(placement: .bottomBar) {
+                    ToolbarItemGroup(placement: .bottomBar) {
+                        backControl.disabled(!playbackActionsEnabled)
                         pauseControl
                             .labelStyle(.iconOnly)
                             .disabled(!playbackActionsEnabled)
+                        forwardControl.disabled(!playbackActionsEnabled)
                     }
+                    .cameraPlaybackHorizontalAxis()
                 }
             } else {
                 if !recordingLocksStreamConfiguration {
@@ -2183,6 +2183,7 @@ private struct CameraFullScreenCameraContent: View {
                             .disabled(!playbackActionsEnabled)
                         forwardControl.disabled(!playbackActionsEnabled)
                     }
+                    .cameraPlaybackHorizontalAxis()
                     ToolbarSpacer(.fixed, placement: .bottomBar)
                     ToolbarItem(placement: .bottomBar) {
                         CameraLiveModeButton(
@@ -2192,6 +2193,7 @@ private struct CameraFullScreenCameraContent: View {
                         )
                             .disabled(!playbackActionsEnabled || (isLive && !canControlPlayback))
                     }
+                    .cameraPlaybackHorizontalAxis()
                     if !isLive {
                         ToolbarSpacer(.fixed, placement: .bottomBar)
                         ToolbarItem(placement: .bottomBar) {
@@ -2858,7 +2860,7 @@ private struct CameraFullScreenCameraContent: View {
                 }
             }
         } label: {
-            Image(systemName: "slider.horizontal.3")
+            Label("Video quality", systemImage: "slider.horizontal.3")
         }
         .accessibilityLabel("Video quality")
         .accessibilityValue(
@@ -2875,7 +2877,7 @@ private struct CameraFullScreenCameraContent: View {
     }
 
     private func toggleControls() {
-        withAnimation(.snappy) {
+        withAnimation(reduceMotion ? nil : .snappy) {
             controlsVisible = interactionPresentation.togglingControls(
                 from: controlsVisible
             )

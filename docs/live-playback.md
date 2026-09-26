@@ -259,8 +259,9 @@ uniformly to fit the available height. There is no scrolling, cropping, or
 offscreen overflow. Single-camera presentation is unchanged.
 
 Safe-area policy is independent of that layout choice. The media canvas ignores
-container safe-area insets only with compact height and regular width. Every
-other size-class combination lays the canvas out inside the safe area. Size-class
+container safe-area insets with compact height, while controls are hidden, or
+with compact width on a device that reports a hinge. An active fold division
+also uses the full canvas. Other combinations lay the canvas out inside the safe area. Size-class
 changes can therefore alter the available canvas but never directly select a row,
 column, or grid. Relayout does not replace camera sessions, stream connections,
 buffers, or playback state. Video remains aspect-fit inside each cell, never
@@ -268,6 +269,17 @@ cropped or oversized.
 The canvas keeps one structural SwiftUI hierarchy across every size-class
 combination; safe-area behavior changes through modifier values rather than an
 `if` that replaces its camera-pane subtree.
+On iOS 27.1 and later, compact-width camera layouts additionally query active
+`.occlusion` reserved regions. Even when ignoring safe areas, the camera canvas
+uses the largest single axis-aligned rectangle that avoids every returned
+region. The reported frames already contain the system's avoidance margins;
+they are not expanded again. This changes camera layout, not native toolbar or
+timeline placement. Regular-width layouts and systems returning no occlusions
+are unchanged. A closed Duo is explicitly exempt: the existing `onHingeChange`
+capability check now also tracks `.closed`, without device-name guesses. An open
+Duo still follows the compact-width rule and reserves its fold independently.
+Safe label bounds and the fold are translated into the resized canvas's local
+coordinates. Changes retain the same mounted camera views and playback resources.
 Camera labels stay inside the screen's safe area without moving or shrinking
 the video panes; interior grid edges do not gain extra safe-area padding. In
 side-by-side two-up they touch the bottom of the actual video rectangle from immediately
@@ -431,8 +443,8 @@ snap, haptic, and visible-thumbnail calculations use the resulting cell width.
 Images proportionally fill the frame,
 cropping overflow from other aspect ratios instead of letterboxing or stretching.
 
-Player layout uses compact-height plus regular-width size classes only for the
-explicit full-bleed safe-area policy, not to choose a multi-camera arrangement.
+Player layout uses size classes for the safe-area and occlusion policies above,
+not to choose a multi-camera arrangement.
 The camera preview grid uses horizontal size class; the timeline uses vertical
 size class. Multi-camera arrangement, video aspect-fit, per-pane gesture
 coordinates, safe-area label placement, and bounded PTZ slider lengths remain

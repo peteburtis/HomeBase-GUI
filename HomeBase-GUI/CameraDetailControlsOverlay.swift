@@ -742,18 +742,22 @@ struct CameraDayNightModeToolbarControl: View {
     var appliesRepeatedSelections = false
 
     var body: some View {
-        Picker(selection: selection) {
-            ForEach(target.choices) { choice in
-                Label(
-                    choice.mode.title,
-                    systemImage: choice.mode.systemImageName
-                )
-                .tag(Optional(choice.mode))
+        Menu {
+            Picker("Day and night mode", selection: selection) {
+                ForEach(target.choices) { choice in
+                    Label(
+                        choice.mode.title,
+                        systemImage: choice.mode.systemImageName
+                    )
+                    .tag(Optional(choice.mode))
+                }
             }
         } label: {
-            Label("Day and night mode", systemImage: displayedMode.systemImageName)
+            Label(
+                "Day and night mode",
+                systemImage: displayedMode.systemImageName
+            )
         }
-        .pickerStyle(.menu)
         .disabled(!isEnabled || target.control.isUpdating)
         .accessibilityLabel("Day and night mode")
         .accessibilityValue(target.selectedMode?.title ?? "Unavailable")
