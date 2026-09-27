@@ -61,7 +61,7 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
         for camera in cameras.dropFirst() { group.toggle(camera) }
         group.activateResources(access: nil)
         let state = CameraFocusHarnessState()
-        let host = UIHostingController(rootView: CameraFocusHarness(group: group, state: state))
+        let host = UIHostingController(rootView: AnyView(CameraFocusHarness(group: group, state: state)))
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.rootViewController = host; window.isHidden = false
@@ -109,6 +109,12 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
             }
             capture(id == nil ? "Camera focus — restored grid" : "Camera focus — single camera")
         }
+        // Drain SwiftUI's deferred teardown while this async test still owns
+        // its camera models; don't leave it for the next XCTest invocation.
+        host.rootView = AnyView(Color.clear)
+        group.deactivate()
+        try await Task.sleep(for: .milliseconds(100))
+        withExtendedLifetime(group) {}
     }
 
     func testNativePlaybackSpeedMenuSupportsAllRates() async throws {

@@ -6,6 +6,112 @@ import XCTest
 
 @MainActor
 final class CameraLivePlaybackTests: XCTestCase {
+    func testExternalDisplayCanDecodeTheCurrentPictureAfterConnecting() async throws {
+        let clip = try video()
+        let renderer = CameraH264Renderer()
+        _ = try renderer.configure(clip.configuration)
+        for frame in clip.frames.prefix(5) { _ = try renderer.enqueue(frame) }
+        let replica = CameraVideoDisplayReplica()
+        renderer.displayRelay.attach(replica)
+        defer { renderer.displayRelay.detach(replica); renderer.reset() }
+        for _ in 0..<40 where !replica.layer.isReadyForDisplay {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertTrue(replica.layer.isReadyForDisplay)
+        XCTAssertNotEqual(replica.layer.sampleBufferRenderer.status, .failed)
+        XCTAssertNotEqual(renderer.layer.sampleBufferRenderer.status, .failed)
+    }
+
+    func testExternalDisplayPrimesCurrentPictureWithoutMutatingPhoneSamples() async throws {
+        let clip = try video()
+        let renderer = CameraH264Renderer()
+        _ = try renderer.configure(clip.configuration)
+        let first = try XCTUnwrap(renderer.enqueue(clip.frames[0]))
+        let last = try XCTUnwrap(renderer.enqueue(clip.frames[1]))
+        let output = CameraDisplayOutputSpy()
+        renderer.displayRelay.attach(output)
+        XCTAssertEqual(output.samples.count, 2)
+        XCTAssertTrue(output.isHidden(at: 0))
+        XCTAssertFalse(output.isHidden(at: 1))
+        XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(try XCTUnwrap(output.samples.last)),
+            CMSampleBufferGetPresentationTimeStamp(last))
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(first, createIfNecessary: false)
+            as? [[String: Any]]
+        XCTAssertEqual(attachments?.first?[kCMSampleAttachmentKey_DoNotDisplay as String] as? Bool, false,
+            "Priming an external decoder must not hide the phone's keyframe")
+
+        _ = try renderer.enqueue(clip.frames[2])
+        XCTAssertEqual(output.samples.count, 3)
+        renderer.displayRelay.detach(output)
+        _ = try renderer.enqueue(clip.frames[3])
+        XCTAssertEqual(output.samples.count, 3)
+        XCTAssertEqual(output.flushes, [true])
+        renderer.reset()
+    }
+
+    func testExternalDisplayResetClearsCachedVideoAndRequiresNewKeyframe() async throws {
+        let clip = try video()
+        let renderer = CameraH264Renderer()
+        _ = try renderer.configure(clip.configuration)
+        _ = try renderer.enqueue(clip.frames[0])
+        renderer.reset()
+        let output = CameraDisplayOutputSpy()
+        renderer.displayRelay.attach(output)
+        XCTAssertTrue(output.samples.isEmpty, "Revocation/black frames must clear bootstrap imagery")
+        XCTAssertNil(try renderer.enqueue(clip.frames[1]))
+        XCTAssertTrue(output.samples.isEmpty)
+        _ = try renderer.enqueue(clip.frames[15])
+        XCTAssertEqual(output.samples.count, 1)
+        renderer.reset()
+        XCTAssertEqual(output.flushes, [true])
+    }
+
+    func testExternalDisplayCanConnectDuringPreservingFlushAndRecoverIndependently() async throws {
+        let clip = try video()
+        let renderer = CameraH264Renderer()
+        _ = try renderer.configure(clip.configuration)
+        _ = try renderer.enqueue(clip.frames[0])
+        renderer.reset(removingDisplayedImage: false)
+        let output = CameraDisplayOutputSpy()
+        renderer.displayRelay.attach(output)
+        XCTAssertEqual(output.samples.count, 1, "A paused picture remains available to a new display")
+        _ = try renderer.enqueue(clip.frames[15])
+        output.needsRecovery = true
+        let phoneSample = try renderer.enqueue(clip.frames[16])
+        XCTAssertNotNil(phoneSample, "External decoder failure must not stop the phone")
+        XCTAssertEqual(output.flushes, [false])
+        XCTAssertEqual(output.samples.count, 2)
+        output.needsRecovery = false
+        _ = try renderer.enqueue(clip.frames[17])
+        XCTAssertEqual(output.samples.count, 2, "An external decoder waits for its own new keyframe")
+        _ = try renderer.enqueue(clip.frames[30])
+        XCTAssertEqual(output.samples.count, 3)
+        renderer.reset()
+    }
+
+    func testExternalDisplayBootstrapIsBoundedAndDoesNotRetainDisconnectedOutputs() async throws {
+        let clip = try video()
+        let renderer = CameraH264Renderer()
+        _ = try renderer.configure(clip.configuration)
+        let frames = try (0..<3).map { try XCTUnwrap(renderer.enqueue(clip.frames[$0])) }
+        for relay in [CameraVideoDisplayRelay(maximumSamples: 2), CameraVideoDisplayRelay(maximumBytes: 1)] {
+            for (index, frame) in frames.enumerated() { relay.enqueue(frame, keyFrame: index == 0) }
+            var output: CameraDisplayOutputSpy? = CameraDisplayOutputSpy()
+            weak let weakOutput = output
+            relay.attach(try XCTUnwrap(output))
+            XCTAssertTrue(try XCTUnwrap(output).samples.isEmpty)
+            output = nil
+            XCTAssertNil(weakOutput)
+            let replacement = CameraDisplayOutputSpy()
+            relay.attach(replacement)
+            relay.enqueue(frames[1], keyFrame: false)
+            XCTAssertTrue(replacement.samples.isEmpty)
+            relay.enqueue(frames[0], keyFrame: true)
+            XCTAssertEqual(replacement.samples.count, 1)
+        }
+        renderer.reset()
+    }
+
     func testLivePiPPauseKeepsDecodingAndPlayDisplaysTheCurrentLiveFrame() async throws {
         let clip = try video()
         let renderer = CameraH264Renderer()
@@ -718,6 +824,41 @@ final class CameraLivePlaybackTests: XCTestCase {
         XCTAssertGreaterThan(controller.timeline.retainedBytes, bytes)
         XCTAssertNil(controller.errorMessage)
         controller.close()
+    }
+
+    func testSynchronizedLiveRendererAndExternalDisplayFollowDelayedCursor() async throws {
+        let clip = try video()
+        let controller = CameraLivePlaybackController(clock: { 20 })
+        let owner = UUID(), output = CameraDisplayOutputSpy()
+        controller.renderer.displayRelay.attach(output)
+        defer { controller.renderer.displayRelay.detach(output); controller.close() }
+        controller.useGroupClock()
+        controller.setLiveSynchronization(true)
+        _ = try controller.configure(clip.configuration, ownerID: owner)
+        for var frame in clip.frames {
+            frame.cameraUTC = 1000 + Double(frame.presentationTimestamp) / 90_000
+            XCTAssertNil(try controller.receive(frame, ownerID: owner), "Delayed group output must not enter Photos recording")
+        }
+        XCTAssertTrue(output.samples.isEmpty, "Reception alone cannot display leading video")
+        XCTAssertEqual(controller.liveSynchronizationHead?.cameraUTC, 1000 + 44.0 / 15)
+        controller.followGroupLive(cameraTarget: 1001)
+        for _ in 0..<100 where output.samples.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertFalse(output.samples.isEmpty)
+        XCTAssertEqual(controller.timeline.position ?? -1, 1, accuracy: 0.0001)
+        XCTAssertTrue(controller.isLive)
+        XCTAssertFalse(controller.isUsingHistory)
+        XCTAssertNil(controller.errorMessage)
+        controller.followGroupLive(cameraTarget: nil)
+        try await Task.sleep(for: .milliseconds(60))
+        controller.followGroupLive(cameraTarget: nil)
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(controller.timeline.position, controller.timeline.head)
+        XCTAssertNotEqual(controller.renderer.layer.sampleBufferRenderer.status, .failed)
+        controller.useLocalClock()
+        XCTAssertFalse(controller.liveSynchronizationEnabled)
+        XCTAssertTrue(controller.isLive)
+        _ = try controller.receive(clip.frames[0], ownerID: owner)
+        XCTAssertNil(controller.errorMessage)
     }
 
     private func configured(duration: Double = 300, bytes: Int = 64 * 1024 * 1024)

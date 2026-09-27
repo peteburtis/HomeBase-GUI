@@ -62,21 +62,92 @@ its playing state and retained buffer is preserved, then joins a warm preview.
 Use `TEST_RUNNER_HB_LIVE_PLAYBACK_SMOKE_URL` with the existing smoke procedure
 below. It neither changes camera controls nor saves media.
 
+### Bounded live-camera synchronization
+
+Multiple live panes use camera wall-clock sampling times, not NVR canonical
+time or phone packet-arrival time. For comparable cameras, leading panes retain
+compressed frames and present the most tardy camera's current source time. This
+remains **Live**; there is no fixed 2.5-second buffer and no history request.
+The existing RAM/decoder bounds still apply. The external display follows the
+same presented samples; independent single-camera PiP stays at its live edge.
+
+The maximum alignment window is **2.5 seconds**, inclusive. Decisions use the
+newest *received* camera timestamps, never the held display positions. A stalled
+camera briefly holds its peers, then drops out once the received heads separate
+by more than 2.5 seconds or its last frame is more than 2.5 seconds old. Other
+panes catch up without waiting for reconnect. Missing clocks and clock outliers
+play independently. With three/four cameras, the largest mutually compatible
+group synchronizes; ties prefer the existing group, then the fresher group.
+Returning cameras rejoin when eligible, but displayed cursors never rewind.
+
+The app requests optional `cameraTime: true` live media. HomeBase attaches only
+camera-derived RTCP UTC: the NVR's existing validated camera mapping for shared
+feeds, or standard matching-SSRC RTCP sender reports for direct RTSP. No receipt
+or canonical-clock fallback is substituted. Camera clocks still need to agree
+in practice; the window bounds disagreement but cannot prove clock accuracy.
+An updated app works with older HomeBase/NVR builds, falling back to independent
+playback when timestamps are absent. Deploy the updated HomeBase and NVR as well
+as the app to enable synchronization for NVR-shared feeds. No service install or
+restart is performed by this GUI change.
+
+`CameraLiveSynchronizationTests` cover alignment, clock outliers, stalled-feed
+release/rejoin, freshness, and no-rewind behavior. Renderer tests exercise delayed
+live presentation and external-display replication with synthetic H.264. Physical
+camera checks should compare a common moving subject, stall one feed, and confirm
+the other panes release within the bounded window and the Live button stays Live.
+
+### Network interruptions and live recovery
+
+A transient control or media connection failure keeps the live consumers and
+their existing camera authorizations. It displays **Reconnecting to camera…**
+and retries with shared per-camera backoff (1, 2, 4, 8, 16, then 30 seconds).
+Every attempt checks/resumes the main HomeBase connection, opening a fresh
+session if its resume state has expired, then obtains a new `camera.live.open`
+ticket and media socket. Tickets are never reused. A successful keyframe resets
+backoff and switches the existing player to the new stream generation.
+
+`NWPathMonitor` changes are debounced by 500 ms and wake pending retries. They
+also trigger a bounded main-connection check, without interrupting healthy media
+merely because an interface changed. Path status never gates connection attempts:
+a VPN can change without changing general Internet reachability. A ready media
+socket receiving no frames or status messages is replaced after **15–30 seconds**;
+initial warm-up remains bounded to 20 seconds. Shared connection checks time out
+after 8 seconds, session open/resume after 15, and other control requests after
+30. Concurrent cameras share a single main-connection recovery. Control writes
+are not automatically replayed after a timeout.
+
+Network recovery does not unlock cameras, read Keychain, reopen dismissed views,
+or restart PiP automatically. Already-authorized active PiP/external-display
+consumers can recover while retained in the background, subject to iOS execution
+and networking availability. Dismissal, explicit disconnect, and access
+revocation cancel recovery; malformed media and non-retryable server failures
+remain terminal. Old-connection callbacks cannot retire a newer stream.
+Diagnostics use the `CameraRecovery` and `Connection` log categories without
+including tickets, credentials, or camera URLs.
+
+Deterministic `CameraStreamArbiterTests` and `HomeBaseConnectionRecoveryTests`
+cover dropped/silent sockets, bounded retries, concurrent recovery, fresh
+sessions/tickets, stale callbacks, and revocation/cancellation. Device testing
+should reproduce VPN loss during lock/unlock with PiP or an external camera
+display, then confirm all selected cameras resume without leaving the viewer.
+Also disconnect output or dismiss/revoke access during recovery and confirm
+that playback does not restart.
+
 Backgrounding, biometric locking, leaving the camera section, and HomeBase
 disconnect bypass the warm-join grace. Authorization revocation also rejects
 late acquisitions, clears the arbiter's compressed-media cache, and closes
 pending replacement streams. Inactive system dialogs only conceal the existing
 camera UI; they retain the existing camera-section lifecycle policy.
 
-An explicitly active iOS Picture in Picture session (see below) retains the
+An explicitly active iOS Picture in Picture session or connected external camera display (see below) retains the
 camera access session and already-unlocked S3 credentials in memory, including
-across background/foreground transitions. Foreground stream leases are still
+across device lock and background/foreground transitions. Ordinary foreground stream leases are still
 revoked in the background. Stream authorization is per consumer, so PiP's
 one-camera lease can share encoded media without retaining ordinary streams.
 Revoking either lease never revokes the other; an idle handoff
 stream still closes immediately when its own authorization is revoked.
 
-Backgrounding releases live video and history connections. Non-live playback
+Without a connected external camera display, backgrounding releases the viewer's live video and history connections. Non-live playback
 (the live buffer or NVR history) pauses at its current position, including the
 shared timeline in Multiple mode, and stays paused when the screen resumes.
 
@@ -362,7 +433,7 @@ changing quality/generation, or a backwards source timestamp does not discard
 retained footage. Each new stream epoch keeps its own decoder configuration and
 starts collecting at a keyframe; monotonic receipt time places the new epoch
 after the previous one, including a connection gap. The existing app lifecycle
-still stops network reception in the background; it resumes on returning to the
+stops ordinary network reception in the background (except active PiP/external output); it resumes on returning to the
 screen. Pausing for longer than the retention window can leave the cursor before
 available footage. Without NVR history,
 resuming Play starts at the oldest remaining decodable frame; with NVR history,
@@ -377,7 +448,7 @@ replaces the ordinary control connection. The screen keeps it prepared while Liv
 paused, or playing. A negotiated `supportsKeepalive` heartbeat every 20 seconds
 keeps idle IPC alive without reading files or fetching video. Older servers get an
 idle reconnect every 40 seconds, before their 60-second timeout. Screen close
-releases the connection and caches; backgrounding suspends networking and
+releases the connection and caches; without external output, backgrounding suspends networking and
 foregrounding prepares it again. Canceling an obsolete in-flight seek closes only
 this media connection, then prepares a replacement.
 
@@ -536,9 +607,9 @@ Unauthorized chips do nothing when tapped and do not create preview streams.
 The S3 setup padlock on missing footage is a separate action and is unchanged. The same
 gate covers camera video opened from device details; fullscreen players cannot
 bypass it. One session spans the camera list, fullscreen player, and camera
-switches. Unless explicit PiP is active, leaving the section or backgrounding
+switches. Unless explicit PiP or a connected external camera display is active, leaving the section or backgrounding
 locks the session and releases its credential references. Inactive transitions conceal imagery for system
-snapshots, but do not cancel the authentication prompt itself. History stays
+snapshots, but do not cancel the authentication prompt itself. Without external output, history stays
 paused at its existing position after backgrounding.
 
 ### Full Screen camera focus
@@ -562,6 +633,55 @@ whose quality was changed while focused. The camera picker still retains the
 complete open selection; removing the focused camera clears the override.
 Native PiP restoration reveals the grid if the restored camera was hidden by a
 different focused pane.
+
+### External camera display (iOS)
+
+While the camera viewer is open, an AirPlay or wired external display
+automatically receives its own camera matrix. The phone keeps its existing
+video, controls, timeline, and gestures. No per-camera menu action is required.
+The external view uses the same `CameraGroupVideo` layout rules and camera
+selection order, calculated independently for the external display's dimensions.
+Phone orientation and single-camera focus do not change the external matrix.
+Camera names and playback status are included; interactive controls stay on
+the phone. The shared playback session also keeps history and pause in sync.
+
+Each external pane has a separate sample-buffer display layer. A bounded relay
+feeds it the main player's already-scheduled live or history samples, without
+another camera subscription or playback clock. It retains at most one GOP,
+bounded to 8 MiB and 240 samples per camera, to prime a display connected while
+paused. If that bound is exceeded, a newly connected output waits for the next
+keyframe. External decoder recovery never resets the phone's decoder. Teardown
+flushes only the external output; normal playback reset/access revocation clears
+both outputs and the relay's cached imagery. PiP remains independently live-only.
+
+iOS 27 uses a noninteractive external-display scene accessory registered by the
+camera viewer. iOS 26 uses the corresponding scene role and a viewer registry.
+An output can first retain media only while its viewer is authorized and the
+phone is foregrounded. A registration without a connected window retains nothing.
+An already-connected output follows the same continuation policy as active PiP:
+locking/backgrounding the phone does not blank it, flush loaded credentials,
+pause its playback clock, or restart its streams. Each selected camera has a
+scoped consumer authorization; only those consumers survive phone suspension.
+Ordinary previews, phone controls, local recording, and new authentication/Keychain requests remain
+disabled, and phone imagery remains concealed while inactive. The interactive
+window's scene phase drives this policy, not the app's aggregate scene phase.
+
+Unlocking resumes phone controls without a new biometric prompt, Keychain read,
+or media restart. The last external-window disconnect or viewer dismissal
+releases retention; explicit access revocation/server changes always stop output
+and clear secrets. If PiP still owns access, its independent lease survives.
+This is the application's policy, not a guarantee against iOS suspending the
+process or disconnecting AirPlay while locked; physical-device checks are required.
+
+Device checks: connect before and after opening the viewer; use one through
+four cameras; change selection, quality, and live/history position; rotate and
+focus the phone while confirming the external matrix keeps its own layout;
+disconnect and reconnect while paused; confirm phone gestures remain available;
+lock/unlock while confirming the phone conceals its imagery but the external
+matrix continues. Check that disconnect/dismissal/revocation releases output and
+that merely registering a viewer without a connected display grants no exception.
+Exercise both a wired display and AirPlay, including an iOS 26 device and an
+iOS 27 device, and confirm PiP still uses its own live stream.
 
 ### Picture in Picture (iOS)
 
@@ -611,13 +731,17 @@ read Keychain again. It does not unlock credentials that were locked before PiP.
 Ordinary camera imagery is still concealed while inactive; ordinary streams,
 controls, and history remain suspended in the background. The independent,
 exact-camera stream authorization is revoked on
-PiP stop/failure, audio interruption, protected-data unavailability, or server
+PiP stop/failure, audio interruption, explicit access revocation, or server
 change. Ending PiP while backgrounded (or with no camera UI open) also clears
-the retained camera session and credentials. Protected-data loss and server
-changes always clear them. There is no persisted background authorization or
+the retained camera session and credentials unless an external display still owns them.
+Device lock/protected-data unavailability retains already-active output and keys
+already in memory; it cancels pending starts/swaps and permits no new Keychain
+request. Explicit revocation and server changes always clear them.
+There is no persisted background authorization or
 automatic PiP restart.
 
-If the PiP stream ends, the window closes silently using the normal stop/cleanup
+Transient network loss retains the active PiP window while the shared live
+connection recovers. If the stream ends with a terminal failure, the window closes silently using the normal stop/cleanup
 path. No stream-ended alert is retained for the next time the viewer opens.
 Failures of an explicit start or swap still provide immediate feedback.
 
@@ -656,7 +780,7 @@ foreground-stream revocation, and restoration-handoff ordering. On a device, als
 check native start/stop and pause/resume, starting live PiP while History remains
 visible, switching Live → History → Live while PiP continues live and the native
 placeholder returns, background playback, return with the viewer open and closed,
-switching PiP cameras, lock-screen teardown, and that backgrounding without an
+switching PiP cameras, locked-device continuation, and that backgrounding without an
 explicit PiP action never opens the system window.
 
 Verified on Parkaboy through iPhone Mirroring (2026-09-25): native start/stop,
@@ -840,7 +964,7 @@ On-device authentication smoke checks:
 
 - With no saved S3 credentials, enter Cameras: chips stay black until the system
   authentication decision. Cancel should leave them locked; Unlock retries.
-- Without PiP, background and return, and leave/re-enter Cameras. Each starts a
+- Without PiP or a connected external display, background and return, and leave/re-enter Cameras. Each starts a
   fresh lock session. Opening fullscreen and switching cameras should not ask again.
 - With active PiP, background and return (including the system full-screen
   action after closing the viewer). No additional Face ID prompt should appear,

@@ -201,7 +201,7 @@ final class CameraPictureInPictureController: NSObject, ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in MainActor.assumeIsolated {
                 self?.accessLifecycle?.protectedDataWillBecomeUnavailable()
-                self?.stop()
+                self?.protectedDataWillBecomeUnavailable()
             } }
             .store(in: &notifications)
         NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)
@@ -391,6 +391,12 @@ final class CameraPictureInPictureController: NSObject, ObservableObject {
         // No automatic PiP, including an outstanding preparation request when
         // the user leaves the app before the system has actually started PiP.
         if appIsBackgrounded, !self.phase.mayContinueInBackground { stop() }
+    }
+
+    func protectedDataWillBecomeUnavailable() {
+        cancelSwap()
+        // Locking is continuation, never an opportunity to finish starting PiP.
+        if !phase.mayContinueInBackground { stop() }
     }
 
     func configureAudioSession(policy: CameraPiPAudioPolicy) throws {

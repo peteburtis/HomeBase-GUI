@@ -5,6 +5,39 @@ import LocalAuthentication
 
 @MainActor
 final class CameraAccessSessionTests: XCTestCase {
+    func testExternalDisplayRetentionIsLimitedToExistingSelectedViewerStreams() async throws {
+        let fixture = Fixture(presence: .biometricProtected)
+        let session = fixture.session
+        let arbiter = CameraStreamArbiter { _, _ in throw CameraStreamError.ended }
+        session.enter()
+        await waitUntil { !session.isAuthenticating }
+        let selected = UUID(), other = UUID()
+        let external = try session.authorizeViewerStream(arbiter, camera: "selected", owner: selected)
+        let ordinary = try session.authorizeViewerStream(arbiter, camera: "other", owner: other)
+        let preview = try session.authorizeStreams(arbiter)
+        XCTAssertThrowsError(try session.authorizeViewerStream(arbiter, camera: "wrong-camera", owner: selected))
+        session.retainViewerStream(owner: selected)
+        session.suspendStreams()
+        XCTAssertTrue(external.isValid)
+        XCTAssertFalse(ordinary.isValid)
+        XCTAssertFalse(preview.isValid)
+        XCTAssertTrue(try session.authorizeViewerStream(arbiter, camera: "selected", owner: selected) === external)
+        XCTAssertThrowsError(try session.authorizeViewerStream(arbiter, camera: "other", owner: other))
+        XCTAssertThrowsError(try session.authorizePictureInPicture(camera: "selected"))
+        session.retainViewerStream(owner: other)
+        XCTAssertThrowsError(try session.authorizeViewerStream(arbiter, camera: "other", owner: other))
+        session.releaseViewerStream(owner: selected)
+        XCTAssertFalse(external.isValid)
+        XCTAssertNotNil(session.unlockedCredentials, "Stream release is separate from access ownership")
+        session.resumeStreams()
+        let replacement = try session.authorizeViewerStream(arbiter, camera: "selected", owner: selected)
+        session.retainViewerStream(owner: selected)
+        session.lock()
+        XCTAssertFalse(replacement.isValid, "Explicit locking overrides retention synchronously")
+        XCTAssertNil(session.unlockedCredentials)
+        await arbiter.shutdown()
+    }
+
     func testExplicitPiPLeaseSurvivesUILockWithoutUnlockingCredentialsOrOtherCameras() async throws {
         let fixture = Fixture(presence: .biometricProtected)
         let arbiter = CameraStreamArbiter { _, _ in throw CameraStreamError.ended }

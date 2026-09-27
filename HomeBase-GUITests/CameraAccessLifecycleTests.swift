@@ -280,23 +280,48 @@ final class CameraAccessLifecycleTests: XCTestCase {
         }
     }
 
-    func testProtectedDataLossAndServerResetOverridePiPAndRestorationRetention() async {
-        for serverReset in [true, false] {
+    func testDeviceLockRetainsActivePiPButServerResetAlwaysClearsIt() async {
+        for lockBeforeBackground in [true, false] {
             let session = CameraAccessSession(credentials: CameraPageTestCredentials(presence: .biometricProtected),
                 authenticator: CameraPageTestAuthenticator(), environment: .device)
             let lifecycle = CameraAccessLifecycle(session: session)
             lifecycle.setActive(true, owner: UUID())
             await settle(session)
             lifecycle.pictureInPictureStarted()
+            if lockBeforeBackground { lifecycle.protectedDataWillBecomeUnavailable() }
             lifecycle.scenePhaseChanged(.background)
             lifecycle.pictureInPictureWillRestore()
-            if serverReset { lifecycle.reset() }
-            else { lifecycle.protectedDataWillBecomeUnavailable() }
+            lifecycle.protectedDataWillBecomeUnavailable()
+            XCTAssertTrue(session.isUnlocked)
+            XCTAssertNotNil(session.unlockedCredentials)
+            XCTAssertTrue(session.streamsSuspended)
+            lifecycle.reset()
             XCTAssertFalse(session.isUnlocked)
             XCTAssertNil(session.unlockedCredentials)
             lifecycle.pictureInPictureRestorationCompleted(true)
             XCTAssertFalse(session.isUnlocked, "A late restore callback cannot resurrect authorization")
         }
+    }
+
+    func testDeviceLockWithoutRunningOutputClearsSecretsEvenBeforeBackground() async {
+        let session = CameraAccessSession(credentials: CameraPageTestCredentials(presence: .biometricProtected),
+            authenticator: CameraPageTestAuthenticator(), environment: .device)
+        let lifecycle = CameraAccessLifecycle(session: session)
+        lifecycle.setActive(true, owner: UUID())
+        await settle(session)
+        lifecycle.pictureInPictureStarted()
+        lifecycle.protectedDataWillBecomeUnavailable()
+        XCTAssertTrue(session.isUnlocked)
+        lifecycle.pictureInPictureStopped()
+        XCTAssertFalse(session.isUnlocked, "Stopping the last output while locked releases the retained grant")
+        XCTAssertNil(session.unlockedCredentials)
+        lifecycle.scenePhaseChanged(.active)
+        lifecycle.setActive(true, owner: UUID())
+        session.enter()
+        await settle(session)
+        XCTAssertTrue(session.isUnlocked)
+        lifecycle.protectedDataWillBecomeUnavailable()
+        XCTAssertFalse(session.isUnlocked, "An ordinary viewer gets no lock-screen continuation")
     }
 
     func testPiPCannotRetainAnAuthorizationThatWasNeverGranted() async {
@@ -317,6 +342,136 @@ final class CameraAccessLifecycleTests: XCTestCase {
     }
 
 #if os(iOS)
+    func testConnectedDisplayKeepsExistingMatrixAndKeysAcrossLockInEitherLifecycleOrder() async throws {
+        for count in [1, 4] {
+            for childFirst in [true, false] {
+                let auth = CameraPageTestAuthenticator()
+                let credentials = CameraPageTestCredentials(presence: .biometricProtected)
+                let access = CameraAccessSession(credentials: credentials, authenticator: auth, environment: .device)
+                let lifecycle = CameraAccessLifecycle(session: access)
+                lifecycle.setActive(true, owner: UUID())
+                await settle(access)
+                let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
+                let client = HomeBaseWebSocketClient(endpoint: endpoint)
+                let cameras = CameraVideoCatalog.cameras(in: [], includesArtificial: true)
+                let group = CameraGroupPlayback(client: client,
+                    initialSession: CameraGroupSession(camera: try XCTUnwrap(cameras.first), client: client))
+                for camera in cameras.dropFirst().prefix(count - 1) { group.toggle(camera) }
+                group.activateResources(access: access)
+                let presentation = CameraExternalDisplayPresentation()
+                presentation.update(group: group, isVisible: true, lifecycle: lifecycle)
+                let output = UUID(), secondOutput = UUID()
+                presentation.outputConnected(output)
+                presentation.outputConnected(secondOutput)
+                let arbiter = CameraStreamArbiter { _, _ in throw CameraStreamError.ended }
+                let foreground = try access.authorizeStreams(arbiter)
+                let authorizations = try group.sessions.map {
+                    try access.authorizeViewerStream(arbiter, camera: $0.id, owner: $0.streamOwner)
+                }
+                let identities = group.sessions.map(ObjectIdentifier.init)
+                let renderers = group.sessions.map { ObjectIdentifier($0.playback.renderer) }
+                try await Task.sleep(for: .milliseconds(30))
+                XCTAssertTrue(group.sessions.allSatisfy { $0.liveVideo.state == .playing })
+
+                lifecycle.scenePhaseChanged(.inactive)
+                if childFirst { group.suspendForPhone(stopImmediately: true) }
+                lifecycle.protectedDataWillBecomeUnavailable()
+                lifecycle.scenePhaseChanged(.background)
+                if !childFirst { group.suspendForPhone(stopImmediately: true) }
+                presentation.update(group: group, isVisible: access.isUnlocked, lifecycle: lifecycle)
+                XCTAssertTrue(presentation.isVisible)
+                XCTAssertTrue(group.hasActiveExternalDisplay)
+                XCTAssertTrue(group.sessions.allSatisfy(\.resourcesActive))
+                XCTAssertTrue(group.sessions.allSatisfy { $0.liveVideo.state == .playing })
+                XCTAssertTrue(authorizations.allSatisfy(\.isValid))
+                XCTAssertFalse(foreground.isValid)
+                XCTAssertNotNil(access.unlockedCredentials)
+                XCTAssertEqual(group.sessions.map(ObjectIdentifier.init), identities)
+                XCTAssertEqual(group.sessions.map { ObjectIdentifier($0.playback.renderer) }, renderers)
+                XCTAssertFalse(CameraAccessPresentation(session: access, isAuthorized: true,
+                    isUnlocked: false, isAuthenticating: false, errorMessage: nil).canStream)
+                XCTAssertThrowsError(try access.authorizeStreams(arbiter))
+                XCTAssertThrowsError(try access.authorizeViewerStream(arbiter, camera: "new", owner: UUID()))
+                do {
+                    try await access.unlockCredentials()
+                    XCTFail("Retained credentials must not enable a fresh locked Keychain request")
+                } catch { XCTAssertEqual(error as? CameraAccessError, .sessionClosed) }
+
+                lifecycle.scenePhaseChanged(.active)
+                group.resume()
+                group.activateResources(access: access)
+                await settle(access)
+                XCTAssertEqual(auth.calls, 1)
+                XCTAssertEqual(credentials.loads, 1)
+                XCTAssertTrue(authorizations.allSatisfy(\.isValid), "Returning must not restart retained video")
+                lifecycle.scenePhaseChanged(.background)
+                group.suspendForPhone(stopImmediately: true)
+                presentation.outputDisconnected(output)
+                XCTAssertTrue(group.hasActiveExternalDisplay, "Another connected output still owns the matrix")
+                presentation.outputDisconnected(secondOutput)
+                XCTAssertFalse(group.hasActiveExternalDisplay)
+                XCTAssertFalse(presentation.isVisible)
+                XCTAssertTrue(group.sessions.allSatisfy { !$0.resourcesActive })
+                XCTAssertTrue(authorizations.allSatisfy { !$0.isValid })
+                XCTAssertFalse(access.isUnlocked)
+                XCTAssertNil(access.unlockedCredentials)
+                presentation.clear()
+                group.deactivate()
+                lifecycle.reset()
+                await arbiter.shutdown()
+            }
+        }
+    }
+
+    func testAccessoryRegistrationAloneAndLateConnectionCannotRetainOrStartBackgroundVideo() async throws {
+        let access = CameraAccessSession(credentials: CameraPageTestCredentials(),
+            authenticator: CameraPageTestAuthenticator(), environment: .device)
+        let lifecycle = CameraAccessLifecycle(session: access)
+        lifecycle.setActive(true, owner: UUID())
+        await settle(access)
+        let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
+        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let camera = try XCTUnwrap(CameraVideoCatalog.cameras(in: [], includesArtificial: true).first)
+        let group = CameraGroupPlayback(client: client, initialSession: CameraGroupSession(camera: camera, client: client))
+        let presentation = CameraExternalDisplayPresentation()
+        defer { presentation.clear(); group.deactivate(); lifecycle.reset() }
+        group.activateResources(access: access)
+        presentation.update(group: group, isVisible: true, lifecycle: lifecycle)
+        XCTAssertFalse(group.hasActiveExternalDisplay)
+        lifecycle.pictureInPictureStarted()
+        lifecycle.scenePhaseChanged(.background)
+        group.suspendForPhone(stopImmediately: true)
+        presentation.outputConnected(UUID())
+        XCTAssertFalse(presentation.isVisible)
+        XCTAssertFalse(group.hasActiveExternalDisplay, "PiP retention cannot authorize a newly connected display")
+        XCTAssertTrue(group.sessions.allSatisfy { !$0.resourcesActive })
+        lifecycle.pictureInPictureStopped()
+        XCTAssertFalse(access.isUnlocked)
+    }
+
+    func testExplicitRevocationBlanksConnectedDisplayAndStopsItsResources() async throws {
+        let access = CameraAccessSession(credentials: CameraPageTestCredentials(presence: .biometricProtected),
+            authenticator: CameraPageTestAuthenticator(), environment: .device)
+        let lifecycle = CameraAccessLifecycle(session: access)
+        lifecycle.setActive(true, owner: UUID())
+        await settle(access)
+        let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
+        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let camera = try XCTUnwrap(CameraVideoCatalog.cameras(in: [], includesArtificial: true).first)
+        let group = CameraGroupPlayback(client: client, initialSession: CameraGroupSession(camera: camera, client: client))
+        let presentation = CameraExternalDisplayPresentation()
+        defer { presentation.clear(); group.deactivate() }
+        group.activateResources(access: access)
+        presentation.update(group: group, isVisible: true, lifecycle: lifecycle)
+        presentation.outputConnected(UUID())
+        XCTAssertTrue(group.hasActiveExternalDisplay)
+        lifecycle.reset()
+        XCTAssertFalse(presentation.isVisible)
+        XCTAssertFalse(group.hasActiveExternalDisplay)
+        XCTAssertTrue(group.sessions.allSatisfy { !$0.resourcesActive })
+        XCTAssertNil(access.unlockedCredentials)
+    }
+
     func testRetainedPiPAccessAutomaticallyResumesGroupAndPreviewAfterInactiveReturn() async throws {
         let auth = CameraPageTestAuthenticator()
         let credentials = CameraPageTestCredentials(presence: .biometricProtected)

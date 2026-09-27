@@ -91,11 +91,19 @@ actor HomeBaseWebSocketClient {
     private let endpoint: HomeBaseEndpoint
     private let clientID: UUID
     private let urlSession: URLSession
+    private let makeControlSocket: @Sendable (URL) -> any HomeBaseControlSocket
+    private let requestTimeout: TimeInterval
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    private var task: URLSessionWebSocketTask?
+    private var task: (any HomeBaseControlSocket)?
     private var connectionAttempt: Task<Void, Error>?
+    private var connectionAttemptID: UUID?
+    private var reactivationAttempt: Task<Void, Error>?
+    private var reactivationAttemptID: UUID?
+    private var connectionGeneration: UInt64 = 0
+    private var networkMonitor: CameraNetworkPathMonitor?
+    private var pathRecoveryTask: Task<Void, Never>?
     private var sessionID: UUID?
     private var resumeToken: String?
     private var serverInstanceID: UUID?
@@ -144,17 +152,26 @@ actor HomeBaseWebSocketClient {
     init(
         endpoint: HomeBaseEndpoint,
         clientID: UUID = UUID(),
-        urlSession: URLSession = .shared
+        urlSession: URLSession = .shared,
+        requestTimeout: TimeInterval = 30,
+        makeControlSocket: (@Sendable (URL) -> any HomeBaseControlSocket)? = nil
     ) {
         self.endpoint = endpoint
         self.clientID = clientID
         self.urlSession = urlSession
+        self.requestTimeout = requestTimeout
+        self.makeControlSocket = makeControlSocket ?? { url in
+            urlSession.webSocketTask(with: url, protocols: [Self.webSocketSubprotocol])
+        }
     }
 
     deinit {
         let arbiter = liveStreamArbiter
         Task { await arbiter?.shutdown() }
         connectionAttempt?.cancel()
+        reactivationAttempt?.cancel()
+        pathRecoveryTask?.cancel()
+        networkMonitor?.cancel()
         receiveTask?.cancel()
         acknowledgementTask?.cancel()
         task?.cancel(with: .goingAway, reason: nil)
@@ -164,8 +181,8 @@ actor HomeBaseWebSocketClient {
         CameraHistoryTransport(endpoint: endpoint, clientID: clientID, session: urlSession)
     }
 
-    /// Call after reactivation so a failed old session cannot invalidate a new
-    /// subscription. All views on this client share these upstream leases.
+    /// Consumers survive transient control-connection losses. Each upstream
+    /// attempt reactivates the main session and requests a fresh one-use ticket.
     func cameraStreamArbiter() -> CameraStreamArbiter {
         if let liveStreamArbiter { return liveStreamArbiter }
         let arbiter = CameraStreamArbiter { [weak self] camera, quality in
@@ -173,11 +190,30 @@ actor HomeBaseWebSocketClient {
             return try await self.openSharedCameraStream(camera, quality: quality)
         }
         liveStreamArbiter = arbiter
+        if networkMonitor == nil {
+            networkMonitor = CameraNetworkPathMonitor { [weak self] in
+                Task { await self?.networkPathChanged() }
+            }
+        }
         return arbiter
+    }
+
+    private func networkPathChanged() {
+        pathRecoveryTask?.cancel()
+        pathRecoveryTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(500)) } catch { return }
+            guard let self, let arbiter = await self.liveStreamArbiter,
+                  await arbiter.networkPathChanged(), !Task.isCancelled else { return }
+            Self.logConnection("network path changed; checking active camera connection")
+            try? await self.reactivate()
+        }
     }
 
     private func openSharedCameraStream(_ camera: String, quality: CameraLiveQualitySelection) async throws -> CameraStreamUpstream {
         try Task.checkCancellation()
+        try await reactivate()
+        try Task.checkCancellation()
+        let generation = connectionGeneration
         let lease = try await openCameraLiveStream(deviceIdentifier: camera, quality: quality)
         var connection: HomeBaseMediaConnection?
         do {
@@ -188,7 +224,7 @@ actor HomeBaseWebSocketClient {
             return CameraStreamUpstream(frames: frames, close: { [weak self] in
                 media.cancel()
                 await self?.releaseSharedCameraStream(lease.opened.streamID)
-            })
+            }, connectionGeneration: generation)
         } catch {
             connection?.cancel()
             await releaseSharedCameraStream(lease.opened.streamID)
@@ -210,6 +246,7 @@ actor HomeBaseWebSocketClient {
     }
 
     func connect() async throws {
+        try Task.checkCancellation()
         if let connectionAttempt {
             try await connectionAttempt.value
             return
@@ -218,6 +255,7 @@ actor HomeBaseWebSocketClient {
             return
         }
 
+        let attemptID = UUID()
         let attempt = Task { [weak self] in
             guard let self else {
                 throw ClientError.notConnected
@@ -225,27 +263,48 @@ actor HomeBaseWebSocketClient {
             try await self.establishConnection()
         }
         connectionAttempt = attempt
-        do {
-            try await attempt.value
-            connectionAttempt = nil
-        } catch {
-            connectionAttempt = nil
-            throw error
+        connectionAttemptID = attemptID
+        defer {
+            if connectionAttemptID == attemptID {
+                connectionAttempt = nil; connectionAttemptID = nil
+            }
         }
+        try await attempt.value
+        try Task.checkCancellation()
     }
 
     func reactivate() async throws {
+        try Task.checkCancellation()
+        if let reactivationAttempt {
+            try await reactivationAttempt.value
+            try Task.checkCancellation()
+            return
+        }
+        let id = UUID()
+        let attempt = Task { try await checkOrReconnect() }
+        reactivationAttemptID = id
+        reactivationAttempt = attempt
+        defer {
+            if reactivationAttemptID == id {
+                reactivationAttempt = nil; reactivationAttemptID = nil
+            }
+        }
+        try await attempt.value
+        try Task.checkCancellation()
+    }
+
+    private func checkOrReconnect() async throws {
         if connectionAttempt != nil {
             try await connect()
             return
         }
 
-        if task != nil, sessionID != nil {
+        if let checkedTask = task, sessionID != nil {
             do {
                 let request = try sessionRequest(
                     operation: HBProtocolOperations.ping
                 )
-                let response = try await sendRequest(request)
+                let response = try await sendRequest(request, using: checkedTask, timeout: min(8, requestTimeout))
                 let body = try response.decodedPayload(
                     as: HBProtocolResponse.self
                 )
@@ -263,7 +322,7 @@ actor HomeBaseWebSocketClient {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                if task != nil {
+                if task === checkedTask {
                     failConnection(with: error)
                 }
             }
@@ -277,6 +336,7 @@ actor HomeBaseWebSocketClient {
     }
 
     private func establishConnection() async throws {
+        try Task.checkCancellation()
         if sessionID != nil, task != nil {
             return
         }
@@ -292,26 +352,30 @@ actor HomeBaseWebSocketClient {
         if let sessionID,
            let resumeToken,
            let serverInstanceID {
+            let task = startWebSocketTask(with: url)
+            let generation = connectionGeneration
             do {
-                let task = startWebSocketTask(with: url)
                 try await resumeSession(
                     sessionID: sessionID,
                     resumeToken: resumeToken,
                     serverInstanceID: serverInstanceID,
                     using: task
                 )
+                try Task.checkCancellation()
+                guard self.task === task else { throw ClientError.notConnected }
                 try await cancelAbandonedSubscriptions()
                 Self.logConnection("session resumed")
                 return
             } catch is CancellationError {
-                failConnection(
-                    with: CancellationError(),
-                    preservingSession: false
-                )
+                if connectionGeneration == generation {
+                    failConnection(with: CancellationError(), preservingSession: false)
+                }
                 throw CancellationError()
             } catch {
+                try Task.checkCancellation()
+                guard connectionGeneration == generation else { throw error }
                 guard shouldRebuildSession(after: error) else {
-                    if task != nil {
+                    if self.task != nil {
                         failConnection(
                             with: error,
                             preservingSession: true
@@ -333,14 +397,18 @@ actor HomeBaseWebSocketClient {
             )
         }
 
+        try Task.checkCancellation()
+        let task = startWebSocketTask(with: url)
+        let generation = connectionGeneration
         do {
-            let task = startWebSocketTask(with: url)
             let request = HBProtocolEnvelope(
                 messageKind: .request,
                 clientID: clientID,
                 operation: HBProtocolOperations.openSession
             )
-            let response = try await sendRequest(request, using: task)
+            let response = try await sendRequest(request, using: task, timeout: min(15, requestTimeout))
+            try Task.checkCancellation()
+            guard self.task === task else { throw ClientError.notConnected }
             let body = try response.decodedPayload(
                 as: HBProtocolResponse.self
             )
@@ -357,19 +425,19 @@ actor HomeBaseWebSocketClient {
             serverInstanceID = opened.serverInstanceID
             Self.logConnection("fresh session opened")
         } catch {
-            failConnection(with: error, preservingSession: false)
+            if connectionGeneration == generation {
+                failConnection(with: error, preservingSession: false)
+            }
             throw error
         }
     }
 
     private func startWebSocketTask(
         with url: URL
-    ) -> URLSessionWebSocketTask {
-        let task = urlSession.webSocketTask(
-            with: url,
-            protocols: [Self.webSocketSubprotocol]
-        )
+    ) -> any HomeBaseControlSocket {
+        let task = makeControlSocket(url)
         task.maximumMessageSize = 4 * 1_024 * 1_024
+        connectionGeneration &+= 1
         self.task = task
         task.resume()
         startReceiveLoop(using: task)
@@ -380,7 +448,7 @@ actor HomeBaseWebSocketClient {
         sessionID: UUID,
         resumeToken: String,
         serverInstanceID: UUID,
-        using task: URLSessionWebSocketTask
+        using task: any HomeBaseControlSocket
     ) async throws {
         // Every delivery at or below latestDeliverySequence has already been
         // decoded and applied locally. Advertising that processing checkpoint
@@ -396,7 +464,7 @@ actor HomeBaseWebSocketClient {
                 acknowledgedDeliverySequence: processingCheckpoint
             )
         )
-        let response = try await sendRequest(request, using: task)
+        let response = try await sendRequest(request, using: task, timeout: min(15, requestTimeout))
         let body = try response.decodedPayload(as: HBProtocolResponse.self)
         let resumed = try body.decodedResult(
             as: HBWebSocketSessionResumed.self
@@ -986,7 +1054,8 @@ actor HomeBaseWebSocketClient {
             payload: HBCameraLiveOpenRequest(
                 deviceIdentifier: deviceIdentifier,
                 quality: quality.requestedQuality,
-                isolatedQuality: true
+                isolatedQuality: true,
+                cameraTime: true
             )
         )
         let response = try await sendRequest(request)
@@ -1226,13 +1295,19 @@ actor HomeBaseWebSocketClient {
         }
     }
 
-    func disconnect() {
+    func disconnect() async {
+        let arbiter = liveStreamArbiter
+        liveStreamArbiter = nil
+        networkMonitor?.cancel(); networkMonitor = nil
+        pathRecoveryTask?.cancel(); pathRecoveryTask = nil
+        reactivationAttempt?.cancel(); reactivationAttempt = nil; reactivationAttemptID = nil
         connectionAttempt?.cancel()
-        connectionAttempt = nil
+        connectionAttempt = nil; connectionAttemptID = nil
         failConnection(
             with: CancellationError(),
             preservingSession: false
         )
+        await arbiter?.shutdown()
     }
 
     private func sessionRequest(
@@ -1276,7 +1351,8 @@ actor HomeBaseWebSocketClient {
 
     private func sendRequest(
         _ request: HBProtocolEnvelope,
-        using task: URLSessionWebSocketTask
+        using task: any HomeBaseControlSocket,
+        timeout: TimeInterval? = nil
     ) async throws -> HBProtocolEnvelope {
         let encodedRequest = try encoder.encode(request)
         logEncodedControlWriteIfPresent(
@@ -1287,6 +1363,13 @@ actor HomeBaseWebSocketClient {
             String(decoding: encodedRequest, as: UTF8.self)
         )
         let requestID = request.requestID
+        let deadline = timeout ?? requestTimeout
+        let watchdog = Task { [weak self, weak task] in
+            do { try await Task.sleep(for: .seconds(deadline)) } catch { return }
+            guard let self, let task else { return }
+            await self.requestTimedOut(requestID, using: task)
+        }
+        defer { watchdog.cancel() }
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -1321,6 +1404,12 @@ actor HomeBaseWebSocketClient {
                 await self?.cancelPendingResponse(requestID)
             }
         }
+    }
+
+    private func requestTimedOut(_ id: UUID, using checkedTask: any HomeBaseControlSocket) {
+        guard task === checkedTask, pendingResponses[id] != nil else { return }
+        Self.logConnection("control response deadline expired; replacing the connection")
+        failConnection(with: URLError(.timedOut))
     }
 
     private func logEncodedControlWriteIfPresent(
@@ -1447,7 +1536,7 @@ actor HomeBaseWebSocketClient {
     private func outboundSendFailed(
         _ error: Error,
         requestID: UUID,
-        task: URLSessionWebSocketTask
+        task: any HomeBaseControlSocket
     ) {
         guard self.task === task else {
             pendingResponses.removeValue(forKey: requestID)?
@@ -1462,14 +1551,14 @@ actor HomeBaseWebSocketClient {
             .resume(throwing: CancellationError())
     }
 
-    private func startReceiveLoop(using task: URLSessionWebSocketTask) {
+    private func startReceiveLoop(using task: any HomeBaseControlSocket) {
         receiveTask = Task { [weak self, weak task] in
             guard let self, let task else { return }
             await self.receiveMessages(using: task)
         }
     }
 
-    private func receiveMessages(using task: URLSessionWebSocketTask) async {
+    private func receiveMessages(using task: any HomeBaseControlSocket) async {
         do {
             while self.task === task, !Task.isCancelled {
                 let message = try await task.receive()
@@ -1485,7 +1574,7 @@ actor HomeBaseWebSocketClient {
 
     private func process(
         _ message: URLSessionWebSocketTask.Message,
-        from task: URLSessionWebSocketTask
+        from task: any HomeBaseControlSocket
     ) throws {
         guard self.task === task else { return }
 
@@ -1916,9 +2005,9 @@ actor HomeBaseWebSocketClient {
         with error: Error,
         preservingSession requestedPreservation: Bool? = nil
     ) {
-        let oldArbiter = liveStreamArbiter
-        liveStreamArbiter = nil
-        Task { await oldArbiter?.shutdown() }
+        let arbiter = liveStreamArbiter
+        let generation = connectionGeneration
+        Task { await arbiter?.connectionInterrupted(generation: generation) }
         let preserveSession = requestedPreservation
             ?? shouldPreserveSession(after: error)
         let hasResumeState = sessionID != nil

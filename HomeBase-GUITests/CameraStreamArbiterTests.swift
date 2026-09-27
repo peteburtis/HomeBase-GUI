@@ -396,12 +396,161 @@ final class CameraStreamArbiterTests: XCTestCase {
         } catch { XCTAssertEqual(error as? CameraStreamError, .closed) }
     }
 
+    func testInitialFailureRetriesWithBackoffWithoutEndingConsumer() async throws {
+        let f = Fixture()
+        let c = try await f.join("a", .low)
+        for (index, delay) in [1.0, 2, 4].enumerated() {
+            await eventually { await f.wire.count == index + 1 }
+            await f.wire.fail(index)
+            await eventually { await f.clock.hasWait(delay) }
+            XCTAssertNil(c.error)
+            await f.clock.advance(delay)
+        }
+        await eventually { await f.wire.count == 4 }
+        await f.wire.ready(3)
+        await eventually { c.video.count == 1 }
+        XCTAssertEqual(c.reconnects, 3)
+        await f.end()
+    }
+
+    func testActiveLossReopensForAllConsumersAndRemapsGeneration() async throws {
+        let f = Fixture()
+        let first = try await f.join("a", .low)
+        let second = try await f.join("a", .low)
+        await eventually { await f.wire.count == 1 }
+        await f.wire.ready(0)
+        await eventually { first.video.count == 1 && second.video.count == 1 }
+        await f.wire.fail(0)
+        await eventually { await f.clock.hasWait(1) }
+        await f.clock.advance(1)
+        await eventually { await f.wire.count == 2 }
+        await f.wire.ready(1)
+        await eventually { first.video.count == 2 && second.video.count == 2 }
+        XCTAssertNotEqual(first.configurations[0], first.configurations[1])
+        XCTAssertNil(first.error)
+        XCTAssertNil(second.error)
+        await f.end()
+    }
+
+    func testPathChangeWakesBackoffButDoesNotReplaceHealthyMedia() async throws {
+        let f = Fixture()
+        let c = try await f.join("a", .low)
+        await eventually { await f.wire.count == 1 }
+        await f.wire.fail(0)
+        await eventually { await f.clock.hasWait(1) }
+        await f.arbiter.networkPathChanged()
+        await eventually { await f.wire.count == 2 }
+        await f.wire.ready(1)
+        await eventually { c.video.count == 1 }
+        await f.arbiter.networkPathChanged()
+        await f.clock.advance(30)
+        let opens = await f.wire.count
+        XCTAssertEqual(opens, 2)
+        XCTAssertNil(c.error)
+        await f.end()
+    }
+
+    func testControlConnectionLossKeepsAuthorizationAndIgnoresStaleFailure() async throws {
+        let f = Fixture()
+        let authorization = CameraStreamAuthorization(camera: "a")
+        let c = Collector(try await f.arbiter.subscribe(camera: "a", quality: .low, authorization: authorization))
+        await eventually { await f.wire.count == 1 }
+        await f.wire.ready(0)
+        await eventually { c.video.count == 1 }
+        await f.arbiter.connectionInterrupted(generation: 1)
+        await eventually { await f.clock.hasWait(1) }
+        await f.clock.advance(1)
+        await eventually { await f.wire.count == 2 }
+        await f.wire.ready(1)
+        await eventually { c.video.count == 2 }
+        await f.arbiter.connectionInterrupted(generation: 1)
+        await f.wire.video(1, sequence: 2)
+        await eventually { c.video.count == 3 }
+        XCTAssertEqual(c.reconnects, 1)
+        XCTAssertTrue(authorization.isValid)
+        XCTAssertNil(c.error)
+        await f.end()
+    }
+
+    func testNoDataWatchdogRecoversButRecentActivityPreventsTimeout() async throws {
+        let f = Fixture(monitorsStalls: true)
+        let c = try await f.join("a", .low)
+        await eventually { await f.wire.count == 1 }
+        await f.wire.ready(0)
+        await eventually { c.video.count == 1 }
+        await eventually { await f.clock.hasWait(15) }
+        await f.wire.video(0, sequence: 2)
+        await eventually { c.video.count == 2 }
+        await f.clock.advance(15)
+        await eventually { await f.clock.hasWait(15) }
+        XCTAssertEqual(c.reconnects, 0)
+        await f.clock.advance(15)
+        await eventually { await f.clock.hasWait(1) }
+        await f.clock.advance(1)
+        await eventually { await f.wire.count == 2 }
+        await f.wire.ready(1)
+        await eventually { c.video.count == 3 }
+        XCTAssertEqual(c.reconnects, 1)
+        XCTAssertNil(c.error)
+        await f.end()
+    }
+
+    func testInitialWarmupTimeoutRetriesInsteadOfLeavingSpinner() async throws {
+        let f = Fixture()
+        let c = try await f.join("a", .low)
+        await eventually { await f.wire.count == 1 }
+        await eventually { await f.clock.hasWait(20) }
+        await f.clock.advance(20)
+        await eventually { await f.clock.hasWait(1) }
+        await f.clock.advance(1)
+        await eventually { await f.wire.count == 2 }
+        await f.wire.ready(1)
+        await eventually { c.video.count == 1 }
+        XCTAssertNil(c.error)
+        await f.end()
+    }
+
+    func testServerRetryabilityIsRespected() async throws {
+        let f = Fixture()
+        let c = try await f.join("a", .low)
+        await eventually { await f.wire.count == 1 }
+        await f.wire.serverEnd(0, retryable: true)
+        await eventually { await f.clock.hasWait(1) }
+        await f.clock.advance(1)
+        await eventually { await f.wire.count == 2 }
+        await f.wire.serverEnd(1, retryable: false)
+        await eventually { c.error != nil }
+        await f.clock.advance(60)
+        let opens = await f.wire.count
+        XCTAssertEqual(opens, 2)
+        XCTAssertEqual(c.error as? CameraStreamError, .serverEnded("test end", retryable: false))
+        await f.end()
+    }
+
+    func testRevocationDuringBackoffCannotResurrectStream() async throws {
+        let f = Fixture()
+        let authorization = CameraStreamAuthorization(camera: "a")
+        let c = Collector(try await f.arbiter.subscribe(camera: "a", quality: .low, authorization: authorization))
+        await eventually { await f.wire.count == 1 }
+        await f.wire.fail(0)
+        await eventually { await f.clock.hasWait(1) }
+        authorization.invalidate()
+        await f.arbiter.networkPathChanged()
+        await f.clock.advance(60)
+        await eventually { c.error != nil }
+        let opens = await f.wire.count
+        XCTAssertEqual(opens, 1)
+        await f.end()
+    }
+
     private final class Fixture {
         let wire = Wire()
         let clock = ManualClock()
         let arbiter: CameraStreamArbiter
-        init(policy: CameraStreamArbiter.Policy = .init()) {
+        init(policy: CameraStreamArbiter.Policy = .init(), monitorsStalls: Bool = false) {
             let wire = wire, clock = clock
+            var policy = policy
+            if !monitorsStalls { policy.stallTimeout = nil }
             arbiter = CameraStreamArbiter(policy: policy, sleep: { try await clock.sleep($0) }, open: { try await wire.open($0, $1) })
         }
         func join(_ camera: String, _ quality: CameraLiveQualitySelection) async throws -> Collector {
@@ -416,6 +565,7 @@ final class CameraStreamArbiterTests: XCTestCase {
         var video: [HBMediaFrame] = []
         var configurations: [UInt32] = []
         var warning: String?
+        var reconnects = 0
         var error: Error?
         var task: Task<Void, Never>?
         init(_ subscription: CameraStreamSubscription) {
@@ -425,6 +575,7 @@ final class CameraStreamArbiterTests: XCTestCase {
                     for try await event in subscription.events {
                         guard let self else { break }
                         switch event {
+                        case .reconnecting: reconnects += 1
                         case .qualityWarning(let value): warning = value
                         case .frames(let frames):
                             for frame in frames {
@@ -460,7 +611,7 @@ private actor Wire {
         let index = outputs.count
         outputs.append(pair.continuation); qualities.append(quality); cameras.append(camera)
         if holdsOpen { await withCheckedContinuation { openWaiter = $0 } }
-        return CameraStreamUpstream(frames: pair.stream, close: { await self.close(index) })
+        return CameraStreamUpstream(frames: pair.stream, close: { await self.close(index) }, connectionGeneration: UInt64(index + 1))
     }
     private func close(_ index: Int) async {
         closing.insert(index)
@@ -479,6 +630,10 @@ private actor Wire {
     }
     func ready(_ index: Int) { configuration(index); video(index, sequence: 1, key: true) }
     func fail(_ index: Int) { outputs[index].finish(throwing: CameraStreamError.ended) }
+    func serverEnd(_ index: Int, retryable: Bool) {
+        let end = HBMediaStreamEnd(reason: "test end", retryable: retryable)
+        outputs[index].yield(HBMediaFrame(type: .streamEnd, payload: try! JSONEncoder().encode(end)))
+    }
 }
 
 private actor ManualClock {

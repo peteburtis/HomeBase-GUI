@@ -9,10 +9,10 @@ import SwiftUI
 
 @main
 struct HomeBase_GUIApp: App {
-    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var serverStore = PairedServerStore()
     @StateObject private var cameraAccess: CameraAccessLifecycle
 #if os(iOS)
+    @UIApplicationDelegateAdaptor(CameraExternalDisplayAppDelegate.self) private var appDelegate
     @StateObject private var cameraPiP: CameraPictureInPictureController
 #endif
 
@@ -32,18 +32,36 @@ struct HomeBase_GUIApp: App {
 #endif
                 .environmentObject(serverStore)
                 .cameraAccessLifecycle(cameraAccess)
-                .onChange(of: scenePhase) { _, phase in
 #if os(iOS)
-                    cameraPiP.scenePhaseChanged(phase)
+                .modifier(CameraPhoneSceneLifecycle(access: cameraAccess, pictureInPicture: cameraPiP))
+#else
+                .modifier(CameraPhoneSceneLifecycle(access: cameraAccess))
 #endif
-                    cameraAccess.scenePhaseChanged(phase)
-                }
                 .onChange(of: serverStore.selectedServerID) { _, _ in
 #if os(iOS)
                     cameraPiP.reset()
 #endif
                     cameraAccess.reset()
                 }
+        }
+    }
+}
+
+/// Observe the interactive window, not the App's aggregate scene phase: an
+/// external scene remaining active must not keep phone previews/controls alive.
+private struct CameraPhoneSceneLifecycle: ViewModifier {
+    @Environment(\.scenePhase) private var scenePhase
+    let access: CameraAccessLifecycle
+#if os(iOS)
+    let pictureInPicture: CameraPictureInPictureController
+#endif
+
+    func body(content: Content) -> some View {
+        content.onChange(of: scenePhase) { _, phase in
+#if os(iOS)
+            pictureInPicture.scenePhaseChanged(phase)
+#endif
+            access.scenePhaseChanged(phase)
         }
     }
 }

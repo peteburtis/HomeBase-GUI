@@ -259,7 +259,12 @@ nonisolated final class HomeBaseMediaConnection: @unchecked Sendable {
         switch state {
         case .ready:
             sendHello()
-        case .failed(let error), .waiting(let error):
+        case .waiting(let error):
+            // Before redemption, Network.framework may recover this attempt.
+            // The arbiter's warm-up deadline bounds that wait. A redeemed
+            // ticket can never be reused to establish another connection.
+            if hello == nil { finish(throwing: error) }
+        case .failed(let error):
             finish(throwing: error)
         case .cancelled:
             finish()
@@ -394,6 +399,7 @@ final class CameraH264Renderer: ObservableObject {
     }
 
     let layer = AVSampleBufferDisplayLayer()
+    let displayRelay = CameraVideoDisplayRelay()
     var suppressesDisplay = false
     private var formatDescription: CMVideoFormatDescription?
     private var generation: UInt32?
@@ -570,6 +576,7 @@ final class CameraH264Renderer: ObservableObject {
         }
 
         layer.sampleBufferRenderer.enqueue(sampleBuffer)
+        displayRelay.enqueue(sampleBuffer, keyFrame: frame.flags.contains(.keyFrame))
         return sampleBuffer
     }
 
@@ -597,10 +604,12 @@ final class CameraH264Renderer: ObservableObject {
         let buffer = try CameraHistorySampleBuilder.sample(sample, segment: segment,
             format: formatDescription, origin: origin, display: display)
         layer.sampleBufferRenderer.enqueue(buffer)
+        displayRelay.enqueue(buffer, keyFrame: sample.frame.keyFrame)
         return buffer
     }
 
     func reset(removingDisplayedImage: Bool = true) {
+        displayRelay.flush(removingDisplayedImage: removingDisplayedImage)
         layer.sampleBufferRenderer.flush(
             removingDisplayedImage: removingDisplayedImage,
             completionHandler: nil
@@ -733,7 +742,8 @@ final class CameraLiveVideoModel: ObservableObject {
         if let arbiter, let subscription { await arbiter.update(subscription, quality: quality) }
     }
 
-    func run(access: CameraAccessSession? = nil, authorization explicitAuthorization: CameraStreamAuthorization? = nil) async {
+    func run(access: CameraAccessSession? = nil, authorization explicitAuthorization: CameraStreamAuthorization? = nil,
+             viewerStreamOwner: UUID? = nil) async {
         guard state == .idle, !Task.isCancelled else { return }
         let token = runOwnership.begin()
         if artificialFeed != nil {
@@ -753,13 +763,19 @@ final class CameraLiveVideoModel: ObservableObject {
         var ownedSubscription: CameraStreamSubscription?
 
         do {
-            try await client.reactivate()
             try Task.checkCancellation()
             guard runOwnership.isCurrent(token) else { throw CancellationError() }
             let shared = await client.cameraStreamArbiter()
             knownArbiter = shared
             guard runOwnership.isCurrent(token) else { throw CancellationError() }
-            let authorization = try explicitAuthorization ?? access?.authorizeStreams(shared)
+            let authorization: CameraStreamAuthorization?
+            if let explicitAuthorization {
+                authorization = explicitAuthorization
+            } else if let viewerStreamOwner {
+                authorization = try access?.authorizeViewerStream(shared, camera: deviceIdentifier, owner: viewerStreamOwner)
+            } else {
+                authorization = try access?.authorizeStreams(shared)
+            }
             let acquired = try await shared.subscribe(camera: deviceIdentifier, quality: quality, authorization: authorization)
             ownedArbiter = shared; ownedSubscription = acquired
             try Task.checkCancellation()
@@ -772,6 +788,8 @@ final class CameraLiveVideoModel: ObservableObject {
                 guard runOwnership.isCurrent(token) else { break }
                 guard authorization?.isValid != false else { throw CancellationError() }
                 switch event {
+                case .reconnecting:
+                    state = .waiting("Reconnecting to camera…")
                 case .qualityWarning(let message): qualityWarning = message
                 case .frames(let frames):
                     for frame in frames {
@@ -1085,6 +1103,7 @@ struct CameraLiveVideoSurface: View {
     @ObservedObject var model: CameraLiveVideoModel
     let allowsRetry: Bool
     let usesHistory: Bool
+    var isSecondaryOutput = false
     let retry: () -> Void
 
     var body: some View {
@@ -1095,7 +1114,7 @@ struct CameraLiveVideoSurface: View {
                 artificialFeed.color
                     .allowsHitTesting(false)
             } else if usesHistory || model.state.displaysVideo {
-                CameraSampleBufferView(renderer: model.renderer)
+                CameraSampleBufferView(renderer: model.renderer, isSecondaryOutput: isSecondaryOutput)
                     .allowsHitTesting(false)
             }
 
@@ -1840,8 +1859,7 @@ private struct CameraFullScreenCameraContent: View {
         liveVideo
         .onAppear {
             if !access.canStream {
-                group.suspend()
-                group.suspendResources(stopImmediately: true)
+                group.suspendForPhone(stopImmediately: true)
             }
             applyInitialPositionIfAuthorized()
         }
@@ -1882,8 +1900,7 @@ private struct CameraFullScreenCameraContent: View {
             // This reconciliation is synchronous. A superseded SwiftUI task
             // can therefore never apply an older foreground/background intent.
             if isSuspended {
-                group.suspend()
-                group.suspendResources(
+                group.suspendForPhone(
                     stopImmediately: scenePhase == .background || !access.canStream
                 )
             } else {
@@ -2034,6 +2051,9 @@ private struct CameraFullScreenCameraContent: View {
                 controlsVisible = true
             }))
         .background {
+            CameraExternalDisplayBridge(group: group,
+                isVisible: access.isAuthorized)
+                .frame(width: 0, height: 0)
             CameraToolbarScrubBridge(
                 isEnabled: verticalSizeClass == .compact
                     && timelinePresented
@@ -2981,12 +3001,17 @@ private struct CameraFullScreenCameraContent: View {
 #if canImport(UIKit)
 private final class CameraSampleBufferUIView: UIView {
     let sampleBufferLayer: AVSampleBufferDisplayLayer
+    weak var renderer: CameraH264Renderer?
+    let replica: CameraVideoDisplayReplica?
 
-    init(layer: AVSampleBufferDisplayLayer) {
-        sampleBufferLayer = layer
+    init(renderer: CameraH264Renderer, isSecondaryOutput: Bool) {
+        self.renderer = renderer
+        replica = isSecondaryOutput ? CameraVideoDisplayReplica() : nil
+        sampleBufferLayer = replica?.layer ?? renderer.layer
         super.init(frame: .zero)
-        self.layer.addSublayer(layer)
+        self.layer.addSublayer(sampleBufferLayer)
         backgroundColor = .black
+        if let replica { renderer.displayRelay.attach(replica) }
     }
 
     @available(*, unavailable)
@@ -3002,9 +3027,14 @@ private final class CameraSampleBufferUIView: UIView {
 
 private struct CameraSampleBufferView: UIViewRepresentable {
     let renderer: CameraH264Renderer
+    let isSecondaryOutput: Bool
 
     func makeUIView(context: Context) -> CameraSampleBufferUIView {
-        CameraSampleBufferUIView(layer: renderer.layer)
+        CameraSampleBufferUIView(renderer: renderer, isSecondaryOutput: isSecondaryOutput)
+    }
+
+    static func dismantleUIView(_ uiView: CameraSampleBufferUIView, coordinator: ()) {
+        if let replica = uiView.replica { uiView.renderer?.displayRelay.detach(replica) }
     }
 
     func updateUIView(
@@ -3017,13 +3047,18 @@ private struct CameraSampleBufferView: UIViewRepresentable {
 #elseif canImport(AppKit)
 private final class CameraSampleBufferNSView: NSView {
     let sampleBufferLayer: AVSampleBufferDisplayLayer
+    weak var renderer: CameraH264Renderer?
+    let replica: CameraVideoDisplayReplica?
 
-    init(layer: AVSampleBufferDisplayLayer) {
-        sampleBufferLayer = layer
+    init(renderer: CameraH264Renderer, isSecondaryOutput: Bool) {
+        self.renderer = renderer
+        replica = isSecondaryOutput ? CameraVideoDisplayReplica() : nil
+        sampleBufferLayer = replica?.layer ?? renderer.layer
         super.init(frame: .zero)
         wantsLayer = true
         self.layer?.backgroundColor = NSColor.black.cgColor
-        self.layer?.addSublayer(layer)
+        self.layer?.addSublayer(sampleBufferLayer)
+        if let replica { renderer.displayRelay.attach(replica) }
     }
 
     @available(*, unavailable)
@@ -3039,9 +3074,14 @@ private final class CameraSampleBufferNSView: NSView {
 
 private struct CameraSampleBufferView: NSViewRepresentable {
     let renderer: CameraH264Renderer
+    let isSecondaryOutput: Bool
 
     func makeNSView(context: Context) -> CameraSampleBufferNSView {
-        CameraSampleBufferNSView(layer: renderer.layer)
+        CameraSampleBufferNSView(renderer: renderer, isSecondaryOutput: isSecondaryOutput)
+    }
+
+    static func dismantleNSView(_ nsView: CameraSampleBufferNSView, coordinator: ()) {
+        if let replica = nsView.replica { nsView.renderer?.displayRelay.detach(replica) }
     }
 
     func updateNSView(

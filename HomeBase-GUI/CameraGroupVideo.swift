@@ -592,6 +592,7 @@ struct CameraGroupVideo: View {
     @ObservedObject var group: CameraGroupPlayback
     let cameraControlsEnabled: Bool
     let controlsVisible: Bool
+    var isExternalDisplay = false
     var isAccessAllowed = true
     var allowsPictureInPicture = false
     var focusedCameraID: String?
@@ -600,13 +601,13 @@ struct CameraGroupVideo: View {
 
     var body: some View {
         let presentation = CameraGroupPresentation(sessions: group.sessions, focusedCameraID: focusedCameraID)
-        let ignoresSafeArea = CameraGroupLayout.ignoresSafeArea(
+        let ignoresSafeArea = isExternalDisplay || CameraGroupLayout.ignoresSafeArea(
             horizontal: horizontalSizeClass,
             vertical: verticalSizeClass,
             controlsVisible: controlsVisible,
             hasDeviceHinge: deviceHinge.isPresent
         )
-        CameraGroupCanvas(ignoresSafeArea: ignoresSafeArea, avoidsOcclusions: CameraGroupLayout.avoidsOcclusions(
+        CameraGroupCanvas(ignoresSafeArea: ignoresSafeArea, avoidsOcclusions: !isExternalDisplay && CameraGroupLayout.avoidsOcclusions(
             horizontal: horizontalSizeClass, hinge: deviceHinge
         )) { size, safeBounds, division in
             let arrangement = division == nil
@@ -674,6 +675,7 @@ struct CameraGroupVideo: View {
                             )
                         }
                         CameraGroupPane(session: session, group: group,
+                            isExternalDisplay: isExternalDisplay,
                             cameraControlsEnabled: cameraControlsEnabled && presentation.isVisible(session),
                             controlsVisible: controlsVisible,
                             isAccessAllowed: isAccessAllowed,
@@ -704,6 +706,7 @@ private struct CameraGroupPane: View {
     @ObservedObject private var playback: CameraLivePlaybackController
     @ObservedObject private var controls: LiveDeviceControlsModel
     @ObservedObject private var liveVideo: CameraLiveVideoModel
+    let isExternalDisplay: Bool
     let cameraControlsEnabled: Bool
     let controlsVisible: Bool
     let isAccessAllowed: Bool
@@ -716,7 +719,7 @@ private struct CameraGroupPane: View {
     let labelBelowVideo: Bool
     let onSingleTap: () -> Void
 
-    init(session: CameraGroupSession, group: CameraGroupPlayback, cameraControlsEnabled: Bool,
+    init(session: CameraGroupSession, group: CameraGroupPlayback, isExternalDisplay: Bool, cameraControlsEnabled: Bool,
          controlsVisible: Bool,
          isAccessAllowed: Bool,
          allowsPictureInPicture: Bool,
@@ -728,6 +731,7 @@ private struct CameraGroupPane: View {
          labelBelowVideo: Bool,
          onSingleTap: @escaping () -> Void) {
         self.session = session; self.group = group
+        self.isExternalDisplay = isExternalDisplay
         _playback = ObservedObject(wrappedValue: session.playback)
         _controls = ObservedObject(wrappedValue: session.controls)
         _liveVideo = ObservedObject(wrappedValue: session.liveVideo)
@@ -762,8 +766,9 @@ private struct CameraGroupPane: View {
         ZStack {
             CameraLiveVideoSurface(
                 model: liveVideo,
-                allowsRetry: true,
+                allowsRetry: !isExternalDisplay,
                 usesHistory: !isLive,
+                isSecondaryOutput: isExternalDisplay,
                 retry: session.restartLiveVideoIfNeeded
             )
                 .frame(
@@ -772,9 +777,11 @@ private struct CameraGroupPane: View {
                     alignment: videoGravity.alignment
                 )
                 .background {
-                    CameraLiveGestureSurface(videoVisible: group.showsVideo(session), cameraControlsEnabled: gesturesEnabled,
-                        onPan: { phase, translation, viewport in session.gestures.pan(phase, translation: translation, viewport: viewport) },
-                        onMagnify: magnify, onSingleTap: onSingleTap, onTwoFingerTap: { session.gestures.recenter() })
+                    if !isExternalDisplay {
+                        CameraLiveGestureSurface(videoVisible: group.showsVideo(session), cameraControlsEnabled: gesturesEnabled,
+                            onPan: { phase, translation, viewport in session.gestures.pan(phase, translation: translation, viewport: viewport) },
+                            onMagnify: magnify, onSingleTap: onSingleTap, onTwoFingerTap: { session.gestures.recenter() })
+                    }
                 }
             if group.resolvingTime {
                 status("Loading history…", loading: true)
@@ -782,12 +789,14 @@ private struct CameraGroupPane: View {
                 if let error = playback.errorMessage {
                     VStack(spacing: 12) {
                         Text(error).multilineTextAlignment(.center)
-                        Button("Try Again", systemImage: "arrow.clockwise") {
-                            if group.active { group.retry(session) } else { playback.dismissError(); playback.retryHistory() }
-                        }.buttonStyle(.bordered)
+                        if !isExternalDisplay {
+                            Button("Try Again", systemImage: "arrow.clockwise") {
+                                if group.active { group.retry(session) } else { playback.dismissError(); playback.retryHistory() }
+                            }.buttonStyle(.bordered)
+                        }
                     }.foregroundStyle(.white).padding()
                 } else if isHistory, session.historyAvailable {
-                    CameraHistoryStatus(playback: playback, timeZone: timeZone) { previous in
+                    CameraHistoryStatus(playback: playback, timeZone: timeZone, showsControls: !isExternalDisplay) { previous in
                         if group.active { group.jump(from: session, previous: previous) }
                         else { playback.seekToAdjacentRecording(previous: previous) }
                     }
@@ -828,9 +837,15 @@ private struct CameraGroupPane: View {
                 .transition(.opacity)
             }
         }
-        .onChange(of: gesturesEnabled, initial: true) { _, enabled in session.gestures.update(enabled: enabled) }
-        .onChange(of: panTiltTarget?.observedPosition, initial: true) { _, _ in session.gestures.update(enabled: gesturesEnabled) }
-        .onChange(of: controls.state) { _, _ in session.gestures.update(enabled: gesturesEnabled) }
+        .onChange(of: gesturesEnabled, initial: true) { _, enabled in
+            if !isExternalDisplay { session.gestures.update(enabled: enabled) }
+        }
+        .onChange(of: panTiltTarget?.observedPosition, initial: true) { _, _ in
+            if !isExternalDisplay { session.gestures.update(enabled: gesturesEnabled) }
+        }
+        .onChange(of: controls.state) { _, _ in
+            if !isExternalDisplay { session.gestures.update(enabled: gesturesEnabled) }
+        }
         .accessibilityActions {
             if let onFullScreen { Button("Full Screen", action: onFullScreen) }
         }
@@ -838,11 +853,11 @@ private struct CameraGroupPane: View {
             if gesturesEnabled { session.gestures.recenter() }
         }
         .onChange(of: privacy) { old, new in
-            if CameraPrivacyStreamRecovery.shouldRequestRestart(from: old, to: new) {
+            if !isExternalDisplay, CameraPrivacyStreamRecovery.shouldRequestRestart(from: old, to: new) {
                 session.restartLiveVideoIfNeeded()
             }
         }
-        .onDisappear { session.gestures.update(enabled: false) }
+        .onDisappear { if !isExternalDisplay { session.gestures.update(enabled: false) } }
     }
 
     private func status(_ message: String, loading: Bool) -> some View {
@@ -860,6 +875,7 @@ private struct CameraGroupPane: View {
 struct CameraHistoryStatus: View {
     @ObservedObject var playback: CameraLivePlaybackController
     let timeZone: TimeZone
+    var showsControls = true
     let jump: (Bool) -> Void
 
     @ViewBuilder var body: some View {
@@ -876,13 +892,15 @@ struct CameraHistoryStatus: View {
         case .gap:
             VStack(spacing: 16) {
                 Label("No recording at this time", systemImage: "video.slash")
-                navigation
+                if showsControls { navigation }
             }.foregroundStyle(.white).padding()
         case .failed(let message):
             VStack(spacing: 12) {
                 Text("History unavailable").font(.headline)
                 Text(message).font(.callout).multilineTextAlignment(.center)
-                Button("Try Again", systemImage: "arrow.clockwise") { playback.retryHistory() }.buttonStyle(.borderedProminent)
+                if showsControls {
+                    Button("Try Again", systemImage: "arrow.clockwise") { playback.retryHistory() }.buttonStyle(.borderedProminent)
+                }
             }.foregroundStyle(.white).padding()
         }
     }

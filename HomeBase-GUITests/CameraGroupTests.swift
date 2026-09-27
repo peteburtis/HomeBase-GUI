@@ -40,7 +40,7 @@ final class CameraGroupTests: XCTestCase {
             "Collapsing to one camera removes the Back override")
     }
 
-    func testFullScreenUsesSingleCameraFrameWhileHiddenPanesRetainTheirFrames() throws {
+    func testFullScreenUsesSingleCameraFrameWhileHiddenPanesRetainTheirFrames() async throws {
         let client = try makeClient()
         let sessions = try ["A", "B", "C", "D"].map { CameraGroupSession(camera: try camera($0), client: client) }
         defer { sessions.forEach { $0.close() } }
@@ -64,7 +64,7 @@ final class CameraGroupTests: XCTestCase {
         }
     }
 
-    func testFocusedQualityDoesNotChangeOtherCamerasAndGroupCanReapplyItsPreference() throws {
+    func testFocusedQualityDoesNotChangeOtherCamerasAndGroupCanReapplyItsPreference() async throws {
         let group = try makeGroup()
         defer { group.deactivate() }
         group.activate(camera: try camera("A"), position: .live)
@@ -169,7 +169,7 @@ final class CameraGroupTests: XCTestCase {
         XCTAssertNotNil(group.error)
     }
 
-    func testHistorySourceFallsForwardToFirstSelectedCameraWithHistory() throws {
+    func testHistorySourceFallsForwardToFirstSelectedCameraWithHistory() async throws {
         let client = try makeClient()
         let noHistory = try camera("No History", history: false)
         let firstHistory = try camera("First History")
@@ -403,7 +403,31 @@ final class CameraGroupTests: XCTestCase {
         await coordinator.waitForTransitions()
     }
 
-    func testHistoryCredentialRefreshCannotReactivateSuspendedResources() throws {
+    func testRetainedDisplayStopsPhoneControlsWithoutRestartingVideo() async {
+        var videoStarts = 0, videoStops = 0, controlsStarts = 0
+        let coordinator = CameraSessionResourceCoordinator(
+            startLiveVideo: { _ in videoStarts += 1 },
+            stopLiveVideo: { _ in videoStops += 1 },
+            startControls: { controlsStarts += 1 }, stopControls: {})
+        coordinator.setActive(true, access: nil)
+        await coordinator.waitForTransitions()
+        coordinator.setActive(true, access: nil, controlsEnabled: false)
+        await coordinator.waitForTransitions()
+        XCTAssertTrue(coordinator.isActive)
+        XCTAssertFalse(coordinator.controlsActive)
+        coordinator.restartControls()
+        await coordinator.waitForTransitions()
+        XCTAssertEqual(controlsStarts, 1, "Background controls must not retry")
+        coordinator.setActive(true, access: nil)
+        await coordinator.waitForTransitions()
+        XCTAssertEqual(videoStarts, 1)
+        XCTAssertEqual(videoStops, 1, "Only the original start's serialized cleanup")
+        XCTAssertEqual(controlsStarts, 2)
+        coordinator.close()
+        await coordinator.waitForTransitions()
+    }
+
+    func testHistoryCredentialRefreshCannotReactivateSuspendedResources() async throws {
         let client = try makeClient()
         let session = CameraGroupSession(
             camera: try camera("A"),

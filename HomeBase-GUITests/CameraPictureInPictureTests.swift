@@ -259,6 +259,7 @@ final class CameraPictureInPictureTests: XCTestCase {
         let controller = CameraPictureInPictureController()
         controller.scenePhaseChanged(.inactive)
         controller.scenePhaseChanged(.background)
+        controller.protectedDataWillBecomeUnavailable()
         controller.scenePhaseChanged(.active)
         XCTAssertEqual(controller.phase, .stopped)
         XCTAssertNil(controller.session)

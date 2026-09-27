@@ -20,7 +20,7 @@ extension EnvironmentValues {
         set { self[CameraAccessSessionKey.self] = newValue }
     }
 
-    fileprivate var cameraAccessLifecycle: CameraAccessLifecycle? {
+    var cameraAccessLifecycle: CameraAccessLifecycle? {
         get { self[CameraAccessLifecycleKey.self] }
         set { self[CameraAccessLifecycleKey.self] = newValue }
     }
@@ -96,7 +96,7 @@ private struct ObservedCameraAccessGate<Content: View>: View {
             isAuthorized: session.isUnlocked,
             // Inactive also conceals imagery before the app-switcher snapshot,
             // but must not cancel the system's own authentication presentation.
-            isUnlocked: session.isUnlocked && scenePhase == .active,
+            isUnlocked: session.isUnlocked && !session.streamsSuspended && scenePhase == .active,
             isAuthenticating: session.isAuthenticating,
             errorMessage: session.errorMessage
         ))
@@ -191,11 +191,17 @@ final class CameraAccessLifecycle: ObservableObject {
     private var owners: Set<UUID> = []
     private var isBackgrounded = false
     private var hasActivePictureInPicture = false
+    private var externalDisplays: Set<UUID> = []
+    private var isDeviceLocked = false
     private var isRestoringPictureInPicture = false
     private var restorationTimeout: Task<Void, Never>?
 
     private var retainsAccessForPictureInPicture: Bool {
         hasActivePictureInPicture || isRestoringPictureInPicture
+    }
+
+    private var retainsAccessForOutput: Bool {
+        retainsAccessForPictureInPicture || !externalDisplays.isEmpty
     }
 
     init(session: CameraAccessSession? = nil) {
@@ -206,7 +212,7 @@ final class CameraAccessLifecycle: ObservableObject {
         if isActive {
             let wasEmpty = owners.isEmpty
             owners.insert(owner)
-            if wasEmpty && !isBackgrounded {
+            if wasEmpty && !isBackgrounded && !isDeviceLocked {
                 session.resumeStreams()
                 session.enter()
             }
@@ -227,6 +233,7 @@ final class CameraAccessLifecycle: ObservableObject {
             session.suspendStreams()
             lockIfUnowned()
         case .active:
+            isDeviceLocked = false
             session.resumeStreams()
             if isBackgrounded && !owners.isEmpty {
                 session.enter()
@@ -244,6 +251,19 @@ final class CameraAccessLifecycle: ObservableObject {
         // Retain an existing grant only; PiP can never manufacture authorization.
         guard session.isUnlocked else { return }
         hasActivePictureInPicture = true
+    }
+
+    /// Called only for a connected window, not merely an accessory registration.
+    @discardableResult
+    func externalDisplayStarted(owner: UUID) -> Bool {
+        guard session.isUnlocked, !session.streamsSuspended,
+              !isBackgrounded, !isDeviceLocked else { return false }
+        externalDisplays.insert(owner)
+        return true
+    }
+
+    func externalDisplayStopped(owner: UUID) {
+        if externalDisplays.remove(owner) != nil { lockIfUnowned() }
     }
 
     func pictureInPictureStopped() {
@@ -286,20 +306,26 @@ final class CameraAccessLifecycle: ObservableObject {
     }
 
     private func lockIfUnowned() {
-        if !retainsAccessForPictureInPicture && (isBackgrounded || owners.isEmpty) {
+        if !retainsAccessForOutput && (isBackgrounded || isDeviceLocked || owners.isEmpty) {
             session.lock()
         }
     }
 
     func protectedDataWillBecomeUnavailable() {
-        hasActivePictureInPicture = false
-        endRestorationHandoff()
-        session.lock()
+        isDeviceLocked = true
+        session.suspendStreams()
+        // Keep only already-running output and secrets already in memory. This
+        // does not grant access to protected files or perform another Keychain read.
+        if !hasActivePictureInPicture { endRestorationHandoff() }
+        lockIfUnowned()
     }
 
     func reset() {
         owners.removeAll()
-        protectedDataWillBecomeUnavailable()
+        externalDisplays.removeAll()
+        hasActivePictureInPicture = false
+        endRestorationHandoff()
+        session.lock()
     }
 }
 

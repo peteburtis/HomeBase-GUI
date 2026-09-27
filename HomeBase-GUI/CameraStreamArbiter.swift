@@ -1,5 +1,6 @@
 import Foundation
 import HomeBaseProtocol
+import OSLog
 
 /// A user's live-video choice. `automatic` preserves the protocol's omitted
 /// quality request, allowing HomeBase to select its shared/default source.
@@ -54,11 +55,13 @@ nonisolated final class CameraStreamAuthorization: @unchecked Sendable {
 nonisolated struct CameraStreamUpstream: Sendable {
     let frames: AsyncThrowingStream<HBMediaFrame, Error>
     let close: @Sendable () async -> Void
+    var connectionGeneration: UInt64? = nil
 }
 nonisolated enum CameraStreamEvent: Sendable {
     /// Configuration and its keyframe-led bootstrap travel as one queue entry.
     case frames([HBMediaFrame])
     case qualityWarning(String?)
+    case reconnecting
 }
 nonisolated struct CameraStreamSubscription: Sendable {
     let id: UUID
@@ -66,7 +69,8 @@ nonisolated struct CameraStreamSubscription: Sendable {
     let events: AsyncThrowingStream<CameraStreamEvent, Error>
 }
 nonisolated enum CameraStreamError: Error, LocalizedError, Equatable {
-    case closed, invalidMedia, slowConsumer, ended, warmupTimeout
+    case closed, invalidMedia, slowConsumer, ended, warmupTimeout, stalled
+    case serverEnded(String, retryable: Bool)
     var errorDescription: String? {
         switch self {
         case .closed: "Camera streaming is closed."
@@ -74,7 +78,35 @@ nonisolated enum CameraStreamError: Error, LocalizedError, Equatable {
         case .slowConsumer: "This view could not keep up with the camera stream. Try again."
         case .ended: "The live video connection ended."
         case .warmupTimeout: "The replacement stream did not become ready in time."
+        case .stalled: "The live video connection stopped receiving data."
+        case .serverEnded(let reason, _): reason
         }
+    }
+
+    static func shouldRetry(_ error: Error) -> Bool {
+        if error is CancellationError { return false }
+        if let error = error as? Self {
+            switch error {
+            case .ended, .warmupTimeout, .stalled: return true
+            case .serverEnded(_, let retryable): return retryable
+            case .closed, .invalidMedia, .slowConsumer: return false
+            }
+        }
+        if let error = error as? HBProtocolError {
+            return error.retryable || error.code == HBProtocolErrorCodes.resyncRequired
+        }
+        if let error = error as? HomeBaseWebSocketClient.ClientError {
+            if case .invalidEndpoint = error { return false }
+            if case .invalidMessage = error { return false }
+        }
+        if let error = error as? HomeBaseMediaConnection.ConnectionError {
+            switch error {
+            case .connectionEnded: return true
+            case .invalidPort, .invalidServerMessage: return false
+            }
+        }
+        if error is DecodingError || error is HBProtocolValidationError || error is HBMediaFrameError { return false }
+        return true
     }
 }
 
@@ -87,6 +119,7 @@ actor CameraStreamArbiter {
         var idleGrace = 2.0
         var downgradeDelay = 2.0
         var warmupDeadline = 20.0
+        var stallTimeout: Double? = 15
         var bootstrapBytes = 8 * 1024 * 1024
         var bootstrapFrames = 150
         var consumerQueue = 120
@@ -111,6 +144,8 @@ actor CameraStreamArbiter {
         var gop: [HBMediaFrame] = []
         var bytes = 0
         var retiring = false
+        var activityRevision: UInt64 = 0
+        var connectionGeneration: UInt64?
         init(_ quality: CameraLiveQualitySelection) { self.quality = quality }
     }
     private final class Entry {
@@ -132,6 +167,7 @@ actor CameraStreamArbiter {
     private var entries: [String: Entry] = [:]
     private var nextGeneration: UInt32 = 0
     private var closed = false
+    private static let recoveryLogger = Logger(subsystem: "io.pjb.HomeBase-GUI", category: "CameraRecovery")
 
     init(policy: Policy = Policy(), sleep: @escaping Sleep = { try await Task.sleep(for: .seconds($0)) }, open: @escaping Open) {
         self.policy = policy; self.sleep = sleep; self.open = open
@@ -153,6 +189,7 @@ actor CameraStreamArbiter {
         entry.consumers[id] = consumer
         pair.continuation.onTermination = { [weak self] _ in Task { await self?.unsubscribe(camera: camera, id: id) } }
         if let current = entry.current.flatMap({ entry.workers[$0] }), !current.gop.isEmpty { prime(consumer, worker: current) }
+        else if entry.retryCount > 0 { consumer.continuation.yield(.reconnecting) }
         reconcile(camera, entry)
         return .init(id: id, camera: camera, events: pair.stream)
     }
@@ -217,6 +254,43 @@ actor CameraStreamArbiter {
         closed = true
         for camera in Array(entries.keys) { remove(camera, error: CancellationError()) }
     }
+
+    /// A transport loss is not a user/access cancellation. Keep consumers and
+    /// their authorizations, but never reuse a dead media socket or its ticket.
+    func connectionInterrupted(generation: UInt64? = nil) {
+        guard !closed else { return }
+        for (camera, entry) in Array(entries) {
+            pruneRevokedConsumers(camera, entry)
+            guard entries[camera] === entry else { continue }
+            if entry.consumers.isEmpty { remove(camera, error: CancellationError()); continue }
+            // An opening worker gets its own request failure/deadline. In
+            // particular, don't cancel it before it can classify a terminal error.
+            guard entry.current != nil else { continue }
+            if let generation,
+               entry.current.flatMap({ entry.workers[$0]?.connectionGeneration }) != generation { continue }
+            for worker in entry.workers.values { retire(entry, id: worker.id) }
+            entry.current = nil; entry.candidate = nil
+            entry.delayed?.cancel(); entry.delayed = nil; entry.delayToken = nil
+            scheduleRecovery(camera, entry)
+        }
+    }
+
+    /// Path state is advisory: wake failed attempts, leave healthy feeds alone,
+    /// and still allow timed attempts when a VPN change produces no path event.
+    @discardableResult
+    func networkPathChanged() -> Bool {
+        guard !closed else { return false }
+        var hasConsumers = false
+        for (camera, entry) in Array(entries) {
+            pruneRevokedConsumers(camera, entry)
+            guard entries[camera] === entry, !entry.consumers.isEmpty else { continue }
+            hasConsumers = true
+            guard entry.current == nil else { continue }
+            entry.delayed?.cancel(); entry.delayed = nil; entry.delayToken = nil
+            reconcile(camera, entry)
+        }
+        return hasConsumers
+    }
     private func remove(_ camera: String, error: Error) {
         guard let entry = entries.removeValue(forKey: camera) else { return }
         entry.idle?.cancel(); entry.delayed?.cancel()
@@ -273,6 +347,7 @@ actor CameraStreamArbiter {
             var failure: Error = CameraStreamError.ended
             do {
                 let stream = try await open(camera, quality); upstream = stream
+                worker.connectionGeneration = stream.connectionGeneration
                 try Task.checkCancellation()
                 for try await frame in stream.frames {
                     try Task.checkCancellation()
@@ -294,10 +369,25 @@ actor CameraStreamArbiter {
     }
     private func failedCandidate(_ camera: String, _ entry: Entry, error: Error) {
         guard !entry.consumers.isEmpty else { return }
-        guard entry.current != nil else { remove(camera, error: error); return }
+        guard CameraStreamError.shouldRetry(error) else {
+            if entry.current == nil { remove(camera, error: error) }
+            else { broadcast(.qualityWarning("The requested video quality is unavailable."), camera: camera, entry: entry) }
+            return
+        }
+        guard entry.current != nil else { scheduleRecovery(camera, entry); return }
         broadcast(.qualityWarning("Could not change video quality. Continuing the current stream; retrying…"), camera: camera, entry: entry)
         entry.retryCount = min(5, entry.retryCount + 1)
         schedule(camera, entry, seconds: min(30, pow(2, Double(entry.retryCount))))
+    }
+
+    private func scheduleRecovery(_ camera: String, _ entry: Entry) {
+        guard entries[camera] === entry, !entry.consumers.isEmpty, entry.delayed == nil else { return }
+        broadcast(.reconnecting, camera: camera, entry: entry)
+        guard entries[camera] === entry, !entry.consumers.isEmpty else { return }
+        entry.retryCount = min(6, entry.retryCount + 1)
+        let delay = min(30, pow(2, Double(entry.retryCount - 1)))
+        Self.recoveryLogger.notice("Retrying live media; attempt=\(entry.retryCount) delay=\(delay)s")
+        schedule(camera, entry, seconds: delay)
     }
     private func finished(_ camera: String, entry: Entry, worker: Worker, error: Error) {
         worker.deadline?.cancel(); worker.gop.removeAll(); worker.bytes = 0
@@ -309,7 +399,8 @@ actor CameraStreamArbiter {
             // A replacement already opening can still recover this view. Its
             // existing deadline bounds the wait; don't throw it away merely
             // because the old feed ended first.
-            if entry.candidate == nil { remove(camera, error: error) }
+            if entry.candidate == nil { failedCandidate(camera, entry, error: error) }
+            else { broadcast(.reconnecting, camera: camera, entry: entry) }
         }
         else { reconcile(camera, entry) }
     }
@@ -318,6 +409,7 @@ actor CameraStreamArbiter {
         guard entries[camera] === entry, !worker.retiring else { return false }
         pruneRevokedConsumers(camera, entry)
         guard entries[camera] === entry else { return false }
+        worker.activityRevision &+= 1
         var frame = incoming
         switch frame.type {
         case .streamConfiguration:
@@ -345,6 +437,7 @@ actor CameraStreamArbiter {
                 let previous = entry.current
                 entry.current = worker.id; entry.candidate = nil; entry.retryCount = 0
                 worker.deadline?.cancel()
+                watchForStall(camera, entry: entry, worker: worker)
                 broadcast(.qualityWarning(nil), camera: camera, entry: entry)
                 for consumer in entry.consumers.values { consumer.joinedGeneration = worker.generation }
                 broadcast(.frames([configuration, frame]), camera: camera, entry: entry)
@@ -361,13 +454,39 @@ actor CameraStreamArbiter {
         case .streamStatus:
             if entry.current == nil || entry.current == worker.id { broadcast(.frames([frame]), camera: camera, entry: entry) }
         case .streamEnd:
+            let end = try JSONDecoder().decode(HBMediaStreamEnd.self, from: frame.payload)
+            if end.retryable { throw CameraStreamError.serverEnded(end.reason, retryable: true) }
             if (entry.current == worker.id && entry.candidate == nil) || entry.current == nil {
                 broadcast(.frames([frame]), camera: camera, entry: entry)
             }
-            return false
+            throw CameraStreamError.serverEnded(end.reason, retryable: false)
         case .clientHello: throw CameraStreamError.invalidMedia
         }
         return true
+    }
+
+    private func watchForStall(_ camera: String, entry: Entry, worker: Worker) {
+        guard let timeout = policy.stallTimeout else { return }
+        let initialRevision = worker.activityRevision
+        worker.deadline = Task { [weak self, sleep] in
+            var revision = initialRevision
+            while !Task.isCancelled {
+                do { try await sleep(timeout) } catch { return }
+                guard let next = await self?.checkActivity(camera, entry: entry, worker: worker, since: revision) else { return }
+                revision = next
+            }
+        }
+    }
+
+    private func checkActivity(_ camera: String, entry: Entry, worker: Worker, since revision: UInt64) -> UInt64? {
+        guard entries[camera] === entry, entry.current == worker.id, !worker.retiring else { return nil }
+        guard worker.activityRevision == revision else { return worker.activityRevision }
+        Self.recoveryLogger.notice("Live media stalled; replacing its connection and ticket")
+        retire(entry, id: worker.id)
+        entry.current = nil
+        if entry.candidate == nil { failedCandidate(camera, entry, error: CameraStreamError.stalled) }
+        else { broadcast(.reconnecting, camera: camera, entry: entry) }
+        return nil
     }
     private func prime(_ consumer: Consumer, worker: Worker) {
         guard consumer.authorization?.isValid != false else { return }

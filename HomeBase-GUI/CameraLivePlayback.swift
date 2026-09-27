@@ -111,7 +111,7 @@ struct CameraLivePlaybackTimeline {
 
     /// Returns true if a backwards timestamp requires decoder resynchronization.
     @discardableResult
-    mutating func receive(_ frame: HBMediaFrame) -> Bool {
+    mutating func receive(_ frame: HBMediaFrame, advancesLivePosition: Bool = true) -> Bool {
         guard frame.type == .videoAccessUnit, frame.generation == generation else {
             return false
         }
@@ -134,7 +134,7 @@ struct CameraLivePlaybackTimeline {
         lastArrival = arrival
         let time = epochOffset + Double(frame.presentationTimestamp - origin) / timeScale
         head = time
-        if isLive {
+        if isLive && advancesLivePosition {
             position = time
         }
         // Each source epoch starts at a keyframe; never retain undecodable
@@ -231,8 +231,26 @@ struct CameraLivePlaybackTimeline {
         showingBlack = false
     }
 
-    mutating func presentation() -> Presentation {
-        guard !isLive, let position else { return .unchanged }
+    /// Live remains Live: only its presentation cursor is delayed. Missing
+    /// clocks/outliers catch up to the head; rejoining never rewinds a pane.
+    mutating func synchronizeLive(cameraTarget: Double?) {
+        guard isLive, let head else { return }
+        let target: Double
+        if let cameraTarget,
+           let entry = entries.last(where: { $0.epoch == sourceEpoch && ($0.frame.cameraUTC.map { $0 <= cameraTarget + 0.000_001 } ?? false) }) {
+            target = entry.time
+        } else if cameraTarget != nil {
+            // Initially wait for the tardy peer to reach our first picture.
+            // If pressure evicted that picture/dependencies, fail open instead
+            // of waiting forever for a target outside the bounded buffer.
+            guard let tail, tail > (position ?? 0) else { return }
+            target = head
+        } else { target = head }
+        position = min(head, max(position ?? target, target))
+    }
+
+    mutating func presentation(includeLive: Bool = false) -> Presentation {
+        guard !isLive || includeLive, let position else { return .unchanged }
         // Preserve the current picture while a buffer-only session waits for
         // its first keyframe. There is no older history to request or display.
         if !hasAvailableNVRHistory && entries.isEmpty { return .unchanged }
@@ -318,6 +336,7 @@ final class CameraLivePlaybackController: ObservableObject {
     private var historyIndex: Int?
     private var historyShowingBlack = false
     private(set) var externallyClocked = false
+    private(set) var liveSynchronizationEnabled = false
     /// A valid media-lease interruption also pauses the shared multi-camera clock.
     var streamDidStop: (() -> Void)?
 
@@ -393,6 +412,7 @@ final class CameraLivePlaybackController: ObservableObject {
     }
 
     func useLocalClock() {
+        setLiveSynchronization(false)
         externallyClocked = false
         history.setGroupClock(false)
         lastTick = clock()
@@ -408,6 +428,31 @@ final class CameraLivePlaybackController: ObservableObject {
         if seeking { cancelPresentation(); errorMessage = nil }
         timeline.followGroup(position: position, paused: paused, seeking: seeking)
         publishState(); present()
+    }
+
+    var liveSynchronizationHead: (cameraUTC: Double, receivedAt: Double)? {
+        guard !isClosed, !isSuspended, ownerID != nil,
+              let entry = timeline.entries.last, entry.epoch == timeline.sourceEpoch,
+              let utc = entry.frame.cameraUTC, let arrival = timeline.lastFrameArrival else { return nil }
+        return (utc, arrival)
+    }
+
+    func setLiveSynchronization(_ enabled: Bool) {
+        guard liveSynchronizationEnabled != enabled else { return }
+        liveSynchronizationEnabled = enabled
+        if timeline.isLive, !history.isActive {
+            cancelPresentation()
+            timeline.goLive()
+            // When returning to independent playback, dependent frames cannot
+            // skip the withheld section of the GOP. Preserve the image until IDR.
+            if !enabled { renderer.reset(removingDisplayedImage: false) }
+        }
+    }
+
+    func followGroupLive(cameraTarget: Double?) {
+        guard liveSynchronizationEnabled, timeline.isLive, !history.isActive else { return }
+        timeline.synchronizeLive(cameraTarget: cameraTarget)
+        present()
     }
 
     func followGroupHistory(time: Double, liveEdge: Double?, paused: Bool, seeking: Bool) {
@@ -536,7 +581,7 @@ final class CameraLivePlaybackController: ObservableObject {
             throw CameraH264Renderer.RendererError.invalidAccessUnit
         }
         let previousEpoch = timeline.sourceEpoch
-        if timeline.receive(frame) {
+        if timeline.receive(frame, advancesLivePosition: !liveSynchronizationEnabled) {
             configurations[timeline.sourceEpoch] = configurations[previousEpoch]
             if timeline.isLive && !history.isActive {
                 cancelPresentation()
@@ -548,6 +593,7 @@ final class CameraLivePlaybackController: ObservableObject {
         publishState()
         // Only actual live samples can enter the explicit Photos recorder.
         guard timeline.isLive, !history.isActive else { return nil }
+        guard !liveSynchronizationEnabled else { return nil }
         try activateRenderer(for: timeline.sourceEpoch)
         return try renderer.enqueue(frame)
     }
@@ -757,7 +803,7 @@ final class CameraLivePlaybackController: ObservableObject {
     private func present() {
         guard !isClosed, !isSuspended, presentationTask == nil else { return }
         if history.isActive { presentHistory(); return }
-        switch timeline.presentation() {
+        switch timeline.presentation(includeLive: liveSynchronizationEnabled) {
         case .unchanged:
             break
         case .black:
