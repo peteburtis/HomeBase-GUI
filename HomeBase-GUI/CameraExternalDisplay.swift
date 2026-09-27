@@ -7,14 +7,37 @@ import UIKit
 /// already-authorized media, but cannot unlock cameras or create a new grant.
 @MainActor
 final class CameraExternalDisplayPresentation: ObservableObject {
-    @Published private(set) var group: CameraGroupPlayback?
-    @Published private(set) var isVisible = false
+    let objectWillChange = ObservableObjectPublisher()
+    private(set) var group: CameraGroupPlayback? {
+        didSet { if oldValue !== group { notifyPresentationChanged() } }
+    }
+    private(set) var isVisible = false {
+        didSet { if oldValue != isVisible { notifyPresentationChanged() } }
+    }
+    private(set) var hasConnectedOutput = false {
+        didSet { if oldValue != hasConnectedOutput { notifyPresentationChanged() } }
+    }
+    var isOutputActive: Bool { isVisible && hasConnectedOutput }
     private weak var lifecycle: CameraAccessLifecycle?
     private var authorizationObservation: AnyCancellable?
     private let owner = UUID()
     private var connectedOutputs: Set<UUID> = []
     private var requestedVisibility = false
     private var isRetaining = false
+    private var notificationPending = false
+
+    private func notifyPresentationChanged() {
+        // UIKit can attach/dismantle the bridge during a SwiftUI update. Apply
+        // security/resource changes synchronously, but coalesce UI invalidation
+        // onto the next turn rather than publishing back into that update.
+        guard !notificationPending else { return }
+        notificationPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.notificationPending = false
+            self.objectWillChange.send()
+        }
+    }
 
     // Cleanup is explicit in clear(); UIKit may release this outside a Swift
     // task, so value destruction must not require an executor hop on iOS 26.
@@ -50,6 +73,9 @@ final class CameraExternalDisplayPresentation: ObservableObject {
     }
 
     private func reconcile() {
+        if hasConnectedOutput != !connectedOutputs.isEmpty {
+            hasConnectedOutput = !connectedOutputs.isEmpty
+        }
         if !requestedVisibility || connectedOutputs.isEmpty { releaseRetention() }
         if requestedVisibility, !connectedOutputs.isEmpty, !isRetaining,
            let group, let lifecycle, lifecycle.externalDisplayStarted(owner: owner) {
@@ -75,6 +101,7 @@ final class CameraExternalDisplayPresentation: ObservableObject {
         requestedVisibility = false
         releaseRetention()
         connectedOutputs.removeAll()
+        hasConnectedOutput = false
         authorizationObservation = nil
         lifecycle = nil
         isVisible = false
@@ -203,12 +230,15 @@ struct CameraExternalDisplayBridge: UIViewControllerRepresentable {
     @Environment(\.cameraAccessLifecycle) private var lifecycle
     let group: CameraGroupPlayback
     let isVisible: Bool
+    let presentation: CameraExternalDisplayPresentation
+    var retainWhenCovered = false
 
     func makeUIViewController(context: Context) -> CameraExternalDisplayViewController {
-        CameraExternalDisplayViewController()
+        CameraExternalDisplayViewController(presentation: presentation)
     }
 
     func updateUIViewController(_ controller: CameraExternalDisplayViewController, context: Context) {
+        controller.retainWhenCovered = retainWhenCovered
         controller.update(group: group, isVisible: isVisible, lifecycle: lifecycle)
     }
 
@@ -219,14 +249,22 @@ struct CameraExternalDisplayBridge: UIViewControllerRepresentable {
 
 @MainActor
 final class CameraExternalDisplayViewController: UIViewController {
-    let presentation = CameraExternalDisplayPresentation()
+    let presentation: CameraExternalDisplayPresentation
     private let id = UUID()
     private var isPresenting = false
+    var retainWhenCovered = false
     private weak var group: CameraGroupPlayback?
     private var isVisible = false
     private weak var lifecycle: CameraAccessLifecycle?
     // Stored as AnyObject to keep the iOS 26 deployment path available.
     private var accessoryRegistration: AnyObject?
+
+    init(presentation: CameraExternalDisplayPresentation? = nil) {
+        self.presentation = presentation ?? CameraExternalDisplayPresentation()
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func loadView() {
         view = UIView()
@@ -250,7 +288,10 @@ final class CameraExternalDisplayViewController: UIViewController {
 
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
-        stopPresenting()
+        // A retained viewer can be underneath another phone presentation while
+        // its accessory still belongs to this scene. Removal is always cleaned
+        // up by dismantleUIViewController, independently of appearance callbacks.
+        if !retainWhenCovered { stopPresenting() }
     }
 
     func update(group: CameraGroupPlayback, isVisible: Bool,

@@ -645,6 +645,24 @@ Phone orientation and single-camera focus do not change the external matrix.
 Camera names and playback status are included; interactive controls stay on
 the phone. The shared playback session also keeps history and pause in sync.
 
+While a connected external output is actually showing camera video, the phone
+adds a down-chevron **Minimize Video** button beside Close in the same native
+toolbar group. Minimizing leaves the entire viewer mounted in an app-level
+presentation layer, including its camera sessions, focus, quality, panels,
+playback clock, and external-scene registration. It only hides the phone layer
+and disables its interactions; it does not dismiss/recreate the viewer or open
+another set of streams. From Cameras it reveals Home, and selecting Cameras
+again immediately restores the same viewer. Device-detail and PiP-restored
+viewers use the same presentation owner. Close still tears down the viewer.
+
+Only while minimized, the system Cameras-tab badge shows the number of cameras
+currently displaying video on the active external output. It follows playback
+availability, clears on output loss/authorization revocation, and is absent
+while the phone viewer is visible. Other full-screen phone presentations do not
+tear down a retained output. Disconnecting the last output while minimized
+suspends its resources and releases its access grant, but preserves the viewer
+selection for an authorized return to Cameras. Server changes close it entirely.
+
 Each external pane has a separate sample-buffer display layer. A bounded relay
 feeds it the main player's already-scheduled live or history samples, without
 another camera subscription or playback clock. It retains at most one GOP,
@@ -682,6 +700,16 @@ matrix continues. Check that disconnect/dismissal/revocation releases output and
 that merely registering a viewer without a connected display grants no exception.
 Exercise both a wired display and AirPlay, including an iOS 26 device and an
 iOS 27 device, and confirm PiP still uses its own live stream.
+Also minimize with multiple cameras, use Home/Scenes/Triggers and their panels,
+confirm the native Cameras badge, then return to Cameras without a stream or
+layout reset. Check that disconnecting while minimized removes the badge and
+that Close ends output. `CameraViewerPresentationTests` exercise retained view
+and task identity, actual camera session/renderer identity, native tab badges,
+covered-phone presentations, disconnect, restore, and final teardown.
+The full-view native UI test currently runs on iOS 27: this compiler's iOS 26
+XCTest runtime aborts in isolated-deinit while releasing the existing
+`CameraScreenSelection` during SwiftUI teardown. The state and retained-host
+tests still run on iOS 26; physical display checks on that OS remain necessary.
 
 ### Picture in Picture (iOS)
 

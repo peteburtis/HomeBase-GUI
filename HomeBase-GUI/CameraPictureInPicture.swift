@@ -625,11 +625,22 @@ extension EnvironmentValues {
 
 struct CameraPictureInPictureHost: ViewModifier {
     @ObservedObject var controller: CameraPictureInPictureController
+    @Environment(\.cameraViewerPresentation) private var retainedViewer
 
     func body(content: Content) -> some View {
         content
             .environment(\.cameraPictureInPicture, controller)
-            .fullScreenCover(item: $controller.reopenedViewer) { request in
+            .onChange(of: controller.reopenedViewer?.id) { _, _ in
+                guard let retainedViewer, let request = controller.reopenedViewer else { return }
+                retainedViewer.open(device: request.session.camera.device,
+                    quality: request.session.quality, client: request.session.client,
+                    viewerID: request.plan.viewerID)
+                controller.reopenedViewer = nil
+            }
+            .fullScreenCover(item: Binding(
+                get: { retainedViewer == nil ? controller.reopenedViewer : nil },
+                set: { controller.reopenedViewer = $0 }
+            )) { request in
                 CameraFullScreenLiveVideoView(device: request.session.camera.device,
                     quality: request.session.quality, client: request.session.client,
                     viewerID: request.plan.viewerID)

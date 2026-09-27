@@ -10,6 +10,10 @@ import SwiftUI
 
 struct DeviceDetailView: View {
     @Environment(\.scenePhase) private var scenePhase
+#if os(iOS)
+    @Environment(\.cameraViewerPresentation) private var cameraViewer
+    @Environment(\.cameraViewerIsPresented) private var viewerIsPresented
+#endif
 
     let device: HBTopologyDeviceDescriptor
     private let client: HomeBaseWebSocketClient
@@ -51,7 +55,7 @@ struct DeviceDetailView: View {
                             quality: CameraLiveQualitySelection(cameraCapability.previewQuality),
                             client: client,
                             allowsRetry: false,
-                            isStreamEnabled: access.canStream && !isShowingFullScreenVideo,
+                            isStreamEnabled: access.canStream && !isShowingVideo,
                             restartRequest: videoRestartRequest
                         )
                         .clipShape(RoundedRectangle(cornerRadius: 10))
@@ -69,6 +73,12 @@ struct DeviceDetailView: View {
                         .contentShape(Rectangle())
                         .onTapGesture {
                             guard access.isUnlocked else { return }
+#if os(iOS)
+                            if let cameraViewer {
+                                cameraViewer.open(device: device, quality: cameraCapability.fullScreenQuality, client: client)
+                                return
+                            }
+#endif
                             isShowingFullScreenVideo = true
                         }
                         .accessibilityAddTraits(.isButton)
@@ -140,6 +150,14 @@ struct DeviceDetailView: View {
 
     private var cameraCapability: CameraLiveVideoCapability? {
         CameraLiveVideoCapability(metadata: model.deviceMetadata)
+    }
+
+    private var isShowingVideo: Bool {
+#if os(iOS)
+        isShowingFullScreenVideo || viewerIsPresented
+#else
+        isShowingFullScreenVideo
+#endif
     }
 
     private var privacyEnabled: Bool? {

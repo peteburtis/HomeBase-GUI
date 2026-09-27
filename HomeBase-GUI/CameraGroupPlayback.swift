@@ -495,12 +495,12 @@ final class CameraGroupPlayback: ObservableObject {
 
     /// Phone inactivity conceals its UI; backgrounding suspends only its
     /// controls when the same media is still owned by a connected display.
-    func suspendForPhone(stopImmediately: Bool = false) {
+    func suspendForPhone(stopImmediately: Bool = false, stopRecording: Bool = true) {
         phoneResourcesSuspended = true
 #if os(iOS)
         // External playback does not extend local recording into the background.
         let recordings = sessions.map(\.recordingController).filter(\.isRecording)
-        if !recordings.isEmpty {
+        if stopRecording, !recordings.isEmpty {
             Task { for recording in recordings { await recording.stop() } }
         }
 #endif

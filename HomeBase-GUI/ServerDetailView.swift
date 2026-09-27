@@ -10,6 +10,12 @@ import SwiftUI
 struct ServerDetailView: View {
     private enum Tab: Hashable { case home, cameras, scenes, triggers }
     @Environment(\.scenePhase) private var scenePhase
+#if os(iOS)
+    @Environment(\.cameraViewerPresentation) private var cameraViewer
+    @Environment(\.cameraViewerIsPresented) private var viewerIsPresented
+    @Environment(\.cameraViewerIsMinimized) private var viewerIsMinimized
+    @Environment(\.cameraExternalStreamingCount) private var externalStreamingCount
+#endif
 
     let server: PairedServer
     let showServers: () -> Void
@@ -59,6 +65,9 @@ struct ServerDetailView: View {
                     Label("Cameras", systemImage: "video")
                 }
                 .tag(Tab.cameras)
+#if os(iOS)
+                .badge(externalStreamingCount)
+#endif
             }
 
             NavigationStack {
@@ -90,6 +99,17 @@ struct ServerDetailView: View {
                 selectedTab = .home
             }
         }
+#if os(iOS)
+        .onChange(of: viewerIsPresented) { _, presented in
+            isShowingCamera = presented
+        }
+        .onChange(of: viewerIsMinimized) { _, minimized in
+            if minimized && selectedTab == .cameras { selectedTab = .home }
+        }
+        .onChange(of: selectedTab) { _, tab in
+            if tab == .cameras { cameraViewer?.restore() }
+        }
+#endif
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             await connection.reactivate()

@@ -1714,12 +1714,34 @@ private struct CameraRecordingActivityView: UIViewControllerRepresentable {
 }
 #endif
 
+/// Construct the initial session lazily inside one StateObject. Eagerly making
+/// a session in the View initializer creates discarded players whenever an
+/// environment value (including minimized state or the badge count) changes.
+@MainActor
+private final class CameraViewerPlaybackOwner: ObservableObject {
+    let initialSession: CameraGroupSession
+    let group: CameraGroupPlayback
+    var objectWillChange: ObservableObjectPublisher { group.objectWillChange }
+
+    // Playback cleanup is explicit on close; SwiftUI can release this holder
+    // outside a Swift task, including on the iOS 26 runtime.
+    nonisolated deinit {}
+
+    init(camera: CameraVideoDevice, quality: CameraLiveQualitySelection, client: HomeBaseWebSocketClient) {
+        initialSession = CameraGroupSession(camera: camera, client: client, quality: quality)
+        group = CameraGroupPlayback(client: client, initialSession: initialSession)
+    }
+}
+
 private struct CameraFullScreenCameraContent: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 #if os(iOS)
     @Environment(\.cameraPictureInPicture) private var pictureInPicture
+    @Environment(\.cameraViewerPresentation) private var retainedViewer
+    @Environment(\.cameraViewerIsMinimized) private var phoneViewerMinimized
+    @StateObject private var externalDisplay = CameraExternalDisplayPresentation()
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 #endif
@@ -1727,8 +1749,9 @@ private struct CameraFullScreenCameraContent: View {
     let viewerID: UUID
     let screenSelection: CameraScreenSelection
     let access: CameraAccessPresentation
-    @StateObject private var initialSession: CameraGroupSession
-    @StateObject private var group: CameraGroupPlayback
+    @StateObject private var playbackOwner: CameraViewerPlaybackOwner
+    private var initialSession: CameraGroupSession { playbackOwner.initialSession }
+    private var group: CameraGroupPlayback { playbackOwner.group }
     @State private var focusedCameraID: String?
     private var presentation: CameraGroupPresentation {
         CameraGroupPresentation(sessions: group.sessions, focusedCameraID: focusedCameraID)
@@ -1850,17 +1873,14 @@ private struct CameraFullScreenCameraContent: View {
                 qualities: fallbackQualities,
                 supportsDefaultQuality: quality == .automatic
             ))
-        let session = CameraGroupSession(camera: camera, client: client, quality: quality)
-        _initialSession = StateObject(wrappedValue: session)
-        _group = StateObject(wrappedValue: CameraGroupPlayback(client: client, initialSession: session))
+        _playbackOwner = StateObject(wrappedValue: CameraViewerPlaybackOwner(
+            camera: camera, quality: quality, client: client))
     }
 
     private var cameraPresentation: some View {
         liveVideo
         .onAppear {
-            if !access.canStream {
-                group.suspendForPhone(stopImmediately: true)
-            }
+            reconcilePhonePlayback()
             applyInitialPositionIfAuthorized()
         }
         .onDisappear {
@@ -1872,7 +1892,13 @@ private struct CameraFullScreenCameraContent: View {
                 discardRecordingExport()
             }
 #endif
+#if os(iOS)
+            if retainedViewer?.request?.id == viewerID, externalDisplay.isOutputActive {
+                group.suspendForPhone(stopRecording: scenePhase != .active)
+            } else { group.deactivate() }
+#else
             group.deactivate()
+#endif
         }
         .onChange(of: cameraControlsEnabled) { _, enabled in
             if !enabled { stopLiveCameraGestures() }
@@ -1894,19 +1920,18 @@ private struct CameraFullScreenCameraContent: View {
             of: CameraLiveVideoLifecycle.isSuspended(
                 in: scenePhase,
                 isStreamEnabled: access.canStream
-            ),
+            ) || isPhoneViewerMinimized,
             initial: true
-        ) { _, isSuspended in
+        ) { _, _ in
             // This reconciliation is synchronous. A superseded SwiftUI task
             // can therefore never apply an older foreground/background intent.
-            if isSuspended {
-                group.suspendForPhone(
-                    stopImmediately: scenePhase == .background || !access.canStream
-                )
-            } else {
-                group.resume()
-                group.activateResources(access: access.session)
-            }
+            reconcilePhonePlayback()
+        }
+        .onChange(of: scenePhase) { _, _ in
+            // A minimized viewer is already phone-suspended, so the combined
+            // flag above does not change when the app subsequently backgrounds.
+            // Apply the background recording policy even in that case.
+            if isPhoneViewerMinimized { reconcilePhonePlayback() }
         }
         .onChange(of: access.session?.unlockedCredentials) { _, _ in
             if access.isAuthorized {
@@ -1917,6 +1942,16 @@ private struct CameraFullScreenCameraContent: View {
             guard !qualities.contains(selectedQuality),
                   let fallbackQuality = qualities.first else { return }
             selectedQuality = fallbackQuality
+        }
+    }
+
+    private func reconcilePhonePlayback() {
+        if isPhoneViewerMinimized || CameraLiveVideoLifecycle.isSuspended(in: scenePhase, isStreamEnabled: access.canStream) {
+            group.suspendForPhone(stopImmediately: scenePhase == .background || !access.canStream,
+                stopRecording: scenePhase != .active || !access.isAuthorized)
+        } else {
+            group.resume()
+            group.activateResources(access: access.session)
         }
     }
 
@@ -2038,10 +2073,14 @@ private struct CameraFullScreenCameraContent: View {
         // Animate the bars and the media canvas's safe-area policy together.
         .animation(reduceMotion ? nil : .snappy, value: controlsVisible)
 #if os(iOS)
+        .onChange(of: externalStreamingCameraCount, initial: true) { _, count in
+            retainedViewer?.updateExternalOutput(viewerID: viewerID, cameraCount: count)
+        }
         .modifier(CameraPiPViewerRegistration(id: viewerID,
             cameraIDs: Set(group.sessions.map(\.camera.id)),
             owner: screenSelection,
             showControls: {
+                if retainedViewer?.request?.id == viewerID { retainedViewer?.restore() }
                 // If PiP restores a different, currently faded-out pane, reveal
                 // its original position in the group rather than hiding it.
                 if let focusedCameraID,
@@ -2052,7 +2091,8 @@ private struct CameraFullScreenCameraContent: View {
             }))
         .background {
             CameraExternalDisplayBridge(group: group,
-                isVisible: access.isAuthorized)
+                isVisible: access.isAuthorized, presentation: externalDisplay,
+                retainWhenCovered: retainedViewer?.request?.id == viewerID)
                 .frame(width: 0, height: 0)
             CameraToolbarScrubBridge(
                 isEnabled: verticalSizeClass == .compact
@@ -2158,6 +2198,10 @@ private struct CameraFullScreenCameraContent: View {
         }
 #if os(iOS)
         pictureInPicture?.unregisterViewer(viewerID)
+        if retainedViewer?.request?.id == viewerID {
+            retainedViewer?.close()
+            return
+        }
 #endif
         dismiss()
     }
@@ -2181,13 +2225,13 @@ private struct CameraFullScreenCameraContent: View {
     private var cameraToolbar: some ToolbarContent {
 #if os(iOS)
         if toolbarArrangement.navigationItemsInBottomToolbar {
-            ToolbarItem(placement: .bottomBar) {
-                CameraPlayerCloseButton(returnsToCameras: presentation.focusedSession != nil, action: closeViewer)
+            ToolbarItemGroup(placement: .bottomBar) {
+                viewerDismissalControls
             }
             ToolbarSpacer(.fixed, placement: .bottomBar)
         } else {
-            ToolbarItem(placement: .navigation) {
-                CameraPlayerCloseButton(returnsToCameras: presentation.focusedSession != nil, action: closeViewer)
+            ToolbarItemGroup(placement: .navigation) {
+                viewerDismissalControls
             }
         }
 #else
@@ -2808,11 +2852,45 @@ private struct CameraFullScreenCameraContent: View {
             timelineVisible: timelineVisible)
     }
 
-    private var cameraControlsEnabled: Bool { access.isUnlocked && !switchingCamera && playbackControlsPresentation.cameraControlsEnabled }
+    private var isPhoneViewerMinimized: Bool {
+#if os(iOS)
+        phoneViewerMinimized && retainedViewer?.request?.id == viewerID
+#else
+        false
+#endif
+    }
+
+#if os(iOS)
+    private var externalStreamingCameraCount: Int {
+        externalDisplay.isOutputActive ? group.sessions.filter(group.showsVideo).count : 0
+    }
+
+    private var canMinimizeViewer: Bool {
+        access.isUnlocked && externalStreamingCameraCount > 0 && retainedViewer?.request?.id == viewerID
+    }
+
+    @ViewBuilder
+    private var viewerDismissalControls: some View {
+        CameraPlayerCloseButton(returnsToCameras: presentation.focusedSession != nil,
+            usesSystemCloseRole: !canMinimizeViewer, action: closeViewer)
+        if canMinimizeViewer {
+            Button("Minimize Video", systemImage: "chevron.down") {
+                stopLiveCameraGestures()
+                retainedViewer?.minimize(viewerID: viewerID,
+                    externalOutputActive: externalDisplay.isOutputActive)
+            }
+            .labelStyle(.iconOnly)
+            .accessibilityIdentifier("camera.minimize")
+            .accessibilityHint("Keeps video on the external display. Return to Cameras to restore this viewer.")
+        }
+    }
+#endif
+
+    private var cameraControlsEnabled: Bool { access.isUnlocked && !isPhoneViewerMinimized && !switchingCamera && playbackControlsPresentation.cameraControlsEnabled }
 
     private var playbackActionsEnabled: Bool {
 #if os(iOS)
-        access.isUnlocked && !switchingCamera && !recordingLocksStreamConfiguration
+        access.isUnlocked && !isPhoneViewerMinimized && !switchingCamera && !recordingLocksStreamConfiguration
 #else
         access.isUnlocked && !switchingCamera
 #endif

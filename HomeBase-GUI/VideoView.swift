@@ -9,6 +9,10 @@ import SwiftUI
 struct VideoView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.scenePhase) private var scenePhase
+#if os(iOS)
+    @Environment(\.cameraViewerPresentation) private var viewer
+    @Environment(\.cameraViewerIsPresented) private var viewerIsPresented
+#endif
 
     let cameras: [CameraVideoDevice]
     let client: HomeBaseWebSocketClient
@@ -32,6 +36,7 @@ struct VideoView: View {
             let previewsActive = access.canStream
                 && scenePhase == .active
                 && selectedCamera == nil
+                && !hasRetainedViewer
             ScrollView {
                 LazyVGrid(columns: columns, spacing: gridSpacing) {
                     ForEach(cameras) { camera in
@@ -97,6 +102,12 @@ struct VideoView: View {
             // Retain the camera-section lease before presentation can obscure
             // its parent; don't depend on onChange/onDisappear callback order.
             onPresentationChanged(true)
+#if os(iOS)
+            if let viewer {
+                viewer.open(device: camera.device, quality: camera.capability.fullScreenQuality, client: client)
+                return
+            }
+#endif
             selectedCamera = camera
         } label: {
             VStack(alignment: .leading, spacing: 0) {
@@ -158,6 +169,14 @@ struct VideoView: View {
             quality: camera.capability.fullScreenQuality,
             client: client
         )
+    }
+
+    private var hasRetainedViewer: Bool {
+#if os(iOS)
+        viewerIsPresented || viewer?.request != nil
+#else
+        false
+#endif
     }
 }
 

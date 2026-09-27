@@ -14,6 +14,7 @@ struct HomeBase_GUIApp: App {
 #if os(iOS)
     @UIApplicationDelegateAdaptor(CameraExternalDisplayAppDelegate.self) private var appDelegate
     @StateObject private var cameraPiP: CameraPictureInPictureController
+    @StateObject private var cameraViewer = CameraViewerPresentation()
 #endif
 
     init() {
@@ -28,7 +29,9 @@ struct HomeBase_GUIApp: App {
         WindowGroup {
             ContentView()
 #if os(iOS)
+                .modifier(CameraViewerHost(presentation: cameraViewer))
                 .modifier(CameraPictureInPictureHost(controller: cameraPiP))
+                .environment(\.cameraViewerPresentation, cameraViewer)
 #endif
                 .environmentObject(serverStore)
                 .cameraAccessLifecycle(cameraAccess)
@@ -40,6 +43,7 @@ struct HomeBase_GUIApp: App {
                 .onChange(of: serverStore.selectedServerID) { _, _ in
 #if os(iOS)
                     cameraPiP.reset()
+                    cameraViewer.close()
 #endif
                     cameraAccess.reset()
                 }

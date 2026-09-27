@@ -72,15 +72,22 @@ struct CameraLiveModeButton: View {
 /// Let the toolbar provide the dismissal button's label, sizing, and glass.
 struct CameraPlayerCloseButton: View {
     var returnsToCameras = false
+    var usesSystemCloseRole = true
     let action: () -> Void
 
     @ViewBuilder var body: some View {
         if returnsToCameras {
             Button("Back to cameras", systemImage: "chevron.backward", action: action)
                 .accessibilityIdentifier("camera.backToCameras")
-        } else {
+        } else if usesSystemCloseRole {
             Button(role: .close, action: action)
                 .accessibilityLabel("Close live video")
+                .accessibilityIdentifier("camera.close")
+        } else {
+            // The system close role gets its own glass island. Use a normal
+            // toolbar button when Close shares a group with Minimize.
+            Button("Close live video", systemImage: "xmark", action: action)
+                .labelStyle(.iconOnly)
                 .accessibilityIdentifier("camera.close")
         }
     }
