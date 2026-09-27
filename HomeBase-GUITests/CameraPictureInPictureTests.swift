@@ -1,5 +1,6 @@
 #if os(iOS)
 import AVKit
+import Combine
 import MediaPlayer
 import SwiftUI
 import XCTest
@@ -57,7 +58,7 @@ final class CameraPictureInPictureTests: XCTestCase {
     }
 #endif
 
-    func testNativeControllerUsesLiveSampleBufferSourceAndNeverStartsAutomatically() async throws {
+    func testNativeControllerUsesLinearLiveSampleBufferSourceAndNeverStartsAutomatically() async throws {
         let owner = CameraPictureInPictureController()
         try XCTSkipUnless(owner.isSupported, "This simulator/device does not advertise native PiP support")
         let renderer = CameraH264Renderer()
@@ -68,6 +69,59 @@ final class CameraPictureInPictureTests: XCTestCase {
         let range = owner.pictureInPictureControllerTimeRangeForPlayback(native)
         XCTAssertTrue(range.duration.isPositiveInfinity)
         XCTAssertTrue(owner.pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(native))
+    }
+
+    func testPaneKeepsLivePiPSourceMountedWithoutCoveringHistory() {
+        for isLive in [false, true] {
+            let detached = CameraPiPPanePresentation(attached: false, isLive: isLive)
+            XCTAssertFalse(detached.keepsSourceMounted)
+            XCTAssertFalse(detached.sourceCoversContent)
+        }
+
+        let live = CameraPiPPanePresentation(attached: true, isLive: true)
+        XCTAssertTrue(live.keepsSourceMounted)
+        XCTAssertTrue(live.sourceCoversContent,
+            "Live must expose AVKit's system Picture in Picture placeholder")
+
+        let history = CameraPiPPanePresentation(attached: true, isLive: false)
+        XCTAssertTrue(history.keepsSourceMounted,
+            "History must not tear down the independent live PiP source")
+        XCTAssertFalse(history.sourceCoversContent,
+            "History video must remain visible in the main pane")
+
+        let returnedLive = CameraPiPPanePresentation(attached: true, isLive: true)
+        XCTAssertTrue(returnedLive.sourceCoversContent,
+            "Returning to Live must reveal AVKit's PiP placeholder again")
+    }
+
+    func testMountedSourceDoesNotDisappearAcrossLiveHistoryLive() async throws {
+        let state = CameraPiPSourceLayerTestState()
+        let host = UIHostingController(rootView: CameraPiPSourceLayerTestHarness(state: state))
+        let scene = try XCTUnwrap(
+            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        )
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        window.rootViewController = host
+        window.isHidden = false
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        host.view.frame = window.bounds
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(state.appearances, 1)
+        XCTAssertEqual(state.disappearances, 0)
+
+        for isLive in [false, true] {
+            state.isLive = isLive
+            try await Task.sleep(for: .milliseconds(50))
+            host.view.layoutIfNeeded()
+            XCTAssertEqual(state.appearances, 1)
+            XCTAssertEqual(state.disappearances, 0,
+                "Changing only the main viewer mode must not detach the live PiP source")
+        }
     }
 
     func testRestorePreservesExistingViewerAndCameraGroup() {
@@ -213,6 +267,29 @@ final class CameraPictureInPictureTests: XCTestCase {
         XCTAssertNil(controller.pendingSwap)
         XCTAssertTrue(controller.canStartOrSwap)
         controller.reset()
+    }
+}
+
+@MainActor
+private final class CameraPiPSourceLayerTestState: ObservableObject {
+    @Published var isLive = true
+    var appearances = 0
+    var disappearances = 0
+}
+
+private struct CameraPiPSourceLayerTestHarness: View {
+    @ObservedObject var state: CameraPiPSourceLayerTestState
+
+    var body: some View {
+        CameraPiPSourceLayer(
+            presentation: CameraPiPPanePresentation(attached: true, isLive: state.isLive),
+            sourceDidAppear: { state.appearances += 1 },
+            sourceDidDisappear: { state.disappearances += 1 }
+        ) {
+            Color.black
+        } source: {
+            Color.red
+        }
     }
 }
 #endif

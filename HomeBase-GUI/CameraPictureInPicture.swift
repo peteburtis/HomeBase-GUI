@@ -103,10 +103,54 @@ final class CameraPiPSession: Identifiable {
          authorization: CameraStreamAuthorization) {
         self.camera = camera; self.quality = quality; self.client = client
         self.originViewerID = originViewerID; self.authorization = authorization
-        // Deliberately no history controller, S3 credentials, camera controls,
-        // or recording controller. This lease is live video for one camera only.
+        // Deliberately no history controller, replay buffer, S3 credentials,
+        // camera controls, or recording controller. PiP is always live video.
         model = CameraLiveVideoModel(deviceIdentifier: camera.device.addressableName,
             quality: quality, client: client)
+    }
+}
+
+struct CameraPiPPanePresentation: Equatable {
+    let keepsSourceMounted: Bool
+    let sourceCoversContent: Bool
+
+    init(attached: Bool, isLive: Bool) {
+        keepsSourceMounted = attached
+        sourceCoversContent = attached && isLive
+    }
+}
+
+struct CameraPiPSourceLayer<Content: View, Source: View>: View {
+    let presentation: CameraPiPPanePresentation
+    let content: Content
+    let source: Source
+    let sourceDidAppear: () -> Void
+    let sourceDidDisappear: () -> Void
+
+    init(presentation: CameraPiPPanePresentation,
+         sourceDidAppear: @escaping () -> Void,
+         sourceDidDisappear: @escaping () -> Void,
+         @ViewBuilder content: () -> Content,
+         @ViewBuilder source: () -> Source) {
+        self.presentation = presentation
+        self.sourceDidAppear = sourceDidAppear
+        self.sourceDidDisappear = sourceDidDisappear
+        self.content = content()
+        self.source = source()
+    }
+
+    var body: some View {
+        ZStack {
+            content
+                .zIndex(presentation.sourceCoversContent ? 0 : 1)
+            if presentation.keepsSourceMounted {
+                source
+                    .zIndex(presentation.sourceCoversContent ? 1 : 0)
+                    .accessibilityHidden(!presentation.sourceCoversContent)
+                    .onAppear(perform: sourceDidAppear)
+                    .onDisappear(perform: sourceDidDisappear)
+            }
+        }
     }
 }
 
@@ -360,11 +404,18 @@ final class CameraPictureInPictureController: NSObject, ObservableObject {
 
     func setPlaying(_ playing: Bool) {
         guard phase == .active, let session else { return }
+        applySystemPlaybackState(playing: playing, renderer: session.model.renderer) {
+            controller?.invalidatePlaybackState()
+        }
+    }
+
+    func applySystemPlaybackState(playing: Bool, renderer: CameraH264Renderer,
+                                  invalidate: () -> Void) {
         isPaused = !playing
-        // Live-only: keep decoding dependencies, but freeze the displayed frame.
-        // Resume shows the current live picture; it never enters an archive.
-        session.model.renderer.suppressesDisplay = !playing
-        controller?.invalidatePlaybackState()
+        // Pausing freezes PiP without changing playback mode. The independent
+        // stream keeps decoding, so Play resumes at the current live edge.
+        renderer.suppressesDisplay = !playing
+        invalidate()
     }
 
     func stop() {
@@ -541,7 +592,7 @@ extension CameraPictureInPictureController: AVPictureInPictureControllerDelegate
     }
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, didTransitionToRenderSize newRenderSize: CMVideoDimensions) {}
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) {
-        // This first implementation is explicitly live-only and linear.
+        // PiP is deliberately live-only and linear.
         completionHandler()
     }
     func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
@@ -634,13 +685,14 @@ struct CameraPiPPane: ViewModifier {
     @Environment(\.cameraPiPViewerID) private var viewerID
     let session: CameraGroupSession
     let alignment: Alignment
+    let isLive: Bool
 
     @ViewBuilder
     func body(content: Content) -> some View {
         if let controller, let viewerID {
             content.modifier(ObservedCameraPiPPane(controller: controller, viewerID: viewerID,
                 cameraSession: session,
-                alignment: alignment))
+                alignment: alignment, isLive: isLive))
         } else { content }
     }
 }
@@ -650,6 +702,7 @@ private struct ObservedCameraPiPPane: ViewModifier {
     let viewerID: UUID
     let cameraSession: CameraGroupSession
     let alignment: Alignment
+    let isLive: Bool
 
     private var isSource: Bool {
         controller.session?.originViewerID == viewerID
@@ -663,21 +716,36 @@ private struct ObservedCameraPiPPane: ViewModifier {
     }
 
     func body(content: Content) -> some View {
-        content
-            .overlay {
-                if let session = attachedSource {
-                    // Keep the same native source mounted through PiP's
-                    // transition and active phase. AVKit supplies its own
-                    // inline placeholder; don't cover it with an app overlay.
-                    CameraLiveVideoSurface(model: session.model, allowsRetry: false,
-                        usesHistory: false, retry: {})
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment)
-                        .id(session.id)
-                        .allowsHitTesting(false)
-                        .onAppear { controller.sourceAttachmentChanged(sessionID: session.id, attached: true) }
-                        .onDisappear { controller.sourceAttachmentChanged(sessionID: session.id, attached: false) }
+        let session = attachedSource
+        let presentation = CameraPiPPanePresentation(
+            attached: session != nil,
+            isLive: isLive
+        )
+        CameraPiPSourceLayer(
+            presentation: presentation,
+            sourceDidAppear: {
+                if let session {
+                    controller.sourceAttachmentChanged(sessionID: session.id, attached: true)
+                }
+            },
+            sourceDidDisappear: {
+                if let session {
+                    controller.sourceAttachmentChanged(sessionID: session.id, attached: false)
                 }
             }
+        ) {
+            content
+        } source: {
+            if let session {
+                // Keep the live source attached while History is in front. In
+                // Live, putting it in front exposes AVKit's native PiP message.
+                CameraLiveVideoSurface(model: session.model, allowsRetry: false,
+                    usesHistory: false, retry: {})
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment)
+                    .id(session.id)
+                    .allowsHitTesting(false)
+            }
+        }
     }
 }
 

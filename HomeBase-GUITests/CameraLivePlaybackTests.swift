@@ -6,14 +6,22 @@ import XCTest
 
 @MainActor
 final class CameraLivePlaybackTests: XCTestCase {
-    func testLivePiPPauseDecodesWithoutDisplayingAndResumeDisplaysCurrentFrame() async throws {
+    func testLivePiPPauseKeepsDecodingAndPlayDisplaysTheCurrentLiveFrame() async throws {
         let clip = try video()
         let renderer = CameraH264Renderer()
+        let controller = CameraPictureInPictureController()
+        var invalidations = 0
         _ = try renderer.configure(clip.configuration)
         let first = try XCTUnwrap(renderer.enqueue(clip.frames[0]))
-        renderer.suppressesDisplay = true
+        controller.applySystemPlaybackState(playing: false, renderer: renderer) {
+            invalidations += 1
+        }
+        XCTAssertTrue(controller.isPaused)
         let paused = try XCTUnwrap(renderer.enqueue(clip.frames[1]))
-        renderer.suppressesDisplay = false
+        controller.applySystemPlaybackState(playing: true, renderer: renderer) {
+            invalidations += 1
+        }
+        XCTAssertFalse(controller.isPaused)
         let resumed = try XCTUnwrap(renderer.enqueue(clip.frames[2]))
         func isHidden(_ sample: CMSampleBuffer) -> Bool? {
             let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
@@ -25,6 +33,13 @@ final class CameraLivePlaybackTests: XCTestCase {
         XCTAssertEqual(isHidden(resumed), false)
         XCTAssertGreaterThan(CMSampleBufferGetPresentationTimeStamp(resumed),
             CMSampleBufferGetPresentationTimeStamp(paused))
+        XCTAssertEqual(
+            CMSampleBufferGetPresentationTimeStamp(resumed).seconds,
+            Double(clip.frames[2].presentationTimestamp - clip.frames[0].presentationTimestamp)
+                / Double(clip.configuration.timeScale),
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(invalidations, 2)
         renderer.reset()
     }
 

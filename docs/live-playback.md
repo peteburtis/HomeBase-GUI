@@ -568,8 +568,10 @@ different focused pane.
 Long-press a real camera pane in the viewer to choose **Picture in Picture**.
 In history the action is named **Start Live Picture in Picture**: PiP has an
 independent live-only renderer, not the group's history cursor, replay buffer,
-recording controller, or S3 credentials. Artificial color-only cameras are not
-offered because they do not supply encoded media. While PiP is active, another
+recording controller, or S3 credentials. Starting it from History leaves History
+visible in the main pane and opens the current live feed in the PiP window.
+Artificial color-only cameras are not offered because they do not supply encoded
+media. While PiP is active, another
 camera's menu says **Swap Picture in Picture** with the `arrow.triangle.swap`
 symbol. Its live-only replacement stream prepares in the foreground while the
 current camera keeps playing. Once the new source is attached and its sample
@@ -586,11 +588,15 @@ New PiP actions are unavailable while recording locks stream configuration.
 
 An app-owned `AVPictureInPictureController` uses the camera's native
 `AVSampleBufferDisplayLayer`. Its inline source view stays mounted throughout
-PiP's transition and active phase so AVKit's own PiP placeholder remains visible;
-the app does not cover it with a custom message. `requiresLinearPlayback` suppresses seeking;
-Pause freezes the displayed live frame while decoding continues, and Play
-returns to the current live picture. The app declares the `audio` background
-mode required for media PiP. Its `.playback`/`.moviePlayback` audio session
+PiP's transition and active phase. While the main pane is Live, that source stays
+in front so AVKit's own “playing in Picture in Picture” placeholder is visible;
+the app does not cover it with a custom message. Entering History moves the
+live-only PiP source behind the main pane without detaching it, so PiP keeps
+playing Live while the main pane shows independent History video. Returning the
+main pane to Live reveals AVKit's placeholder again. `requiresLinearPlayback`
+suppresses seeking; Pause freezes the displayed live frame while decoding
+continues, and Play jumps to the current live picture. The app declares the
+`audio` background mode required for media PiP. Its `.playback`/`.moviePlayback` audio session
 mixes with other apps for silent video. `CameraPiPAudioPolicy` isolates that
 choice so future audible cameras can take audio focus without changing the
 authorization/restoration design. Now Playing contains **only the camera name**
@@ -647,9 +653,11 @@ Focused tests cover the scoped lease, independent foreground/PiP revocation,
 late acquisition and idle-handoff teardown, minimal metadata, native controller
 flags, restoration selection, background-start policy, retained credentials,
 foreground-stream revocation, and restoration-handoff ordering. On a device, also
-check native start/stop and pause/resume, background playback, return with the
-viewer open and closed, switching PiP cameras, lock-screen teardown, and that
-backgrounding without an explicit PiP action never opens the system window.
+check native start/stop and pause/resume, starting live PiP while History remains
+visible, switching Live → History → Live while PiP continues live and the native
+placeholder returns, background playback, return with the viewer open and closed,
+switching PiP cameras, lock-screen teardown, and that backgrounding without an
+explicit PiP action never opens the system window.
 
 Verified on Parkaboy through iPhone Mirroring (2026-09-25): native start/stop,
 pause/resume to the current live frame, continuing playback on the Home Screen,

@@ -798,7 +798,8 @@ private struct CameraGroupPane: View {
         }
         .background(Color.black)
 #if os(iOS)
-        .modifier(CameraPiPPane(session: session, alignment: videoGravity.alignment))
+        .modifier(CameraPiPPane(session: session, alignment: videoGravity.alignment,
+            isLive: isLive))
 #endif
         .contextMenu {
             if let onFullScreen {
