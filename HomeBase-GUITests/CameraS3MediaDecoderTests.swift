@@ -136,7 +136,7 @@ private nonisolated final class S3DecodedFrameCount: @unchecked Sendable {
 
 /// Test fixtures use segment-output AVAssetWriter too: neither fixture creation
 /// nor the decoder takes a filesystem URL or writes the clear-text recording.
-@MainActor private struct S3MediaFixture {
+@MainActor struct S3MediaFixture {
     let data: Data
     let expected: CameraS3ManifestShard
     let samples: [CMSampleBuffer]

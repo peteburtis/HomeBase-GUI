@@ -549,13 +549,15 @@ struct CameraGroupCanvas<Content: View>: View {
     }
 
     private func firstActiveDivision(in proxy: GeometryProxy) -> CameraGroupLayout.Division? {
-        if #available(iOS 27.1, macOS 27.1, tvOS 27.1, watchOS 27.1, visionOS 27.1, *) {
+#if os(iOS)
+        if #available(iOS 27.1, *) {
             guard let region = proxy.reservedRegions(kind: .division).first else { return nil }
             return CameraGroupLayout.Division(
                 frame: region.frame,
                 margins: region.margins
             )
         }
+#endif
         return nil
     }
 }

@@ -52,6 +52,16 @@ private struct CameraTimelinePlayheadKey: EnvironmentKey {
     static let defaultValue: CGFloat? = nil
 }
 
+private struct CameraTimelineTrailingControlInsetKey: EnvironmentKey {
+    static let defaultValue: CGFloat = CameraPTZOverlayMetrics.inset
+}
+
+enum CameraTimelineControlPlacement {
+    static func trailingInset(in bounds: CGRect, safeBounds: CGRect) -> CGFloat {
+        max(0, bounds.maxX - safeBounds.maxX) + CameraPTZOverlayMetrics.inset
+    }
+}
+
 enum CameraTimelinePlayheadPlacement {
     /// Coordinates are relative to the timeline, not the full media canvas.
     /// Keep the entire marker beyond the fold's frame and recommended margins.
@@ -72,6 +82,11 @@ extension EnvironmentValues {
     var cameraTimelinePlayhead: CGFloat? {
         get { self[CameraTimelinePlayheadKey.self] }
         set { self[CameraTimelinePlayheadKey.self] = newValue }
+    }
+
+    var cameraTimelineTrailingControlInset: CGFloat {
+        get { self[CameraTimelineTrailingControlInsetKey.self] }
+        set { self[CameraTimelineTrailingControlInsetKey.self] = newValue }
     }
 }
 
@@ -136,6 +151,10 @@ final class CameraTimelineModel: ObservableObject {
     nonisolated deinit {}
 
     var needsConnection: Bool { anchor == nil }
+    var dateSelection: CameraHistoryDateSelection? {
+        guard !needsConnection, let cursor, let latest else { return nil }
+        return .init(date: Date(timeIntervalSince1970: cursor), latestDate: Date(timeIntervalSince1970: latest))
+    }
     var end: Double { min(latest ?? start, start + Double(CameraTimelineScale.windowCells) * CameraTimelineScale.seconds) }
     var tiles: Range<Int> {
         Int(floor(start / CameraTimelineScale.seconds))..<max(Int(floor(start / CameraTimelineScale.seconds)), Int(ceil(end / CameraTimelineScale.seconds)))
@@ -328,6 +347,8 @@ struct CameraTimelinePlacement<Content: View>: View {
                 .environment(\.cameraTimelineThumbnailSize, CameraTimelineSizing.standard)
                 .environment(\.cameraTimelinePlayhead,
                     CameraTimelinePlayheadPlacement.position(in: bounds, division: division))
+                .environment(\.cameraTimelineTrailingControlInset,
+                    CameraTimelineControlPlacement.trailingInset(in: bounds, safeBounds: safeBounds))
                 .frame(
                     width: bounds.width,
                     height: bounds.height,
@@ -362,6 +383,7 @@ struct CameraHistoryTimeline: View {
     @Environment(\.displayScale) private var displayScale
     @Environment(\.cameraTimelineThumbnailSize) private var thumbnailSize
     @Environment(\.cameraTimelinePlayhead) private var preferredPlayhead
+    @Environment(\.cameraTimelineTrailingControlInset) private var trailingControlInset
     @StateObject private var model = CameraTimelineModel()
     @State private var scroll = ScrollPosition(x: 0)
     @State private var attempt = 0
@@ -384,6 +406,7 @@ struct CameraHistoryTimeline: View {
     var interactionEnabled = true
     var onCancel: () -> Void = {}
     var toolbarScrubRelay: CameraToolbarScrubRelay?
+    var onPlayFromDate: ((Date) -> Void)? = nil
 
     private var playhead: CGFloat {
         min(viewportWidth, max(0, preferredPlayhead ?? viewportWidth / 2))
@@ -471,6 +494,17 @@ struct CameraHistoryTimeline: View {
         }
         .background(.black.opacity(0.65))
         .foregroundStyle(.yellow)
+        .overlay(alignment: .trailing) {
+            if let onPlayFromDate {
+                CameraHistoryCalendarButton(selection: {
+                    model.follow(position())
+                    return model.dateSelection
+                }, timeZone: timeZone,
+                    isEnabled: isActive && interactionEnabled && !model.dragging && model.dateSelection != nil,
+                    onPlay: onPlayFromDate)
+                    .padding(.trailing, trailingControlInset)
+            }
+        }
         .sensoryFeedback(.selection, trigger: model.feedbackTick)
         .onChange(of: thumbnailSize, initial: true) { _, _ in updateScale() }
         .onChange(of: preferredPlayhead) { _, _ in updateScale() }

@@ -187,9 +187,17 @@ struct CameraAccessLockedView: View {
 /// Presenting a fullscreen camera must not be mistaken for leaving Cameras.
 @MainActor
 final class CameraAccessLifecycle: ObservableObject {
+    private enum TrackedScenePhase: Equatable {
+        case active
+        case inactive
+        case background
+    }
+
     let session: CameraAccessSession
     private var owners: Set<UUID> = []
     private var isBackgrounded = false
+    private var scenePhases: [UUID: TrackedScenePhase] = [:]
+    private let legacySceneID = UUID()
     private var hasActivePictureInPicture = false
     private var externalDisplays: Set<UUID> = []
     private var isDeviceLocked = false
@@ -227,24 +235,47 @@ final class CameraAccessLifecycle: ObservableObject {
     }
 
     func scenePhaseChanged(_ phase: ScenePhase) {
+        scenePhaseChanged(phase, scene: legacySceneID)
+    }
+
+    /// Track window phases independently. One hidden browser window must not
+    /// suspend streams that belong to another active camera window.
+    func scenePhaseChanged(_ phase: ScenePhase, scene sceneID: UUID) {
         switch phase {
         case .background:
-            isBackgrounded = true
-            session.suspendStreams()
-            lockIfUnowned()
+            scenePhases[sceneID] = .background
+            enterBackgroundIfEverySceneIsBackgrounded()
         case .active:
+            scenePhases[sceneID] = .active
             isDeviceLocked = false
-            session.resumeStreams()
-            if isBackgrounded && !owners.isEmpty {
+            if isBackgrounded {
+                session.resumeStreams()
+            }
+            if isBackgrounded, !owners.isEmpty {
                 session.enter()
             }
             isBackgrounded = false
             finishRestorationHandoffIfReady()
         case .inactive:
-            break
+            scenePhases[sceneID] = .inactive
         @unknown default:
             break
         }
+    }
+
+    func sceneDisconnected(_ sceneID: UUID) {
+        scenePhases.removeValue(forKey: sceneID)
+        enterBackgroundIfEverySceneIsBackgrounded()
+    }
+
+    private func enterBackgroundIfEverySceneIsBackgrounded() {
+        guard !isBackgrounded,
+              scenePhases.isEmpty
+                || scenePhases.values.allSatisfy({ $0 == .background })
+        else { return }
+        isBackgrounded = true
+        session.suspendStreams()
+        lockIfUnowned()
     }
 
     func pictureInPictureStarted() {

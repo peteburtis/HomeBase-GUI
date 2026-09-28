@@ -1252,11 +1252,11 @@ nonisolated struct CameraToolbarArrangement: Equatable {
     }
 
     var recordInTrailingNavigationBar: Bool {
-        isLive && !navigationItemsInBottomToolbar
+        !navigationItemsInBottomToolbar
     }
 
     var recordInBottomTrailing: Bool {
-        isLive && navigationItemsInBottomToolbar
+        navigationItemsInBottomToolbar
     }
 }
 
@@ -1520,6 +1520,9 @@ struct CameraFullScreenLiveVideoView: View {
                 selectCamera: { selection.select($0, position: $1) },
                 retainCamera: { selection.retain($0, quality: $1) })
                 .id(selection.session.id)
+#if os(macOS)
+                .navigationTitle(selection.session.device.displayName)
+#endif
             }
         }
     }
@@ -1574,6 +1577,7 @@ private struct CameraRecordingControlStyle: ViewModifier {
 
 private struct CameraRecordingExportPopover: View {
     let recordings: [CameraLocalRecording]
+    var notices: [String] = []
     let saveToPhotos: () -> Void
     let saveToFiles: () -> Void
     let share: () -> Void
@@ -1588,6 +1592,9 @@ private struct CameraRecordingExportPopover: View {
                             .font(.headline)
                             .multilineTextAlignment(.center)
                             .frame(maxWidth: .infinity)
+                    }
+                    ForEach(notices, id: \.self) { notice in
+                        Text(notice).font(.caption).foregroundStyle(.secondary)
                     }
                 }
             }
@@ -1786,8 +1793,10 @@ private struct CameraFullScreenCameraContent: View {
     @State private var historyBookmarkError: String?
     @State private var s3Destination: CameraS3Destination?
 #if os(iOS)
+    @StateObject private var historyExport = CameraHistoryExportController()
+    @State private var historyExportVisible = false
     private var recordingControllers: [CameraLocalRecordingController] {
-        group.sessions.map(\.recordingController)
+        group.sessions.map(\.recordingController) + historyExport.recordings
     }
 
     private var pendingRecordings: [CameraLocalRecording] {
@@ -1815,13 +1824,13 @@ private struct CameraFullScreenCameraContent: View {
     }
 
     private var recordingIsBusy: Bool {
-        recordingControllers.contains {
+        historyExport.isBusy || recordingControllers.contains {
             $0.state == .finalizing || $0.state == .exporting
         }
     }
 
     private var recordingLocksStreamConfiguration: Bool {
-        recordingControllers.contains(where: \.locksStreamConfiguration)
+        historyExportVisible || historyExport.isBusy || recordingControllers.contains(where: \.locksStreamConfiguration)
     }
 
     private var recordingStartedAt: Date? {
@@ -1888,6 +1897,7 @@ private struct CameraFullScreenCameraContent: View {
             cameraSwitchTask?.cancel(); cameraSwitchTask = nil
             stopLiveCameraGestures()
 #if os(iOS)
+            cancelHistoryExport()
             if !pendingRecordings.isEmpty {
                 discardRecordingExport()
             }
@@ -1999,9 +2009,25 @@ private struct CameraFullScreenCameraContent: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .background,
-               !pendingRecordings.isEmpty {
+            if phase == .background {
+                cancelHistoryExport()
+                if !pendingRecordings.isEmpty { discardRecordingExport() }
+            }
+        }
+        .onChange(of: access.isAuthorized) { _, allowed in
+            if !allowed {
+                cancelHistoryExport()
                 discardRecordingExport()
+            }
+        }
+        .onChange(of: isPhoneViewerMinimized) { _, minimized in
+            if minimized { cancelHistoryExport() }
+        }
+        .onChange(of: historyExport.isExporting) { wasExporting, exporting in
+            if wasExporting, !exporting, historyExport.error == nil,
+               !pendingRecordings.isEmpty {
+                presentRecordingExport()
+                historyExportVisible = false
             }
         }
 #else
@@ -2168,7 +2194,15 @@ private struct CameraFullScreenCameraContent: View {
                                     if group.active { group.togglePause() } else { playbackController.togglePause() }
                                 }
                                 timelineResumeAfterSeek = false
-                            }, toolbarScrubRelay: toolbarScrubRelay)
+                            }, toolbarScrubRelay: toolbarScrubRelay,
+                            onPlayFromDate: { date in
+                                guard playbackActionsEnabled else { return }
+                                cancelHistoryRestore()
+                                timelineResumeAfterSeek = false
+                                stopLiveCameraGestures()
+                                if group.active { group.seek(to: date, paused: false) }
+                                else { playbackController.seek(to: date, paused: false) }
+                            })
                             .id(metadata.cameraID)
                     }
                 }
@@ -2515,32 +2549,35 @@ private struct CameraFullScreenCameraContent: View {
             .modifier(CameraRecordingControlStyle(
                 isProminent: recordingIsActive
             ))
-            .popover(
-                item: $recordingExportPresentation,
-                attachmentAnchor: .rect(.bounds)
-            ) { presentation in
-                CameraRecordingExportPopover(
-                    recordings: presentation.recordings,
-                    saveToPhotos: saveRecordingToPhotos,
-                    saveToFiles: {
-                        presentSystemRecordingExport(
-                            .files(presentation.recordings)
+            .popover(isPresented: recordingPopoverIsPresented, attachmentAnchor: .rect(.bounds)) {
+                Group {
+                    if historyExportVisible {
+                        CameraHistoryExportPopover(export: historyExport,
+                            timeZone: CameraHistoryTimestamp.timeZone(in: controlsModel.deviceMetadata),
+                            start: startHistoryExport, cancel: cancelHistoryExport)
+                    } else if let presentation = recordingExportPresentation {
+                        CameraRecordingExportPopover(
+                            recordings: presentation.recordings,
+                            notices: historyExport.recordings.contains(where: { $0.pendingRecording != nil })
+                                ? historyExport.notices : [],
+                            saveToPhotos: saveRecordingToPhotos,
+                            saveToFiles: { presentSystemRecordingExport(.files(presentation.recordings)) },
+                            share: { presentSystemRecordingExport(.share(presentation.recordings)) },
+                            delete: discardRecordingExport
                         )
-                    },
-                    share: {
-                        presentSystemRecordingExport(
-                            .share(presentation.recordings)
-                        )
-                    },
-                    delete: discardRecordingExport
-                )
+                    }
+                }
                 .presentationCompactAdaptation(.popover)
-                .interactiveDismissDisabled()
+                .interactiveDismissDisabled(historyExport.isBusy || recordingExportPresentation != nil)
+            }
+            .onChange(of: historyExportVisible) { _, visible in
+                if !visible { historyExport.cancel() }
             }
             .task(id: recordingExportTrigger) {
                 guard !recordingExportTrigger.recordingIDs.isEmpty,
                       !recordingExportTrigger.isBusy,
                       recordingExportTrigger.errorMessage == nil,
+                      !historyExportVisible,
                       recordingExportPresentation == nil,
                       recordingSystemPresentation == nil
                 else { return }
@@ -2552,6 +2589,15 @@ private struct CameraFullScreenCameraContent: View {
             }
     }
 
+    private var recordingPopoverIsPresented: Binding<Bool> {
+        Binding(get: { historyExportVisible || recordingExportPresentation != nil }, set: { visible in
+            if !visible {
+                cancelHistoryExport()
+                recordingExportPresentation = nil
+            }
+        })
+    }
+
     private var recordingButton: some View {
         Button {
             if !pendingRecordings.isEmpty {
@@ -2560,6 +2606,8 @@ private struct CameraFullScreenCameraContent: View {
                 Task {
                     await stopRecording()
                 }
+            } else if !isLive {
+                prepareHistoryExport()
             } else {
                 guard cameraControlsEnabled else { return }
                 Task {
@@ -2569,19 +2617,21 @@ private struct CameraFullScreenCameraContent: View {
         } label: {
             recordingButtonLabel
         }
-        .tint(.red)
+        .tint(isLive || recordingIsActive ? .red : .accentColor)
         .disabled(
             recordingIsBusy
                 || (!recordingIsActive
                     && pendingRecordings.isEmpty
-                    && (presentation.visibleSessions.isEmpty
-                        || !presentation.visibleSessions.allSatisfy({ $0.recordingController.isStreamAvailable })
-                        || !cameraControlsEnabled))
+                    && (isLive
+                        ? (presentation.visibleSessions.isEmpty
+                            || !presentation.visibleSessions.allSatisfy({ $0.recordingController.isStreamAvailable })
+                            || !cameraControlsEnabled)
+                        : !canExportHistory))
         )
         .accessibilityLabel(
             recordingIsActive
                 ? "Stop recording"
-                : "Record video"
+                : (isLive ? "Record video" : "Export history")
         )
         .accessibilityValue(recordingAccessibilityValue)
     }
@@ -2593,8 +2643,48 @@ private struct CameraFullScreenCameraContent: View {
         } else if recordingHasStarted {
             Image(systemName: "stop.fill")
         } else {
-            Image(systemName: "record.circle")
+            Image(systemName: isLive ? "record.circle" : "square.and.arrow.up")
         }
+    }
+
+    private var canExportHistory: Bool {
+        access.isUnlocked && !isPhoneViewerMinimized && !switchingCamera
+            && playbackPosition != .live
+            && presentation.visibleSessions.contains { $0.historyAvailable }
+    }
+
+    private func prepareHistoryExport() {
+        guard canExportHistory else { return }
+        // Snapshot both the cursor and camera selection at the button tap,
+        // not when an asynchronous clock lookup or the export completes.
+        let position = playbackPosition
+        let targets = presentation.visibleSessions.map {
+            CameraHistoryExportController.Target(name: $0.camera.device.displayName,
+                metadata: CameraPlaybackHistoryAvailability.metadata(in: $0.controls.deviceMetadata))
+        }
+        historyExportVisible = true
+        historyExport.prepare(position: position, targets: targets) { position in
+            guard case .relative = position else { return position }
+            let source = await client.makeHistoryTransport()
+            do {
+                let resolved = try await position.resolve(using: source)
+                await source.close()
+                return resolved
+            } catch { await source.close(); throw error }
+        }
+    }
+
+    private func startHistoryExport() {
+        guard access.isUnlocked, !isPhoneViewerMinimized else { cancelHistoryExport(); return }
+        let credentials = access.session?.unlockedCredentials
+        historyExport.start(destination: CameraPhotoLibraryRecordingDestination()) { metadata in
+            await CameraHistorySources.make(metadata: metadata, client: client, credentials: credentials)
+        }
+    }
+
+    private func cancelHistoryExport() {
+        historyExportVisible = false
+        historyExport.cancel()
     }
 
     private var recordingElapsedTimeLabel: some View {
@@ -2614,6 +2704,7 @@ private struct CameraFullScreenCameraContent: View {
     }
 
     private var recordingAccessibilityValue: String {
+        if historyExport.isBusy { return historyExport.status }
         if recordingControllers.contains(where: { $0.state == .exporting }) {
             return "Exporting recordings"
         }
@@ -2623,7 +2714,7 @@ private struct CameraFullScreenCameraContent: View {
         if recordingHasStarted { return "Recording" }
         if recordingIsActive { return "Starting recording" }
         if recordingErrorMessage != nil { return "Recording unavailable" }
-        return "Not recording"
+        return isLive ? "Not recording" : "Choose an interval to export"
     }
 
     private func startRecording() async {

@@ -59,6 +59,7 @@ struct ServerDetailView: View {
                 VideoView(
                     cameras: cameras,
                     client: connection.client,
+                    server: server,
                     onPresentationChanged: { isShowingCamera = $0 }
                 )
                 .tabItem {

@@ -36,9 +36,9 @@ struct HomeBase_GUIApp: App {
                 .environmentObject(serverStore)
                 .cameraAccessLifecycle(cameraAccess)
 #if os(iOS)
-                .modifier(CameraPhoneSceneLifecycle(access: cameraAccess, pictureInPicture: cameraPiP))
+                .modifier(CameraSceneLifecycle(access: cameraAccess, pictureInPicture: cameraPiP))
 #else
-                .modifier(CameraPhoneSceneLifecycle(access: cameraAccess))
+                .modifier(CameraSceneLifecycle(access: cameraAccess))
 #endif
                 .onChange(of: serverStore.selectedServerID) { _, _ in
 #if os(iOS)
@@ -48,24 +48,45 @@ struct HomeBase_GUIApp: App {
                     cameraAccess.reset()
                 }
         }
+
+#if os(macOS)
+        WindowGroup("Camera", for: CameraWindowRequest.self) { request in
+            if let request = request.wrappedValue {
+                CameraWindowRoot(request: request)
+                    .cameraAccessLifecycle(cameraAccess)
+                    .modifier(CameraSceneLifecycle(access: cameraAccess))
+            }
+        }
+        .defaultSize(width: 960, height: 640)
+        .windowResizability(.contentMinSize)
+#endif
     }
 }
 
-/// Observe the interactive window, not the App's aggregate scene phase: an
-/// external scene remaining active must not keep phone previews/controls alive.
-private struct CameraPhoneSceneLifecycle: ViewModifier {
+/// Observe interactive windows individually so one background window cannot
+/// suspend another window's camera. iOS output accessories remain separate.
+private struct CameraSceneLifecycle: ViewModifier {
     @Environment(\.scenePhase) private var scenePhase
+    @State private var sceneID = UUID()
     let access: CameraAccessLifecycle
 #if os(iOS)
     let pictureInPicture: CameraPictureInPictureController
 #endif
 
     func body(content: Content) -> some View {
-        content.onChange(of: scenePhase) { _, phase in
+        content
+            .onChange(of: scenePhase, initial: true) { _, phase in
 #if os(iOS)
-            pictureInPicture.scenePhaseChanged(phase)
+                pictureInPicture.scenePhaseChanged(phase)
+                access.scenePhaseChanged(phase)
+#else
+                access.scenePhaseChanged(phase, scene: sceneID)
 #endif
-            access.scenePhaseChanged(phase)
-        }
+            }
+#if os(macOS)
+            .onDisappear {
+                access.sceneDisconnected(sceneID)
+            }
+#endif
     }
 }

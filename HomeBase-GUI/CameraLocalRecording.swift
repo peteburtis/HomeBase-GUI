@@ -392,7 +392,7 @@ final class CameraLocalRecordingController: ObservableObject {
         state = .failed(error.localizedDescription)
     }
 
-    private static func filename(
+    static func filename(
         cameraName: String?,
         creationDate: Date
     ) -> String {
@@ -408,7 +408,7 @@ final class CameraLocalRecordingController: ObservableObject {
         return "\(cleanedName.isEmpty ? "Camera" : cleanedName) \(timestamp).mov"
     }
 
-    private static func removeRecordingFile(at url: URL) {
+    static func removeRecordingFile(at url: URL) {
         try? FileManager.default.removeItem(at: url)
         let directory = url.deletingLastPathComponent()
         if directory.lastPathComponent.hasPrefix("HomeBase-Camera-") {

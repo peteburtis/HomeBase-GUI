@@ -17,6 +17,35 @@ final class CameraTimelineTests: XCTestCase {
         )
     }
 
+    func testCalendarInsetRespectsSafeTrailingEdgeWithoutShrinkingTimeline() {
+        let full = CGRect(x: 0, y: 0, width: 852, height: 393)
+        let safe = CGRect(x: 40, y: 0, width: 752, height: 369)
+        XCTAssertEqual(CameraTimelineControlPlacement.trailingInset(in: full, safeBounds: safe), 72)
+        XCTAssertEqual(CameraTimelineControlPlacement.trailingInset(in: safe, safeBounds: safe), 12,
+            "A safe-area-sized portrait timeline must not double-count its inset")
+        XCTAssertEqual(CameraTimelineControlPlacement.trailingInset(in: full, safeBounds: full), 12)
+    }
+
+    func testCalendarDraftSnapshotsPlayheadAndServerEdgeWithoutSeekingOrPausing() async throws {
+        let model = CameraTimelineModel(clock: { 100 })
+        XCTAssertNil(model.dateSelection)
+        await model.open(cameraID: camera, transport: TimelineFetcher())
+        defer { model.close() }
+        let cursor = TimelineFetcher.anchor - 3600.125
+        model.follow(.canonical(cursor, paused: false))
+        let selection = try XCTUnwrap(model.dateSelection)
+        XCTAssertEqual(selection.date.timeIntervalSince1970, cursor)
+        XCTAssertEqual(selection.latestDate.timeIntervalSince1970, TimelineFetcher.anchor,
+            "Use the NVR's edge, not the phone's wall clock")
+        XCTAssertEqual(model.cursor, cursor)
+        XCTAssertFalse(model.dragging)
+        model.follow(.canonical(cursor + 5, paused: false))
+        XCTAssertEqual(selection.date.timeIntervalSince1970, cursor, "An open date draft must not follow playback")
+        XCTAssertEqual(model.cursor, cursor + 5)
+        model.close()
+        XCTAssertNil(model.dateSelection, "A disconnected timeline must resolve its clock again before opening a draft")
+    }
+
     func testFoldPlayheadSitsBeyondReservedDivisionAndItsMargins() {
         let bounds = CGRect(x: 20, y: 40, width: 800, height: 500)
         let vertical = CameraGroupLayout.Division(
@@ -432,6 +461,58 @@ final class CameraTimelineTests: XCTestCase {
     }
 
 #if os(iOS)
+    func testCalendarOverlaysScrubberAtSafeTrailingEdgeInPortraitAndLandscape() async throws {
+        let fetcher = TimelineFetcher(jpeg: try sampleJPEG())
+        var plays: [Date] = []
+        var timelineFrame: CGRect?
+        let host = UIHostingController(rootView: CameraTimelinePlacement(edge: .top) {
+            CameraHistoryTimeline(makeTransport: { fetcher }, cameraID: camera,
+                timeZone: TimeZone(identifier: "America/New_York")!,
+                position: { .canonical(TimelineFetcher.anchor - 3600, paused: true) },
+                onBegin: { XCTFail("Laying out the calendar must not pause playback") },
+                onSeek: { _ in XCTFail("Laying out the calendar must not seek") },
+                onPlayFromDate: { plays.append($0) })
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { timelineFrame = $0 }
+        }.environment(\.scenePhase, .active).background(.black).preferredColorScheme(.dark))
+        host.additionalSafeAreaInsets = UIEdgeInsets(top: 0, left: 24, bottom: 24, right: 60)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host; window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for compact in [true, false] {
+            host.traitOverrides.verticalSizeClass = compact ? .compact : .regular
+            window.frame = CGRect(origin: .zero, size: compact ? CGSize(width: 852, height: 393) : CGSize(width: 393, height: 852))
+            host.view.frame = window.bounds
+            host.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(450))
+            host.view.layoutIfNeeded()
+            let image = UIGraphicsImageRenderer(size: host.view.bounds.size).image { _ in
+                host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+            }
+            let scroll = try XCTUnwrap(findScroll(in: host.view))
+            // SwiftUI can extend the native scroll container into the safe
+            // area. The visible strip, not that UIKit backing, anchors controls.
+            let frame = try XCTUnwrap(timelineFrame)
+            let safe = host.view.safeAreaLayoutGuide.layoutFrame
+            let center = CGPoint(x: safe.maxX - CameraPTZOverlayMetrics.inset - CameraPTZOverlayMetrics.buttonSize / 2,
+                                 y: frame.midY)
+            let calendarHit = try XCTUnwrap(host.view.hitTest(center, with: nil))
+            XCTAssertFalse(calendarHit === scroll || calendarHit.isDescendant(of: scroll),
+                "The centered calendar must receive the touch, not the scrubber beneath it: \(calendarHit); center \(center), safe \(safe), scroll \(frame)")
+            let scrubHit = try XCTUnwrap(host.view.hitTest(CGPoint(x: frame.minX + 20, y: frame.midY), with: nil))
+            XCTAssertTrue(scrubHit === scroll || scrubHit.isDescendant(of: scroll),
+                "The remaining scrubber must stay interactive")
+            XCTAssertEqual(frame.maxX, compact ? host.view.bounds.maxX : safe.maxX, accuracy: 1,
+                "Overlaying the calendar must not narrow the timeline")
+            let attachment = XCTAttachment(image: image)
+            attachment.name = compact ? "Calendar overlay — landscape safe inset" : "Calendar overlay — portrait safe inset"
+            attachment.lifetime = .keepAlways; add(attachment)
+        }
+        XCTAssertTrue(plays.isEmpty)
+        let availability = await fetcher.availability.count
+        XCTAssertEqual(availability, 1, "The calendar shares the timeline clock and does not open another connection")
+    }
+
     func testMountedTimelineShowsTrailingIntervalsBesideShortAndDatedTimestamps() async throws {
         let fetcher = TimelineFetcher(jpeg: try sampleJPEG())
         let recent = floor((TimelineFetcher.anchor - 3600) / 1200) * 1200 + 60
@@ -511,8 +592,12 @@ final class CameraTimelineTests: XCTestCase {
         let host = UIHostingController(rootView: timeline(playhead: nil))
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
+        // Keep every tested marker on screen, including x=620. A phone-sized
+        // window clips this deliberately 800-point-wide fixture's snapshot.
+        window.frame = CGRect(x: 0, y: 0, width: 800, height: 240)
         window.rootViewController = host; window.isHidden = false
         defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
         host.view.layoutIfNeeded()
         try await Task.sleep(for: .milliseconds(500))
         let scroll = try XCTUnwrap(findScroll(in: host.view))
@@ -736,12 +821,14 @@ final class CameraTimelineTests: XCTestCase {
         )
         var position = CameraSwitchPosition.live
         var thumbnailSize = CameraTimelineSizing.standard
+        var timelineFrame: CGRect?
         let layout = TimelineTestLayout()
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let host = UIHostingController(rootView: TimelineTestCanvas(layout: layout).overlay(alignment: .top) {
             TimelineTestPlacement(edge: .top) {
             CameraHistoryTimeline(makeTransport: { fetcher }, cameraID: self.camera, timeZone: TimeZone(secondsFromGMT: 0)!,
                 position: { position }, onBegin: { XCTFail("Initial alignment must not seek") }, onSeek: { _ in XCTFail("Following is not scrubbing") })
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { timelineFrame = $0 }
                 .background(TimelineSizingProbe { thumbnailSize = $0 })
             }
         }.environment(\.scenePhase, .active).preferredColorScheme(.dark))
@@ -761,7 +848,9 @@ final class CameraTimelineTests: XCTestCase {
         XCTAssertGreaterThan(count, 0)
         XCTAssertEqual(scroll.bounds.height, reservedHeight, accuracy: 0.5,
             "Loading and loaded timelines reserve the same height")
-        let landscapeFrame = scroll.convert(scroll.bounds, to: host.view)
+        // UIKit can extend its scroll backing into safe areas; snapshot
+        // assertions concern the visible SwiftUI strip, not that backing.
+        let landscapeFrame = try XCTUnwrap(timelineFrame)
         XCTAssertGreaterThan(host.view.safeAreaInsets.bottom, 0, "Test must have a real protected bottom inset")
         XCTAssertEqual(landscapeFrame.minY, host.view.bounds.minY, accuracy: 1,
             "Compact height ignores the top safe-area inset")
@@ -863,7 +952,7 @@ final class CameraTimelineTests: XCTestCase {
         let regularHeight = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
             host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
         }
-        let regularFrame = scroll.convert(scroll.bounds, to: host.view)
+        let regularFrame = try XCTUnwrap(timelineFrame)
         XCTAssertEqual(regularFrame.minY, host.view.safeAreaLayoutGuide.layoutFrame.minY, accuracy: 1)
         XCTAssertEqual(regularFrame.minX, host.view.safeAreaLayoutGuide.layoutFrame.minX, accuracy: 1)
         XCTAssertEqual(regularFrame.maxX, host.view.safeAreaLayoutGuide.layoutFrame.maxX, accuracy: 1)
@@ -878,7 +967,7 @@ final class CameraTimelineTests: XCTestCase {
         let portraitAttachment = XCTAttachment(image: portrait)
         portraitAttachment.name = "Timeline in Portrait — top safe area retained"
         portraitAttachment.lifetime = .keepAlways; add(portraitAttachment)
-        let portraitFrame = scroll.convert(scroll.bounds, to: host.view)
+        let portraitFrame = try XCTUnwrap(timelineFrame)
         XCTAssertEqual(portraitFrame.minY, host.view.safeAreaLayoutGuide.layoutFrame.minY, accuracy: 1)
         XCTAssertEqual(portraitFrame.minX, host.view.safeAreaLayoutGuide.layoutFrame.minX, accuracy: 1)
         XCTAssertEqual(portraitFrame.maxX, host.view.safeAreaLayoutGuide.layoutFrame.maxX, accuracy: 1)

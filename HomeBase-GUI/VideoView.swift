@@ -12,10 +12,13 @@ struct VideoView: View {
 #if os(iOS)
     @Environment(\.cameraViewerPresentation) private var viewer
     @Environment(\.cameraViewerIsPresented) private var viewerIsPresented
+#elseif os(macOS)
+    @Environment(\.openWindow) private var openWindow
 #endif
 
     let cameras: [CameraVideoDevice]
     let client: HomeBaseWebSocketClient
+    let server: PairedServer?
     var onPresentationChanged: (Bool) -> Void = { _ in }
     @StateObject private var previews: CameraGridPreviewModel
     @State private var selectedCamera: CameraVideoDevice?
@@ -23,10 +26,12 @@ struct VideoView: View {
     init(
         cameras: [CameraVideoDevice],
         client: HomeBaseWebSocketClient,
+        server: PairedServer? = nil,
         onPresentationChanged: @escaping (Bool) -> Void = { _ in }
     ) {
         self.cameras = cameras
         self.client = client
+        self.server = server
         self.onPresentationChanged = onPresentationChanged
         _previews = StateObject(wrappedValue: CameraGridPreviewModel(client: client))
     }
@@ -63,10 +68,6 @@ struct VideoView: View {
         .fullScreenCover(item: $selectedCamera) { camera in
             fullScreenVideo(for: camera)
         }
-#else
-        .sheet(item: $selectedCamera) { camera in
-            fullScreenVideo(for: camera)
-        }
 #endif
         .onChange(of: selectedCamera?.id) { _, identifier in
             onPresentationChanged(identifier != nil)
@@ -99,16 +100,19 @@ struct VideoView: View {
     ) -> some View {
         Button {
             guard access.isUnlocked, access.session?.isUnlocked != false else { return }
+#if os(macOS)
+            guard let server else { return }
+            openWindow(value: CameraWindowRequest(server: server, camera: camera))
+#else
             // Retain the camera-section lease before presentation can obscure
             // its parent; don't depend on onChange/onDisappear callback order.
             onPresentationChanged(true)
-#if os(iOS)
             if let viewer {
                 viewer.open(device: camera.device, quality: camera.capability.fullScreenQuality, client: client)
                 return
             }
-#endif
             selectedCamera = camera
+#endif
         } label: {
             VStack(alignment: .leading, spacing: 0) {
                 CameraProtectedPreview(access: access) {
@@ -144,7 +148,7 @@ struct VideoView: View {
         .accessibilityAddTraits(access.isUnlocked ? .isButton : .isStaticText)
         .accessibilityLabel(camera.device.displayName)
         .accessibilityHint(access.isUnlocked
-            ? "Opens camera controls and full-screen video"
+            ? cameraAccessibilityHint
             : (access.showsUnlockRecovery ? "Locked. Use Unlock to authenticate." : "Camera preview hidden during authentication."))
     }
 
@@ -176,6 +180,14 @@ struct VideoView: View {
         viewerIsPresented || viewer?.request != nil
 #else
         false
+#endif
+    }
+
+    private var cameraAccessibilityHint: String {
+#if os(macOS)
+        "Opens camera controls and video in a dedicated window"
+#else
+        "Opens camera controls and full-screen video"
 #endif
     }
 }

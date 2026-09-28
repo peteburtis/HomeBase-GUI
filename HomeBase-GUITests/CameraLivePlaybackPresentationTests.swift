@@ -423,7 +423,7 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
             "History transport moves together to the toolbar without leaving an overflow menu")
         XCTAssertTrue(historyCompactWidth.playbackControlsInBottomTrailing)
         XCTAssertFalse(historyCompactWidth.navigationItemsInBottomToolbar)
-        XCTAssertFalse(historyCompactWidth.recordInTrailingNavigationBar)
+        XCTAssertTrue(historyCompactWidth.recordInTrailingNavigationBar, "History export occupies the Live recording slot")
         XCTAssertFalse(historyCompactWidth.recordInBottomTrailing)
 
         let liveCompactHeight = CameraToolbarArrangement(
@@ -456,6 +456,8 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
         )
         XCTAssertTrue(historyCompactHeight.navigationItemsInBottomToolbar)
         XCTAssertFalse(historyCompactHeight.playbackControlsInOverflow)
+        XCTAssertTrue(historyCompactHeight.recordInBottomTrailing)
+        XCTAssertFalse(historyCompactHeight.recordInTrailingNavigationBar)
 
         let fullyCompactHistory = CameraToolbarArrangement(
             isLive: false,
@@ -676,6 +678,48 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
         XCTAssertTrue(selections.isEmpty)
         host.dismiss(animated: false)
         XCTAssertTrue(selections.isEmpty)
+    }
+
+    func testCalendarDatePickerShowsPlayAndUsesNativeCompactDateControls() async throws {
+        var selections: [Date] = []
+        let selection = CameraHistoryDateSelection(date: Date(timeIntervalSince1970: 1_790_439_635),
+            latestDate: Date(timeIntervalSince1970: 1_790_440_000))
+        let host = UIHostingController(rootView: CameraHistoryDatePicker(selection: selection) { selections.append($0) }
+            .environment(\.timeZone, TimeZone(identifier: "America/New_York")!))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = host; window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        try await Task.sleep(for: .milliseconds(150))
+        let size = host.sizeThatFits(in: CGSize(width: 340, height: 400))
+        host.view.bounds = CGRect(origin: .zero, size: size)
+        host.view.layoutIfNeeded()
+        let image = UIGraphicsImageRenderer(size: size).image { _ in
+            host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+        }
+        let attachment = XCTAttachment(image: image)
+        attachment.name = "Calendar date and time — Play only"
+        attachment.lifetime = .keepAlways; add(attachment)
+        XCTAssertTrue(selections.isEmpty)
+    }
+
+    func testCalendarButtonTouchTargetDoesNotFallThroughToVideo() async throws {
+        let host = UIHostingController(rootView: ZStack {
+            CameraLiveGestureSurface(videoVisible: true, cameraControlsEnabled: true,
+                onPan: { _, _, _ in }, onMagnify: nil, onSingleTap: {}, onTwoFingerTap: {})
+            CameraHistoryCalendarButton(selection: { .init(date: .now) }, timeZone: .current,
+                isEnabled: true, onPlay: { _ in XCTFail("Layout must not seek") })
+        }.ignoresSafeArea().environment(\.scenePhase, .active))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 600, height: 240)
+        window.rootViewController = host; window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        try await Task.sleep(for: .milliseconds(100))
+        host.view.layoutIfNeeded()
+        let center = CGPoint(x: host.view.bounds.midX, y: host.view.bounds.midY)
+        XCTAssertFalse(host.view.hitTest(center, with: nil) is CameraLiveGestureUIView)
     }
 }
 

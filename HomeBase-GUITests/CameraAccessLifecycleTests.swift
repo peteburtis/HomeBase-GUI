@@ -84,6 +84,43 @@ final class CameraAccessLifecycleTests: XCTestCase {
         XCTAssertEqual(auth.calls, 2)
     }
 
+    func testBackgroundBrowserWindowDoesNotSuspendActiveCameraWindow() async {
+        let auth = CameraPageTestAuthenticator()
+        let session = CameraAccessSession(
+            credentials: CameraPageTestCredentials(),
+            authenticator: auth,
+            environment: .device
+        )
+        let lifecycle = CameraAccessLifecycle(session: session)
+        let cameraOwner = UUID()
+        let browserScene = UUID()
+        let cameraScene = UUID()
+
+        lifecycle.scenePhaseChanged(.active, scene: browserScene)
+        lifecycle.scenePhaseChanged(.active, scene: cameraScene)
+        lifecycle.setActive(true, owner: cameraOwner)
+        await settle(session)
+
+        lifecycle.scenePhaseChanged(.background, scene: browserScene)
+        XCTAssertTrue(session.isUnlocked)
+        XCTAssertFalse(session.streamsSuspended)
+        XCTAssertEqual(auth.calls, 1)
+
+        lifecycle.scenePhaseChanged(.background, scene: cameraScene)
+        XCTAssertFalse(session.isUnlocked)
+        XCTAssertTrue(session.streamsSuspended)
+
+        lifecycle.scenePhaseChanged(.active, scene: cameraScene)
+        await settle(session)
+        XCTAssertTrue(session.isUnlocked)
+        XCTAssertFalse(session.streamsSuspended)
+        XCTAssertEqual(auth.calls, 2)
+
+        lifecycle.sceneDisconnected(cameraScene)
+        XCTAssertFalse(session.isUnlocked)
+        XCTAssertTrue(session.streamsSuspended)
+    }
+
     func testLastCameraOwnerLeavingClearsSecretsButOneOwnerLeavingDoesNot() async {
         let credentials = CameraPageTestCredentials(presence: .biometricProtected)
         let session = CameraAccessSession(credentials: credentials, authenticator: CameraPageTestAuthenticator(), environment: .device)

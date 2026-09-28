@@ -241,17 +241,44 @@ screen still ends its session and releases its buffers.
   history/cache boundary only buffers; it does not reset the selected speed.
   The existing explicit Forward-30 behavior is unchanged, and skips still mean
   30 seconds of footage at every speed.
-- Record to Photos is available only in Live mode. Shuttle/Live controls stay
-  visible but disabled while requesting Photos authorization, starting/saving a
-  recording, or recording. The status/timer is shown beneath the navigation bar.
-  In regular width, Record remains in the bottom toolbar during buffered/history
-  playback, disabled rather than removed. In compact width it is hidden outside
-  Live. Quality, day/night, and privacy are absent when
+- Record is available in Live mode. In History, **Export history** occupies the
+  same toolbar slot (including compact-height layouts). It opens a range popover
+  initialized to the exact playhead at the button tap; a buffered playhead is
+  resolved against the NVR clock without advancing the snapshot. Choose an
+  editable start and either an end date/time or hours/minutes duration. The
+  default duration is one minute, with a 24-hour limit per export. Times use the
+  NVR's advertised time zone. No seek, NVR recording change, or Photos write is
+  caused by opening or dismissing the popover.
+  Export reads existing NVR footage through independent, bounded 10-second
+  requests, with the same unlocked S3 fallback as playback. It does not wait for
+  future footage or rely on the live connection. Visible cameras export together;
+  focusing a pane exports only that camera. Cameras without recorded history
+  are reported. Each movie begins at a preceding available keyframe, potentially
+  earlier than the requested start, and ends at the requested end. Repeated GOP
+  preroll is deduplicated across requests when the shared encoded frame is
+  identified (allowing a source tick of timestamp rounding). Compatible chunks
+  concatenate end-to-end on a movie-local clock, retaining timing inside each
+  chunk. Recording gaps, one-frame timing mismatches and clock-epoch changes do
+  not split files or insert wall-clock pauses; the exported running time may be
+  shorter than the requested interval. Only incompatible decoder formats create
+  separate clips. Unidentified decoder prefixes retain their keyframe rather
+  than discarding dependent frames to trim an apparent clock overlap. Missing
+  coverage is still reported in the save popover. No transcoding or
+  audio synthesis occurs. Unknown coverage/network failures fail the export
+  rather than silently saving a truncated success.
+  Completion uses the same **Save to Photos / Save to Files / Share / Delete**
+  popover as live recording. Export progress is cancellable; closing/minimizing
+  the viewer, backgrounding, or revoking camera access cancels in-flight exports
+  and removes their temporary files. Keep the viewer open until completion.
+  Playback/camera-switch controls are hidden while choosing/exporting/saving a
+  clip; the playback reader and its cursor are not repurposed for export.
+  Quality, day/night, and privacy are absent when
   unavailable, including outside Live; invalid/disconnected day/night and privacy
   controls are hidden, and quality is hidden while Photos recording locks stream
   configuration. Pending day/night or privacy writes retain their brief disabled
   state to prevent duplicate actions without making the button disappear mid-use.
-  Capability-based omissions still apply, including no Photos recording with two or more cameras selected.
+  Capability-based omissions still apply; history export requires an advertised
+  history source for at least one visible camera.
   Camera switching remains available in history. PTZ sliders and their button are hidden outside
   Live; pan, pinch, and recenter gestures are disabled there,
   including the recenter accessibility action, and pending writes are cancelled.
@@ -324,8 +351,8 @@ toolbar control remains available in Multiple mode. A quality change applies to
 all selected cameras; cameras added later open directly at the selected quality.
 The menu offers qualities supported by every selected camera. Adding a camera
 that cannot use the selected quality reports that incompatibility instead of
-silently changing the existing cameras. Two or more selected cameras hide Photos recording
-controls. For two through four cameras, layout compares the existing vertical
+silently changing the existing cameras. Recording and history export save a
+separate movie for each visible camera. For two through four cameras, layout compares the existing vertical
 column and grid candidates at the available canvas size, using each selected
 camera's current picture aspect ratio (16:9 only until configuration arrives),
 and chooses whichever gives the group the larger total rendered picture area.
@@ -579,6 +606,20 @@ uses canonical time; labels use Homebase's time zone, with the existing local-zo
 fallback. VoiceOver's adjustable action moves twenty minutes in either direction.
 Multi-camera uses the first selected camera for previews and moves every selected
 camera together on the shared timeline.
+
+A circular glass **calendar** button overlays the trailing side of the scrubber,
+vertically centered on the strip. It is not a toolbar item and does not reserve
+space or change the timeline's scrolling geometry. It stays twelve points inside
+the trailing safe edge, including when the compact-height strip itself runs
+full-width under the safe-area insets. The button opens a date/time popover in
+the camera's time zone, initialized to the current playhead and bounded by the
+NVR-derived live edge. **Play** seeks the camera/group to the chosen instant and
+resumes playback, even if it was paused before opening. Opening, editing, or
+tapping outside to dismiss does not pause or seek. The popover shows only the
+native date/time controls and Play, without a heading, visible label, or Cancel button.
+The button waits for timeline clock resolution and respects the same playback
+interaction locks as the scrubber. Backgrounding or disabling playback dismisses
+the popover without committing its draft.
 
 Only the visible cells plus a small margin are requested, nearest first, as
 320×180-bounded JPEGs over a separate media WebSocket. This does not compete with
@@ -1089,8 +1130,8 @@ playing, confirming no playback state changes. In portrait, allow the system's
 native navigation-bar adaptation; there is no bespoke row layout.
 Seek to an empty time and use the gap arrows to find the preceding/following
 recording; missing directions are absent and paused jumps remain paused.
-Pause: speed appears in the bottom toolbar. In regular width, Record stays in the
-bottom toolbar but is disabled; in compact width, Record is hidden. Quality,
+Pause: speed appears in the bottom toolbar and Record becomes Export history in
+the same slot. Quality,
 day/night, privacy, and PTZ controls disappear. Camera gestures do not move the camera. Camera
 switching remains usable. After five seconds, Forward 30 should show the newest
 frame but remain paused as new frames arrive. Play, then Forward 30: this resumes
@@ -1110,3 +1151,20 @@ and pause state should carry across. With no destination NVR, expect Live instea
 Start a Photos recording and confirm the list button stays visible but disabled
 until the recording finishes saving. The shuttles stay visible but disabled too,
 and the recording timer/save status appears beneath the navigation bar.
+
+History export checks: pause or seek to a recognizable frame, open Export history,
+and confirm the start remains that playhead even while playback continues. Try
+both duration and end date/time (including a date boundary), cancel, and confirm
+the video position and NVR recording state are untouched. Export across a shard
+boundary and check that the movie starts at the previous keyframe without a
+repeated GOP. Check a recording gap, an unavailable camera in a matrix, a focused
+single pane, and a network interruption. Save with Photos, Files, and Share;
+cancel the system picker and verify the export options return. Rotate while the
+range form is open: its content should scroll in short landscape height. Cancel,
+close, background, and revoke access during a long export; it must stop without
+presenting a late save dialog. `CameraHistoryExportTests` cover the frozen cursor,
+range validation, real H.264/HEVC MOV decoding and endpoint clipping, chunk
+deduplication, shard rebasing, concatenation across gaps/epochs/rounding and
+one-frame discontinuities, a three-hour/1,080-chunk single-file export, genuine
+codec-change splits, failure/cancellation cleanup, native
+range layouts, and deferred Photos access.
