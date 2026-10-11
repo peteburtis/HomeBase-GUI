@@ -22,6 +22,7 @@ struct ServerDetailView: View {
     @StateObject private var connection: ServerConnectionModel
     @State private var selectedTab: Tab = .home
     @State private var isShowingCamera = false
+    @State private var homeDetailSelection: TopologyDetailDestination?
 
     init(
         server: PairedServer,
@@ -34,21 +35,39 @@ struct ServerDetailView: View {
         )
     }
 
+    init(
+        server: PairedServer,
+        connection: ServerConnectionModel,
+        showServers: @escaping () -> Void
+    ) {
+        self.server = server
+        self.showServers = showServers
+        _connection = StateObject(wrappedValue: connection)
+    }
+
     var body: some View {
         let cameras = CameraVideoCatalog.cameras(
             in: connection.topology.devices
         )
 
         TabView(selection: $selectedTab) {
-            NavigationStack {
-                homeView
-                    .toolbar {
-                        ToolbarItem(placement: .navigation) {
-                            Button("Servers", systemImage: "list.bullet") {
-                                showServers()
+            NavigationSplitView {
+                NavigationStack {
+                    homeView
+                        .toolbar {
+                            ToolbarItem(placement: .navigation) {
+                                Button("Servers", systemImage: "list.bullet") {
+                                    showServers()
+                                }
                             }
                         }
-                    }
+                }
+            } detail: {
+                TopologyDetailDestinationView(
+                    selection: homeDetailSelection,
+                    topology: connection.presentedTopology,
+                    client: connection.client
+                )
             }
                 .tabItem {
                     Label("Home", systemImage: "house")
@@ -139,7 +158,7 @@ struct ServerDetailView: View {
             $0.metadata.hasHiddenFlag
         }
 
-        return List {
+        return List(selection: $homeDetailSelection) {
             Section {
                 if visibleRooms.isEmpty {
                     Text(emptyRoomsMessage)
@@ -150,7 +169,8 @@ struct ServerDetailView: View {
                             RoomDetailView(
                                 room: room,
                                 topology: topology,
-                                client: connection.client
+                                client: connection.client,
+                                selection: $homeDetailSelection
                             )
                         } label: {
                             TopologyRowLabel(
@@ -163,6 +183,9 @@ struct ServerDetailView: View {
                                 )
                             )
                         }
+#if os(iOS) || os(visionOS)
+                        .isDetailLink(false)
+#endif
                     }
                 }
             } header: {
@@ -175,7 +198,8 @@ struct ServerDetailView: View {
                         emptyMessage: "No devices are available.",
                         items: topLevelDeviceItems,
                         topology: topology,
-                        client: connection.client
+                        client: connection.client,
+                        selection: $homeDetailSelection
                     )
                 }
             }
@@ -187,11 +211,15 @@ struct ServerDetailView: View {
                             GroupDetailView(
                                 group: group,
                                 topology: topology,
-                                client: connection.client
+                                client: connection.client,
+                                selection: $homeDetailSelection
                             )
                         } label: {
                             TopologyGroupRow(group: group)
                         }
+#if os(iOS) || os(visionOS)
+                        .isDetailLink(false)
+#endif
                     }
                 } header: {
                     Text("Groups")
@@ -208,7 +236,8 @@ struct ServerDetailView: View {
                             deviceItems: hiddenTopLevelDeviceItems,
                             groups: hiddenTopLevelGroups,
                             topology: topology,
-                            client: connection.client
+                            client: connection.client,
+                            selection: $homeDetailSelection
                         )
                     } label: {
                         HiddenItemsRowLabel(
@@ -218,6 +247,9 @@ struct ServerDetailView: View {
                                 + hiddenTopLevelGroups.count
                         )
                     }
+#if os(iOS) || os(visionOS)
+                    .isDetailLink(false)
+#endif
                 }
             }
         }
@@ -288,8 +320,12 @@ final class ServerConnectionModel: ObservableObject {
 
     let client: HomeBaseWebSocketClient
 
-    init(endpoint: HomeBaseEndpoint) {
-        client = HomeBaseWebSocketClient(endpoint: endpoint)
+    convenience init(endpoint: HomeBaseEndpoint) {
+        self.init(client: HomeBaseWebSocketClient(endpoint: endpoint))
+    }
+
+    init(client: HomeBaseWebSocketClient) {
+        self.client = client
     }
 
     deinit {
