@@ -24,6 +24,7 @@ extension AutomationActionTypeRegistry {
             .full(SceneActivateActionPlugin()),
             .presentation(BuiltInActionPresentationPlugin(.sceneClear)),
             .presentation(BuiltInActionPresentationPlugin(.sceneClearAll)),
+            .presentation(BuiltInActionPresentationPlugin(.overlayGroupClear)),
             .presentation(BuiltInActionPresentationPlugin(.sceneToggle)),
             .presentation(BuiltInActionPresentationPlugin(.sceneSetBetween)),
             .presentation(BuiltInActionPresentationPlugin(.sequenceSet)),

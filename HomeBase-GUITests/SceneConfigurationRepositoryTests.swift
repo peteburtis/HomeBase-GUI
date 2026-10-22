@@ -26,6 +26,22 @@ final class SceneConfigurationRepositoryTests: XCTestCase {
         XCTAssertTrue(client.events.isEmpty)
     }
 
+    func testRevertedOverlayGroupPerformsNoRemoteOperations() async throws {
+        let source = sceneSource(value: 0.25)
+        let client = SceneConfigurationRemoteClientSpy(
+            files: ["scenes/Evening.json": source]
+        )
+        let repository = SceneConfigurationRepository(client: client)
+        var draft = try makeDraft(source: source)
+        try draft.setOverlayGroup("Ambience")
+        try draft.setOverlayGroup(nil)
+        let outcome = try await repository.save(draft)
+        guard case .unchanged = outcome else {
+            return XCTFail("A reverted group must not save")
+        }
+        XCTAssertTrue(client.events.isEmpty)
+    }
+
     func testNewSceneCreatesReloadsAndVerifiesDerivedFile() async throws {
         let client = SceneConfigurationRemoteClientSpy(files: [:])
         let repository = SceneConfigurationRepository(client: client)

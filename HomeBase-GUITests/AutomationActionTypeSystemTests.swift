@@ -10,7 +10,7 @@ import XCTest
 @MainActor
 final class AutomationActionTypeSystemTests: XCTestCase {
     func testStandardRegistryResolvesEveryBuiltInActionAndFallsBackToRawJSON() {
-        XCTAssertEqual(BuiltInAutomationActionKind.allCases.count, 13)
+        XCTAssertEqual(BuiltInAutomationActionKind.allCases.count, 14)
 
         for kind in BuiltInAutomationActionKind.allCases {
             let resolution = AutomationActionTypeRegistry.standard.resolve(
@@ -192,6 +192,11 @@ final class AutomationActionTypeSystemTests: XCTestCase {
                     title: "Deactivate Scenes",
                     detail: "All global scenes except Evening and Night"
                 )
+            ),
+            (
+                "OverlayGroupClear",
+                "Ambience",
+                .init(title: "Clear Overlay Group", detail: "Ambience")
             ),
             (
                 "SceneToggle",

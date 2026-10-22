@@ -8,6 +8,22 @@ import XCTest
 @testable import HomeBase_GUI
 
 final class SceneConfigurationDocumentTests: XCTestCase {
+    func testOverlayGroupChangeAndRevertPreservesSemanticBaseline() throws {
+        let document = try RemoteJSONDocument(
+            path: "scenes/Evening.json",
+            source: #"{"Identifier":"Evening","OverlayGroup":"Ambience","Actions":[],"Future":true}"#
+        )
+        let scene = try SceneConfigurationCatalog(documents: [document]).scene(named: "Evening")
+        var draft = SceneConfigurationDraft(scene: scene)
+        XCTAssertEqual(scene.overlayGroup, "Ambience")
+        XCTAssertFalse(draft.isDirty)
+        try draft.setOverlayGroup("Task")
+        XCTAssertTrue(draft.isDirty)
+        try draft.setOverlayGroup("Ambience")
+        XCTAssertFalse(draft.isDirty)
+        XCTAssertEqual(draft.scene.fields["Future"], .bool(true))
+    }
+
     func testSingleObjectSceneRetainsSourceAndUnknownContent() throws {
         let source = """
         {

@@ -326,6 +326,19 @@ private struct SceneConfigurationContents: View {
                                 model.identifierValidationMessage
                         )
                         SceneConfigurationEditableTextRow(
+                            label: "Overlay group",
+                            text: Binding(
+                                get: { model.overlayGroupInput },
+                                set: model.setOverlayGroupInput
+                            ),
+                            prompt: "None",
+                            kind: .identifier,
+                            validationMessage: nil
+                        )
+                        Text("Activating this scene replaces the active selection in its group. Applying it to the baseline leaves the group unchanged.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        SceneConfigurationEditableTextRow(
                             label: "Priority",
                             text: Binding(
                                 get: { model.priorityInput },
@@ -742,6 +755,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
     @Published private(set) var saveConfirmation: String?
     @Published private(set) var identifierInput = ""
     @Published private(set) var priorityInput = ""
+    @Published private(set) var overlayGroupInput = ""
     @Published private(set) var timingInput = ""
     @Published var presentedAlert: SceneEditorAlert?
 
@@ -1109,6 +1123,14 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         saveConfirmation = nil
         updateSceneMetadata { draft in
             try draft.setIdentifier(input)
+        }
+    }
+
+    func setOverlayGroupInput(_ input: String) {
+        overlayGroupInput = input
+        saveConfirmation = nil
+        updateSceneMetadata { draft in
+            try draft.setOverlayGroup(input)
         }
     }
 
@@ -1648,6 +1670,7 @@ private final class SceneConfigurationDetailModel: AutomationActionEditingModel 
         from scene: SceneConfigurationDocument
     ) {
         identifierInput = scene.identifier ?? ""
+        overlayGroupInput = scene.overlayGroup ?? ""
         priorityInput = scene.fields["Priority"]?.compactConfigurationJSON
             ?? ""
         timingInput = scene.fields["Timing"]?.compactConfigurationJSON ?? ""

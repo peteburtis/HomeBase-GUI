@@ -346,6 +346,7 @@ enum BuiltInAutomationActionKind: String, CaseIterable, Sendable {
     case sceneActivate = "SceneActivate"
     case sceneClear = "SceneClear"
     case sceneClearAll = "SceneClearAll"
+    case overlayGroupClear = "OverlayGroupClear"
     case sceneToggle = "SceneToggle"
     case sceneSetBetween = "SceneSetBetween"
     case sequenceSet = "SequenceSet"
@@ -362,6 +363,7 @@ enum BuiltInAutomationActionKind: String, CaseIterable, Sendable {
         case .sceneActivate: "scene-activate"
         case .sceneClear: "scene-clear"
         case .sceneClearAll: "scene-clear-all"
+        case .overlayGroupClear: "overlay-group-clear"
         case .sceneToggle: "scene-toggle"
         case .sceneSetBetween: "scene-set-between"
         case .sequenceSet: "sequence-set"
@@ -380,6 +382,7 @@ enum BuiltInAutomationActionKind: String, CaseIterable, Sendable {
         case .sceneActivate: "Activate Scene"
         case .sceneClear: "Deactivate Scene"
         case .sceneClearAll: "Deactivate Scenes"
+        case .overlayGroupClear: "Clear Overlay Group"
         case .sceneToggle: "Toggle Scene"
         case .sceneSetBetween: "Blend Scenes"
         case .sequenceSet: "Run Sequence"
@@ -396,7 +399,7 @@ enum BuiltInAutomationActionKind: String, CaseIterable, Sendable {
         case .wait: "clock"
         case .sceneApply: "sparkles"
         case .sceneActivate: "sparkles.rectangle.stack"
-        case .sceneClear, .sceneClearAll: "sparkles.square.filled.on.square"
+        case .sceneClear, .sceneClearAll, .overlayGroupClear: "sparkles.square.filled.on.square"
         case .sceneToggle: "arrow.triangle.2.circlepath"
         case .sceneSetBetween: "slider.horizontal.below.square.filled.and.square"
         case .sequenceSet: "list.number"
@@ -408,7 +411,7 @@ enum BuiltInAutomationActionKind: String, CaseIterable, Sendable {
         switch self {
         case .sceneActivate:
             .overlayMode
-        case .sceneClear, .sceneClearAll, .sceneToggle:
+        case .sceneClear, .sceneClearAll, .overlayGroupClear, .sceneToggle:
             .triggerMode
         default:
             .all
@@ -480,6 +483,8 @@ struct BuiltInActionPresentationPlugin: AutomationActionPresentationPlugin {
             )
         case .sceneClearAll:
             return sceneClearAllDetail(payload)
+        case .overlayGroupClear:
+            return nonemptyString(payload)
         case .sceneToggle:
             return sceneInvocationDetail(
                 payload,
@@ -503,14 +508,11 @@ private struct AutomationControlCommandPresentation {
 
 private struct AutomationControlActionOptions {
     let clearsOverride: Bool
-    let deactivatesConflictingScenes: Bool
 
     var detailParts: [String] {
         var parts: [String] = []
         if clearsOverride { parts.append("clears override") }
-        if deactivatesConflictingScenes {
-            parts.append("deactivates conflicting scenes")
-        }
+
         return parts
     }
 }
@@ -523,8 +525,7 @@ private func controlSetDetail(_ payload: HBJSONValue) -> String? {
           let command = controlCommand(values[2]),
           let trailing = controlTrailing(Array(values.dropFirst(3))),
           !((command.value.kind == .random || command.value.kind == .cycle)
-              && (trailing.options.clearsOverride
-                  || trailing.options.deactivatesConflictingScenes)) else {
+              && trailing.options.clearsOverride) else {
         return nil
     }
     var parts = [
@@ -566,8 +567,7 @@ private func controlHoldDetail(_ payload: HBJSONValue) -> String? {
           let name = values[3].stringValue,
           let trailing = controlTrailing(Array(values.dropFirst(4))),
           !(command.value.kind == .random
-              && (trailing.options.clearsOverride
-                  || trailing.options.deactivatesConflictingScenes)) else {
+              && trailing.options.clearsOverride) else {
         return nil
     }
     var parts = [
@@ -635,24 +635,19 @@ private func controlOptions(
 ) -> AutomationControlActionOptions? {
     guard let value else {
         return AutomationControlActionOptions(
-            clearsOverride: false,
-            deactivatesConflictingScenes: false
+            clearsOverride: false
         )
     }
     guard let fields = value.objectValue,
           Set(fields.keys).isSubset(
-              of: ["ClearsOverride", "DeactivatesConflictingScenes"]
+              of: ["ClearsOverride"]
           ),
           fields["ClearsOverride"] == nil
-              || fields["ClearsOverride"]?.boolValue != nil,
-          fields["DeactivatesConflictingScenes"] == nil
-              || fields["DeactivatesConflictingScenes"]?.boolValue != nil else {
+              || fields["ClearsOverride"]?.boolValue != nil else {
         return nil
     }
     return AutomationControlActionOptions(
-        clearsOverride: fields["ClearsOverride"]?.boolValue ?? false,
-        deactivatesConflictingScenes:
-            fields["DeactivatesConflictingScenes"]?.boolValue ?? false
+        clearsOverride: fields["ClearsOverride"]?.boolValue ?? false
     )
 }
 

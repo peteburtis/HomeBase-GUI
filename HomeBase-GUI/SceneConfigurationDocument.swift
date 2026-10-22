@@ -27,6 +27,8 @@ struct SceneConfigurationDocument: Identifiable, Equatable, Sendable {
         fields["Priority"]?.integerValue
     }
 
+    var overlayGroup: String? { fields["OverlayGroup"]?.stringValue }
+
     var timing: Double? {
         fields["Timing"]?.numberValue
     }
@@ -44,6 +46,7 @@ struct SceneConfigurationDocument: Identifiable, Equatable, Sendable {
                 $0.key != "Identifier"
                     && $0.key != "Priority"
                     && $0.key != "Timing"
+                    && $0.key != "OverlayGroup"
                     && $0.key != "Actions"
             }
             .sorted { left, right in
@@ -282,6 +285,13 @@ struct SceneConfigurationDraft: Equatable, Sendable {
             "Priority",
             value: priority.map { .integer(Int64($0)) }
         )
+    }
+
+    mutating func setOverlayGroup(_ group: String?) throws {
+        let value = group?.trimmingCharacters(in: .whitespacesAndNewlines)
+        try setSceneField("OverlayGroup", value: value.flatMap {
+            $0.isEmpty ? nil : HBJSONValue.string($0)
+        })
     }
 
     mutating func setTiming(_ timing: Double?) throws {
