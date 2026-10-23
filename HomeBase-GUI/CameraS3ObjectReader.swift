@@ -10,7 +10,18 @@ import ClientRuntime
 
 nonisolated protocol CameraS3ObjectReading: Sendable {
     func read(key: String, maximumBytes: Int) async throws -> Data
+    func list(prefix: String, continuationToken: String?) async throws -> CameraS3ObjectPage?
     func close() async
+}
+
+extension CameraS3ObjectReading {
+    // Existing GET-only sources remain usable without an availability inventory.
+    func list(prefix: String, continuationToken: String?) async throws -> CameraS3ObjectPage? { nil }
+}
+
+nonisolated struct CameraS3ObjectPage: Sendable {
+    let keys: [String]
+    let next: String?
 }
 
 nonisolated enum CameraS3ReadError: Error, LocalizedError, Equatable {
@@ -48,18 +59,22 @@ nonisolated enum CameraS3ReadError: Error, LocalizedError, Equatable {
     }
 }
 
-/// GetObject is the only supported operation. Explicit credentials are scoped
+/// Object reads and optional prefix-scoped listings. Explicit credentials are scoped
 /// to one advertised store; there is no AWS-file/environment credential chain,
-/// bucket listing, remote credential validation, or persistent response cache.
+/// remote credential validation, or persistent response cache.
 actor CameraS3ObjectReader: CameraS3ObjectReading {
     typealias Fetch = @Sendable (HBCameraPlaybackMetadata.S3Store, CameraS3Credentials, String, Int) async throws -> Data
+    typealias List = @Sendable (HBCameraPlaybackMetadata.S3Store, CameraS3Credentials, String, String?) async throws -> CameraS3ObjectPage
     private let destination: HBCameraPlaybackMetadata.S3Store
     private var credentials: CameraS3Credentials?
     private let fetch: Fetch
+    private let listing: List
     private var closed = false
     private var tasks: [UUID: Task<Data, Error>] = [:]
+    private var listTasks: [UUID: Task<CameraS3ObjectPage, Error>] = [:]
 
     init(destination: HBCameraPlaybackMetadata.S3Store, credentials: CameraS3Credentials,
+         listing: @escaping List = CameraS3ObjectReader.listFromAWS,
          fetch: @escaping Fetch = CameraS3ObjectReader.fetchFromAWS) throws {
         try CameraS3ReadScope.validate(destination: destination, credentials: credentials)
         self.destination = destination
@@ -67,6 +82,7 @@ actor CameraS3ObjectReader: CameraS3ObjectReading {
         self.credentials = CameraS3Credentials(destinationID: credentials.destinationID,
             accessKeyID: credentials.accessKeyID, secretAccessKey: credentials.secretAccessKey, encryptionPassword: nil)
         self.fetch = fetch
+        self.listing = listing
     }
 
     func read(key: String, maximumBytes: Int) async throws -> Data {
@@ -91,11 +107,51 @@ actor CameraS3ObjectReader: CameraS3ObjectReading {
         } catch { throw CameraS3ReadError.sanitized(error) }
     }
 
+    func list(prefix: String, continuationToken: String?) async throws -> CameraS3ObjectPage? {
+        guard !closed, let credentials else { throw CameraS3ReadError.closed }
+        try Task.checkCancellation()
+        try CameraS3ReadScope.validate(listPrefix: prefix, destination: destination)
+        guard continuationToken.map({ !$0.isEmpty && $0.utf8.count <= 16384 }) ?? true else {
+            throw CameraS3ReadError.invalidKey
+        }
+        let id = UUID()
+        let task = Task.detached(priority: .userInitiated) { [destination, credentials, listing] in
+            try await listing(destination, credentials, prefix, continuationToken)
+        }
+        listTasks[id] = task
+        defer { listTasks.removeValue(forKey: id) }
+        do {
+            let page = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+            try Task.checkCancellation()
+            guard !closed else { throw CameraS3ReadError.closed }
+            try Self.validate(page: page, prefix: prefix)
+            return page
+        } catch { throw CameraS3ReadError.sanitized(error) }
+    }
+
+    private nonisolated static func validate(page: CameraS3ObjectPage, prefix: String) throws {
+        guard page.keys.count <= 1000, Set(page.keys).count == page.keys.count,
+              page.next.map({ !$0.isEmpty && $0.utf8.count <= 16384 }) ?? true else {
+            throw CameraS3ReadError.network
+        }
+        for key in page.keys { try CameraS3ReadScope.validate(key: key, prefix: prefix) }
+    }
+
     func close() {
         closed = true
         credentials = nil
         for task in tasks.values { task.cancel() }
         tasks.removeAll()
+        for task in listTasks.values { task.cancel() }
+        listTasks.removeAll()
+    }
+
+    private nonisolated static func listFromAWS(_ destination: HBCameraPlaybackMetadata.S3Store,
+        _ credentials: CameraS3Credentials, _ prefix: String, _ token: String?) async throws -> CameraS3ObjectPage {
+        let engine = CameraS3ReadHTTP(destination: destination, listPrefix: prefix, continuationToken: token)
+        defer { engine.close() }
+        return try await listObjects(destination: destination, credentials: credentials,
+                                     prefix: prefix, continuationToken: token, engine: engine)
     }
 
     private nonisolated static func fetchFromAWS(_ destination: HBCameraPlaybackMetadata.S3Store,
@@ -109,6 +165,36 @@ actor CameraS3ObjectReader: CameraS3ObjectReading {
     /// a memory-only engine, exercising the real SDK without any AWS request.
     nonisolated static func getObject(destination: HBCameraPlaybackMetadata.S3Store,
         credentials: CameraS3Credentials, key: String, engine: any HTTPClient) async throws -> Data {
+        let output = try await client(destination: destination, credentials: credentials, engine: engine)
+            .getObject(input: .init(bucket: destination.bucket, expectedBucketOwner: destination.expectedOwner, key: key))
+        try Task.checkCancellation()
+        return try await output.body?.readData() ?? Data()
+    }
+
+    nonisolated static func listObjects(destination: HBCameraPlaybackMetadata.S3Store,
+        credentials: CameraS3Credentials, prefix: String, continuationToken: String?,
+        engine: any HTTPClient) async throws -> CameraS3ObjectPage {
+        let output = try await client(destination: destination, credentials: credentials, engine: engine)
+            .listObjectsV2(input: .init(bucket: destination.bucket, continuationToken: continuationToken,
+                encodingType: .url, expectedBucketOwner: destination.expectedOwner, maxKeys: 1000, prefix: prefix))
+        try Task.checkCancellation()
+        guard output.encodingType == .url, output.isTruncated != nil,
+              output.isTruncated != true || output.nextContinuationToken?.isEmpty == false else {
+            throw CameraS3ReadError.network
+        }
+        let keys = try (output.contents ?? []).map { object in
+            guard let key = object.key?.replacingOccurrences(of: "+", with: " ").removingPercentEncoding else {
+                throw CameraS3ReadError.network
+            }
+            return key
+        }
+        let page = CameraS3ObjectPage(keys: keys, next: output.isTruncated == true ? output.nextContinuationToken : nil)
+        try validate(page: page, prefix: prefix)
+        return page
+    }
+
+    private nonisolated static func client(destination: HBCameraPlaybackMetadata.S3Store,
+        credentials: CameraS3Credentials, engine: any HTTPClient) async throws -> S3Client {
         let resolver = StaticAWSCredentialIdentityResolver(AWSCredentialIdentity(
             accessKey: credentials.accessKeyID, secret: credentials.secretAccessKey))
         var config = try await S3Client.S3ClientConfig(useFIPS: false, useDualStack: false,
@@ -118,10 +204,7 @@ actor CameraS3ObjectReader: CameraS3ObjectReading {
             useGlobalEndpoint: false, clientLogMode: ClientLogMode.none, httpClientEngine: engine,
             httpClientConfiguration: HttpClientConfiguration(connectTimeout: 15, socketTimeout: 45))
         config.logger = CameraS3SilentLogger()
-        let output = try await S3Client(config: config).getObject(input: .init(bucket: destination.bucket,
-            expectedBucketOwner: destination.expectedOwner, key: key))
-        try Task.checkCancellation()
-        return try await output.body?.readData() ?? Data()
+        return S3Client(config: config)
     }
 }
 
@@ -146,6 +229,10 @@ nonisolated enum CameraS3ReadScope {
             throw CameraS3ReadError.invalidKey
         }
     }
+    static func validate(listPrefix: String, destination: HBCameraPlaybackMetadata.S3Store) throws {
+        if listPrefix.isEmpty, destination.prefix.isEmpty { return }
+        try validate(key: listPrefix, prefix: destination.prefix)
+    }
     static func host(_ destination: HBCameraPlaybackMetadata.S3Store) -> String {
         "s3.\(destination.region).amazonaws.com" + (destination.region.hasPrefix("cn-") ? ".cn" : "")
     }
@@ -162,7 +249,9 @@ nonisolated enum CameraS3ReadScope {
 /// and unbounded response buffering. Cryptographic signing stays in the SDK.
 nonisolated final class CameraS3ReadHTTP: NSObject, HTTPClient, URLSessionDataDelegate, @unchecked Sendable {
     private let destination: HBCameraPlaybackMetadata.S3Store
-    private let key: String
+    private let key: String?
+    private let listPrefix: String?
+    private let continuationToken: String?
     private let maximumBytes: Int
     private let sessionConfiguration: URLSessionConfiguration?
     private let lock = NSLock()
@@ -187,10 +276,22 @@ nonisolated final class CameraS3ReadHTTP: NSObject, HTTPClient, URLSessionDataDe
     init(destination: HBCameraPlaybackMetadata.S3Store, key: String, maximumBytes: Int,
          sessionConfiguration: URLSessionConfiguration? = nil) {
         self.destination = destination; self.key = key; self.maximumBytes = maximumBytes
+        self.listPrefix = nil; self.continuationToken = nil
+        self.sessionConfiguration = sessionConfiguration
+    }
+    init(destination: HBCameraPlaybackMetadata.S3Store, listPrefix: String, continuationToken: String?,
+         sessionConfiguration: URLSessionConfiguration? = nil) {
+        self.destination = destination; self.key = nil; self.maximumBytes = 4 * 1024 * 1024
+        self.listPrefix = listPrefix; self.continuationToken = continuationToken
         self.sessionConfiguration = sessionConfiguration
     }
     func send(request: HTTPRequest) async throws -> HTTPResponse {
-        let outgoing = try Self.makeURLRequest(request, destination: destination, key: key)
+        let outgoing: URLRequest
+        if let key { outgoing = try Self.makeURLRequest(request, destination: destination, key: key) }
+        else if let listPrefix {
+            outgoing = try Self.makeListURLRequest(request, destination: destination,
+                prefix: listPrefix, continuationToken: continuationToken)
+        } else { throw CameraS3ReadError.invalidDestination }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 lock.lock()
@@ -216,12 +317,34 @@ nonisolated final class CameraS3ReadHTTP: NSObject, HTTPClient, URLSessionDataDe
               query.count == 1, query[0].name == "x-id", query[0].value == "GetObject" else {
             throw CameraS3ReadError.invalidDestination
         }
+        return try urlRequest(request)
+    }
+    static func makeListURLRequest(_ request: HTTPRequest, destination: HBCameraPlaybackMetadata.S3Store,
+                                  prefix: String, continuationToken: String?) throws -> URLRequest {
+        try CameraS3ReadScope.validate(listPrefix: prefix, destination: destination)
+        let query = request.queryItems ?? []
+        let values = Dictionary(query.map { ($0.name, $0.value ?? "") }, uniquingKeysWith: { first, _ in first })
+        guard request.method == .get, request.destination.scheme == .https,
+              request.destination.host == CameraS3ReadScope.host(destination),
+              request.destination.port == nil || request.destination.port == 443,
+              request.destination.path == CameraS3ReadScope.encodedPath(bucket: destination.bucket, key: "").dropLast(),
+              values.count == query.count,
+              Set(values.keys).isSubset(of: ["list-type", "encoding-type", "prefix", "max-keys", "continuation-token", "x-id"]),
+              values["list-type"] == "2", values["encoding-type"] == "url", values["max-keys"] == "1000",
+              values["prefix"]?.removingPercentEncoding == prefix,
+              values["continuation-token"]?.removingPercentEncoding == continuationToken,
+              values["x-id"] == nil || values["x-id"] == "ListObjectsV2" else {
+            throw CameraS3ReadError.invalidDestination
+        }
+        return try urlRequest(request)
+    }
+    private static func urlRequest(_ request: HTTPRequest) throws -> URLRequest {
         // Mirror the SDK's URLSession conversion: destination.path is already
         // percent-encoded. Assigning URLComponents.path would double-encode it.
         var components = URLComponents()
         components.scheme = "https"; components.host = request.destination.host
         components.percentEncodedPath = request.destination.path
-        components.percentEncodedQueryItems = query.map { URLQueryItem(name: $0.name, value: $0.value) }
+        components.percentEncodedQueryItems = (request.queryItems ?? []).map { URLQueryItem(name: $0.name, value: $0.value) }
         guard let url = components.url else { throw CameraS3ReadError.invalidKey }
         var outgoing = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 45)
         outgoing.httpMethod = "GET"

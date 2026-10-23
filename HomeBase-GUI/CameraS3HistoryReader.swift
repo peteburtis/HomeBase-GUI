@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import HomeBaseProtocol
 
-/// One camera/session cache. All cloud requests are GETs; nothing is enumerated,
+/// One camera/session cache. All cloud requests are read-only; nothing is
 /// decrypted to disk, or sent back through Homebase. Close drops keys and caches.
 actor CameraS3HistoryReader: CameraHistoryFetching {
     typealias Decode = @Sendable (Data, CameraS3ManifestShard, CameraHistoryRange) async throws -> [CameraHistoryPiece]
@@ -16,6 +16,14 @@ actor CameraS3HistoryReader: CameraHistoryFetching {
     private var catalogCache: (CameraS3Catalog, Double)?
     private var manifestCache: (key: String, value: CameraS3Manifest, expires: Double)?
     private var mediaCache: (key: String, hash: String, data: Data)?
+    private struct Inventory {
+        let keys: Set<String>
+        let expires: Double
+        let bytes: Int
+    }
+    private var inventories: [String: Inventory] = [:]
+    private var listingDisabled = false
+    private var listingRetryAt: Double = 0
 
     init(store: HBCameraPlaybackMetadata.S3Store, cameraID: String, password: String?,
          objects: any CameraS3ObjectReading,
@@ -27,6 +35,7 @@ actor CameraS3HistoryReader: CameraHistoryFetching {
     func start() {} // No AWS reads until a local miss actually needs fallback.
     func close() async {
         closed = true; password = nil; catalogCache = nil; manifestCache = nil; mediaCache = nil
+        inventories.removeAll()
         await objects.close()
     }
 
@@ -42,8 +51,9 @@ actor CameraS3HistoryReader: CameraHistoryFetching {
         if request.operation == "neighbors" {
             return try await neighbors(range, catalog: catalog)
         }
-        let shards = try await entries(days: catalog.days.filter { $0.range.intersection(range) != nil }, catalog: catalog)
+        let indexed = try await entries(days: catalog.days.filter { $0.range.intersection(range) != nil }, catalog: catalog)
             .filter { $0.range.intersection(range) != nil }
+        let shards = try await existing(indexed)
         try check()
         if request.operation == "availability" {
             return .init(id: UUID(), range: range, anchor: nil, pieces: [],
@@ -57,7 +67,21 @@ actor CameraS3HistoryReader: CameraHistoryFetching {
             let data: Data
             if let cache = mediaCache, cache.key == shard.key, cache.hash == shard.sha256 { data = cache.data }
             else {
-                let wire = try await objects.read(key: shard.key, maximumBytes: Int(shard.size))
+                let wire: Data
+                do { wire = try await objects.read(key: shard.key, maximumBytes: Int(shard.size)) }
+                catch {
+                    try check()
+                    // A listing can race lifecycle deletion. Refresh once, and
+                    // turn only confirmed absence into a gap. GET-only readers
+                    // and genuine access/network failures keep their old error.
+                    if let failure = error as? CameraS3ReadError, failure == .missing || failure == .accessDenied,
+                       let keys = try await listedKeys(prefix: mediaPrefix(shard, monthly: false), refresh: true),
+                       !keys.contains(shard.key) {
+                        invalidateInventories(containing: [shard.key], except: mediaPrefix(shard, monthly: false))
+                        continue
+                    }
+                    throw error
+                }
                 try check()
                 guard wire.count == shard.size,
                       SHA256.hash(data: wire).map({ String(format: "%02x", $0) }).joined() == shard.sha256.lowercased() else {
@@ -89,6 +113,93 @@ actor CameraS3HistoryReader: CameraHistoryFetching {
     private func check() throws {
         try Task.checkCancellation()
         if closed { throw CancellationError() }
+    }
+
+    /// Only a complete, validated listing proves absence. Partial, denied,
+    /// oversized and failed inventories fall back to ordinary manifest/GET
+    /// playback. Denial is remembered for this session, not saved credentials.
+    private func listedKeys(prefix: String, refresh: Bool = false) async throws -> Set<String>? {
+        try check()
+        guard !listingDisabled else { return nil }
+        if refresh { inventories[prefix] = nil }
+        if let cached = inventories[prefix], now() < cached.expires { return cached.keys }
+        guard now() >= listingRetryAt else { return nil }
+        inventories[prefix] = nil
+        do {
+            var keys: Set<String> = [], tokens: Set<String> = []
+            var token: String?, bytes = 0
+            // 100 pages/100,000 keys/8 MiB per inventory; never retain a partial
+            // snapshot or let optional listing grow without bound.
+            for _ in 0..<100 {
+                guard let page = try await objects.list(prefix: prefix, continuationToken: token) else {
+                    listingDisabled = true; inventories.removeAll(); return nil
+                }
+                try check()
+                guard page.keys.count <= 1000 else { throw CameraS3ReadError.tooLarge }
+                for key in page.keys {
+                    try CameraS3ReadScope.validate(key: key, prefix: prefix)
+                    if keys.insert(key).inserted { bytes += key.utf8.count }
+                }
+                guard bytes <= 8 * 1024 * 1024, keys.count <= 100_000 else { throw CameraS3ReadError.tooLarge }
+                if let next = page.next {
+                    guard !next.isEmpty, next.utf8.count <= 16384, tokens.insert(next).inserted else {
+                        throw CameraS3ReadError.network
+                    }
+                    token = next
+                } else {
+                    // Daily/recent results can change quickly as uploads finish.
+                    let recent = prefix.contains(CameraS3ManifestLayout.day(now()))
+                        || prefix.hasSuffix(CameraS3ManifestLayout.month(now()))
+                        || prefix.hasSuffix("/days/") || prefix.hasSuffix("/months/")
+                    inventories[prefix] = Inventory(keys: keys, expires: now() + (recent ? 5 : 60), bytes: bytes)
+                    while inventories.count > 8 || inventories.values.reduce(0, { $0 + $1.bytes }) > 16 * 1024 * 1024 {
+                        guard let oldest = inventories.min(by: { $0.value.expires < $1.value.expires })?.key else { break }
+                        inventories[oldest] = nil
+                    }
+                    return keys
+                }
+            }
+            throw CameraS3ReadError.tooLarge
+        } catch {
+            try check()
+            if error is CancellationError { throw error }
+            if (error as? CameraS3ReadError) == .accessDenied {
+                listingDisabled = true; inventories.removeAll()
+            } else { listingRetryAt = now() + 5 }
+            return nil
+        }
+    }
+
+    private func mediaPrefix(_ shard: CameraS3ManifestShard, monthly: Bool) -> String {
+        let parent = shard.key.lastIndex(of: "/").map { String(shard.key[...$0]) } ?? ""
+        let leaf = String(shard.key.dropFirst(parent.count))
+        // Use the recorder's filename only to narrow membership queries. Exact
+        // timing still comes exclusively from the manifest, including clock
+        // corrections and shards crossing day/month boundaries. Other layouts
+        // remain supported through their containing prefix.
+        if leaf.count > 10, CameraS3ManifestLayout.validDay(String(leaf.prefix(10))),
+           leaf.dropFirst(10).first == "T" {
+            return parent + leaf.prefix(monthly ? 7 : 10)
+        }
+        return parent
+    }
+
+    private func existing(_ shards: [CameraS3ManifestShard], monthly: Bool = false) async throws -> [CameraS3ManifestShard] {
+        var result: [CameraS3ManifestShard] = []
+        let groups = Dictionary(grouping: shards, by: { mediaPrefix($0, monthly: monthly) })
+        for prefix in groups.keys.sorted() {
+            let keys = try await listedKeys(prefix: prefix)
+            if let keys {
+                let absent = Set(groups[prefix]!.map(\.key)).subtracting(keys)
+                invalidateInventories(containing: absent, except: prefix)
+            }
+            result += groups[prefix]!.filter { keys?.contains($0.key) ?? true }
+        }
+        return result.sorted { ($0.range.start, $0.id) < ($1.range.start, $1.id) }
+    }
+
+    private func invalidateInventories(containing absent: Set<String>, except prefix: String) {
+        inventories = inventories.filter { $0.key == prefix || $0.value.keys.isDisjoint(with: absent) }
     }
     private func validIdentity(format: String, schema: Int, storeID: String, cameraID: String, generated: Double) -> Bool {
         format == "hbnvr-s3-playback" && schema == 1 && storeID == store.id && cameraID == self.cameraID
@@ -134,11 +245,21 @@ actor CameraS3HistoryReader: CameraHistoryFetching {
             let key = CameraS3ManifestLayout.root(prefix: store.prefix, cameraID: cameraID)
                 + (daily ? "days/" : "months/") + period + ".json"
             guard loaded.insert(key).inserted else { continue }
+            let indexPrefix = CameraS3ManifestLayout.root(prefix: store.prefix, cameraID: cameraID)
+                + (daily ? "days/" : "months/")
+            if let keys = try await listedKeys(prefix: indexPrefix), !keys.contains(key) { continue }
             let manifest: CameraS3Manifest
             if let cache = manifestCache, cache.key == key, now() < cache.expires {
                 manifest = cache.value
             } else {
-                let data = try await json(key, maximum: 64 * 1024 * 1024)
+                let data: Data
+                do { data = try await json(key, maximum: 64 * 1024 * 1024) }
+                catch {
+                    try check()
+                    if let failure = error as? CameraS3ReadError, failure == .missing || failure == .accessDenied,
+                       let keys = try await listedKeys(prefix: indexPrefix, refresh: true), !keys.contains(key) { continue }
+                    throw error
+                }
                 try check()
                 do { manifest = try JSONDecoder().decode(CameraS3Manifest.self, from: data) }
                 catch { throw CameraS3HistoryError.invalidManifest }
@@ -160,12 +281,14 @@ actor CameraS3HistoryReader: CameraHistoryFetching {
         // never a day's bounding interval (which may include recording gaps).
         var previous: CameraHistoryRange?, next: CameraHistoryRange?
         for day in catalog.days.filter({ $0.start < range.start }).sorted(by: { $0.day > $1.day }) {
-            let values = try await entries(days: [day], catalog: catalog).map(\.range).filter { $0.end <= range.start }
+            let indexed = try await entries(days: [day], catalog: catalog).filter { $0.range.end <= range.start }
+            let values = try await existing(indexed, monthly: true).map(\.range)
             try check()
             if let found = values.max(by: { $0.end < $1.end }) { previous = found; break }
         }
         for day in catalog.days.filter({ $0.end > range.end }).sorted(by: { $0.day < $1.day }) {
-            let values = try await entries(days: [day], catalog: catalog).map(\.range).filter { $0.start >= range.end }
+            let indexed = try await entries(days: [day], catalog: catalog).filter { $0.range.start >= range.end }
+            let values = try await existing(indexed, monthly: true).map(\.range)
             try check()
             if let found = values.min(by: { $0.start < $1.start }) { next = found; break }
         }

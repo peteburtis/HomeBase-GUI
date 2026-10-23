@@ -160,6 +160,122 @@ final class CameraS3ObjectReaderTests: XCTestCase {
         catch { XCTAssertTrue(error is CancellationError) }
         await reader.close()
     }
+
+    func testSDKSignsScopedListingAndDecodesKeysExactlyOnce() async throws {
+        let prefix = "recordings/café +#%?/", token = "next+%/="
+        let xml = """
+        <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+        <EncodingType>url</EncodingType><IsTruncated>true</IsTruncated>
+        <NextContinuationToken>next+%/=</NextContinuationToken>
+        <Contents><Key>recordings/caf%C3%A9%20%2B%23%25%3F/video%2520.mp4</Key></Contents>
+        </ListBucketResult>
+        """
+        let engine = SignedListingTestEngine(destination: destination, prefix: prefix, token: token, xml: xml)
+        let page = try await CameraS3ObjectReader.listObjects(destination: destination, credentials: credentials,
+            prefix: prefix, continuationToken: token, engine: engine)
+        XCTAssertEqual(page.keys, [prefix + "video%20.mp4"])
+        XCTAssertEqual(page.next, token)
+        let calls = await engine.count; XCTAssertEqual(calls, 1)
+    }
+
+    func testSDKRejectsIncompleteOrOutOfScopeListingResponses() async throws {
+        for body in [
+            "<EncodingType>url</EncodingType><IsTruncated>true</IsTruncated>",
+            "<EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><Contents><Key>elsewhere/key</Key></Contents>",
+            "<IsTruncated>false</IsTruncated>",
+            "<EncodingType>url</EncodingType><Contents><Key>recordings/%ZZ</Key></Contents>",
+        ] {
+            let xml = "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" + body + "</ListBucketResult>"
+            let engine = SignedListingTestEngine(destination: destination, prefix: "recordings/", token: nil, xml: xml)
+            do {
+                _ = try await CameraS3ObjectReader.listObjects(destination: destination, credentials: credentials,
+                    prefix: "recordings/", continuationToken: nil, engine: engine)
+                XCTFail("Invalid response must not establish absence")
+            } catch { XCTAssertTrue(error is CameraS3ReadError) }
+        }
+    }
+
+    func testListingBoundaryRefusesBroaderScopesMethodsAndUnboundedRequests() throws {
+        func request(prefix: String = "recordings/", token: String? = nil, host: String = "s3.us-west-2.amazonaws.com",
+                     path: String = "/synthetic-bucket", method: HTTPMethodType = .get,
+                     max: String = "1000", extra: [URIQueryItem] = []) -> HTTPRequest {
+            var query = [URIQueryItem(name: "list-type", value: "2"), .init(name: "encoding-type", value: "url"),
+                         .init(name: "prefix", value: prefix), .init(name: "max-keys", value: max)]
+            if let token { query.append(.init(name: "continuation-token", value: token)) }
+            return HTTPRequestBuilder().withHost(host).withPath(path).withMethod(method).withQueryItems(query + extra).build()
+        }
+        XCTAssertNoThrow(try CameraS3ReadHTTP.makeListURLRequest(request(), destination: destination,
+            prefix: "recordings/", continuationToken: nil))
+        for bad in [request(prefix: ""), request(prefix: "elsewhere/"), request(host: "attacker.example"),
+                    request(path: "/other-bucket"), request(method: .put), request(max: "10000"), request(token: "unexpected"),
+                    request(extra: [.init(name: "delete", value: "")]), request(extra: [.init(name: "prefix", value: "recordings/")])] {
+            XCTAssertThrowsError(try CameraS3ReadHTTP.makeListURLRequest(bad, destination: destination,
+                prefix: "recordings/", continuationToken: nil))
+        }
+        XCTAssertThrowsError(try CameraS3ReadScope.validate(listPrefix: "", destination: destination))
+        XCTAssertThrowsError(try CameraS3ReadScope.validate(listPrefix: "recordings/../", destination: destination))
+    }
+
+    func testListingValidatesInjectedPagesAndStillAllowsGetAfterDenial() async throws {
+        for page in [CameraS3ObjectPage(keys: ["elsewhere/key"], next: nil),
+                     .init(keys: ["recordings/key"], next: ""),
+                     .init(keys: ["recordings/key", "recordings/key"], next: nil),
+                     .init(keys: (0...1000).map { "recordings/\($0)" }, next: nil)] {
+            let reader = try CameraS3ObjectReader(destination: destination, credentials: credentials,
+                listing: { _, _, _, _ in page }, fetch: { _, _, _, _ in Data([1]) })
+            do { _ = try await reader.list(prefix: "recordings/", continuationToken: nil); XCTFail("Invalid page") }
+            catch { XCTAssertTrue(error is CameraS3ReadError) }
+            await reader.close()
+        }
+        let reader = try CameraS3ObjectReader(destination: destination, credentials: credentials,
+            listing: { _, _, _, _ in throw CameraS3ReadError.accessDenied }, fetch: { _, _, _, _ in Data([1]) })
+        do { _ = try await reader.list(prefix: "recordings/", continuationToken: nil); XCTFail() }
+        catch { XCTAssertEqual(error as? CameraS3ReadError, .accessDenied) }
+        let data = try await reader.read(key: "recordings/key", maximumBytes: 1)
+        XCTAssertEqual(data, Data([1]))
+        await reader.close()
+    }
+
+    func testListingCancellationAndCloseRejectLateResults() async throws {
+        for closing in [false, true] {
+            let started = expectation(description: "listing started")
+            let reader = try CameraS3ObjectReader(destination: destination, credentials: credentials,
+                listing: { _, _, _, _ in
+                    started.fulfill()
+                    try await Task.sleep(for: .seconds(60))
+                    return .init(keys: [], next: nil)
+                }, fetch: { _, _, _, _ in Data([1]) })
+            let listing = Task { try await reader.list(prefix: "recordings/", continuationToken: nil) }
+            await fulfillment(of: [started], timeout: 2)
+            if closing { await reader.close() } else { listing.cancel() }
+            do { _ = try await listing.value; XCTFail("Cancelled listing must not publish empty result") }
+            catch { XCTAssertTrue(error is CancellationError) }
+            await reader.close()
+        }
+    }
+}
+
+private actor SignedListingTestEngine: HTTPClient {
+    let destination: HBCameraPlaybackMetadata.S3Store
+    let prefix: String
+    let token: String?
+    let xml: String
+    private(set) var count = 0
+    init(destination: HBCameraPlaybackMetadata.S3Store, prefix: String, token: String?, xml: String) {
+        self.destination = destination; self.prefix = prefix; self.token = token; self.xml = xml
+    }
+    func send(request: HTTPRequest) async throws -> HTTPResponse {
+        count += 1
+        let urlRequest = try CameraS3ReadHTTP.makeListURLRequest(request, destination: destination,
+            prefix: prefix, continuationToken: token)
+        let query = URLComponents(url: urlRequest.url!, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(query.first { $0.name == "prefix" }?.value, prefix)
+        XCTAssertEqual(query.first { $0.name == "continuation-token" }?.value, token)
+        XCTAssertEqual(urlRequest.value(forHTTPHeaderField: "x-amz-expected-bucket-owner"), "123456789012")
+        XCTAssertTrue(urlRequest.value(forHTTPHeaderField: "Authorization")?.hasPrefix("AWS4-HMAC-SHA256 Credential=SYNTHETIC/") == true)
+        XCTAssertEqual(urlRequest.httpMethod, "GET")
+        return HTTPResponse(body: .data(Data(xml.utf8)), statusCode: .ok)
+    }
 }
 
 /// Installed only on this test's ephemeral session. No test traffic reaches AWS.

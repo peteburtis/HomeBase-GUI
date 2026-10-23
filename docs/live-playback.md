@@ -927,13 +927,18 @@ exact advertised store they were saved for. The existing camera setup remains
 available. Neither settings nor its policy view makes an S3 request.
 
 The form links to a suggested IAM identity policy with selectable JSON, Copy JSON,
-and Share JSON actions. It grants only `s3:GetObject` on the advertised bucket and
-exact prefix (including future predictable manifest objects). It does not grant
-bucket listing, writes, deletes, lifecycle changes, or KMS access; the supported
+and Share JSON actions. It grants `s3:GetObject` on the advertised bucket and
+exact prefix (including future predictable manifest objects), plus optional
+`s3:ListBucket` conditioned on that prefix and its subprefixes. The optional
+`LocateRetainedHomeBaseRecordings` statement lets History identify expired or
+manually deleted footage and offer the existing gap arrows. Existing GetObject-only
+credentials remain supported without modification; omitting or denying listing
+preserves the original playback and retrieval-error behavior. It grants no
+writes, deletes, lifecycle changes, or KMS access; the supported
 recorder uses SSE-S3 and optional app-side encryption. Use a dedicated IAM user
 without console access and no other policies. JSON generation rejects IAM
 wildcards/variables in advertised destinations instead of broadening access.
-An explicitly empty prefix grants reads throughout that bucket and is labeled so.
+An explicitly empty prefix grants reads and listing throughout that bucket and is labeled so.
 
 The reader does not interpret every HTTP 403 as invalid credentials:
 without `s3:ListBucket`, a missing object also returns 403, not 404. Predictable
@@ -993,8 +998,8 @@ journal. Cloud publication is serialized, coalesced, retryable and independent
 of video upload success. Shards crossing UTC midnight appear in both relevant
 days and are deduplicated by identity. Indexes are encrypted with the same
 HBNVR-PBE format when client encryption is enabled. Losing the recorder's journal
-loses its previous searchable cloud history; neither app nor recorder lists the
-bucket or reconstructs old indexes. **Already uploaded, unindexed recordings are
+loses its previous searchable cloud history; optional app listings check membership
+only and never reconstruct indexes or infer timing. **Already uploaded, unindexed recordings are
 not automatically backfilled.** Old spool entries without timing remain safely
 uploadable but cannot enter this new index.
 
@@ -1002,7 +1007,8 @@ The app verifies each object's frozen size and SHA-256, authenticates the entire
 AES-GCM envelope (PBKDF2-HMAC-SHA256, exactly 600,000 iterations), then demuxes
 compressed H.264/H.265 samples in RAM. Embedded timing/identity must match the
 index. There are no temporary MP4s, decrypted disk caches, AWS environment
-credentials, reads through Homebase, or additional IAM permissions. The AWS SDK
+credentials or reads through Homebase. GetObject is required; prefix-scoped listing
+is optional. The AWS SDK
 for Swift is pinned to 1.7.78. Requests have a 45-second deadline, bounded bodies,
 no automatic retries or redirects, and sanitized diagnostics.
 
@@ -1015,12 +1021,23 @@ refills; closing or authorization loss cancels readers and clears keys, object
 caches and media buffers. Backgrounding preserves the paused cursor, not cloud
 credentials. Transient system UI concealment does not restart authentication.
 
-An AWS error is not evidence of a recording gap. Missing/expired objects, a
-missing initial catalog, bad credentials, wrong passwords and corrupt objects
-report retrieval errors. Successfully read local intervals remain usable while
+An AWS error alone is not evidence of a recording gap. Complete successful listings
+filter missing video and period manifests from availability and previous/next
+navigation. Queries cover the camera's manifest directories and manifest-derived
+media prefixes (daily for frames, monthly for neighbors in the standard layout).
+Lists are paginated and cached for 5 seconds for recent periods, 60 seconds otherwise;
+each inventory is bounded to 100 pages, 100,000 keys and 8 MiB of key bytes, with at
+most eight inventories and 16 MiB of cached keys per session. Partial, oversized,
+invalid or failed lists never prove absence and fall back to manifest/GET playback.
+Denied listing is disabled for that reader session; transient failures have a
+5-second cooldown. An object-read failure after a listing refreshes its inventory
+once; only confirmed absence becomes a gap, and stale neighbor inventories are
+invalidated. Listing does not prove read access. A missing initial catalog, bad
+credentials, wrong passwords and corrupt objects remain retrieval errors.
+Successfully read local intervals remain usable while
 failed cloud intervals remain unknown and retryable. S3 Access remains reachable
-from an error state for credential repair. Only successful index reads can
-establish that no indexed footage covers a requested time. Indexes may refer to
+from an error state for credential repair. Successful index reads and optional
+complete inventories establish indexed availability. Indexes may refer to
 objects already expired by bucket lifecycle; the recorder does not delete cloud
 objects or claim authoritative expiration knowledge.
 

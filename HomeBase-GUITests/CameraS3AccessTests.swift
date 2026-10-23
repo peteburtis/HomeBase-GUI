@@ -84,19 +84,28 @@ final class CameraS3AccessTests: XCTestCase {
             historyState: .gap, resolvingTime: false, destination: destination, unlockedDestinationID: "another-store"))
     }
 
-    func testReaderPolicyGrantsOnlyObjectReadsWithinAdvertisedPrefix() throws {
+    func testReaderPolicyGrantsObjectReadsAndOptionalListingWithinAdvertisedPrefix() throws {
         let json = try CameraS3ReadPolicy.json(for: store())
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
         XCTAssertEqual(object["Version"] as? String, "2012-10-17")
         let statements = try XCTUnwrap(object["Statement"] as? [[String: Any]])
-        XCTAssertEqual(statements.count, 1)
+        XCTAssertEqual(statements.count, 2)
         let statement = try XCTUnwrap(statements.first)
         XCTAssertEqual(statement["Effect"] as? String, "Allow")
         XCTAssertEqual(statement["Action"] as? [String], ["s3:GetObject"])
         XCTAssertEqual(statement["Resource"] as? String, "arn:aws:s3:::camera-recordings/nvr/*")
         XCTAssertNil(statement["Principal"], "An identity policy, not a public bucket policy")
         XCTAssertFalse(json.contains("123456789012"), "An S3 object ARN does not embed the account ID")
-        XCTAssertFalse(json.contains("ListBucket"))
+        let listing = statements[1]
+        XCTAssertEqual(listing["Effect"] as? String, "Allow")
+        XCTAssertEqual(listing["Action"] as? [String], ["s3:ListBucket"])
+        XCTAssertEqual(listing["Resource"] as? String, "arn:aws:s3:::camera-recordings")
+        let condition = try XCTUnwrap(listing["Condition"] as? [String: [String: String]])
+        XCTAssertEqual(condition, ["StringLike": ["s3:prefix": "nvr/*"]])
+        XCTAssertNil(listing["Principal"])
+        for action in ["PutObject", "DeleteObject", "PutBucket", "GetLifecycle", "ListAllMyBuckets"] {
+            XCTAssertFalse(json.contains(action))
+        }
     }
 
     func testReaderPolicyPreservesExactPrefixAndSupportsAWSPartitions() throws {
@@ -104,8 +113,12 @@ final class CameraS3AccessTests: XCTestCase {
             for prefix in ["", "hbnvr/a b/", "cameras/日本語/", "quote\"slash\\/"] {
                 let json = try CameraS3ReadPolicy.json(for: store(region: region, prefix: prefix))
                 let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
-                let statement = try XCTUnwrap((object["Statement"] as? [[String: Any]])?.first)
+                let statements = try XCTUnwrap(object["Statement"] as? [[String: Any]])
+                let statement = try XCTUnwrap(statements.first)
                 XCTAssertEqual(statement["Resource"] as? String, "arn:\(partition):s3:::camera-recordings/\(prefix)*")
+                XCTAssertEqual(statements[1]["Resource"] as? String, "arn:\(partition):s3:::camera-recordings")
+                XCTAssertEqual(statements[1]["Condition"] as? [String: [String: String]],
+                               ["StringLike": ["s3:prefix": prefix + "*"]])
             }
         }
         XCTAssertEqual(try CameraS3ReadPolicy.json(for: store(encryption: nil)),
