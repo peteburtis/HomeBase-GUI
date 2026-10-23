@@ -81,14 +81,14 @@ final class CameraS3HistoryTests: XCTestCase {
         XCTAssertTrue(localCalls.isEmpty); XCTAssertTrue(cloudCalls.isEmpty)
     }
 
-    func fixture(start: Double) throws -> (CameraS3ManifestShard, [String: Data]) {
+    func fixture(start: Double, tags: CameraStoredVideoTags? = nil) throws -> (CameraS3ManifestShard, [String: Data]) {
         let bytes = Data("test MP4 substitute".utf8), id = UUID().uuidString
         let entry = CameraS3ManifestShard(id: id, key: store.prefix + "camera/" + id + ".mp4", size: Int64(bytes.count),
             sha256: SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined(), encryption: nil,
             timing: .init(format: "com.graygoolabs.hbnvr.timing", schemaVersion: 1, storeID: store.id,
                 cameraID: camera, shardID: id, time: .init(canonicalUTC: start, receivedUTC: start, cameraUTC: nil,
                     canonicalSource: "received", epochID: UUID().uuidString), firstFrameReceivedUTC: start,
-                timescale: 1000, rtpTimestamp: 0, ssrc: nil), endTicks: 60_000)
+                timescale: 1000, rtpTimestamp: 0, ssrc: nil), endTicks: 60_000, tagMetadata: tags)
         let day = CameraS3ManifestLayout.day(start), month = String(day.prefix(7))
         let encoder = JSONEncoder(), root = CameraS3ManifestLayout.root(prefix: store.prefix, cameraID: camera)
         let catalog = CameraS3Catalog(format: "hbnvr-s3-playback", schemaVersion: 1, storeID: store.id,
@@ -117,6 +117,29 @@ final class CameraS3HistoryTests: XCTestCase {
             await reader.close()
         }
     }
+    func testPlainAndEncryptedManifestTagsOverrideDecodedOriginalMetadata() async throws {
+        for encrypted in [false, true] {
+            let timeline = CameraVideoTagTimeline(version: 2, changes: [.init(ticks: 0, frame: 0, tags: ["homebase.hidden": "true"])],
+                overrides: [.init(start: 0, end: 1000, key: "homebase.hidden", value: nil)])
+            let tags = try encrypted
+                ? CameraStoredVideoTags(timeline: nil, encrypted: CameraS3ThumbnailTests().encrypted(JSONEncoder().encode(timeline)))
+                : CameraStoredVideoTags(timeline: timeline, encrypted: nil)
+            let (entry, files) = try fixture(start: now - 60, tags: tags), frozenNow = now
+            var original = piece(entry.range)
+            original.samples[0].isHidden = true
+            let decoded = original
+            let objects = S3ObjectStub(files: files)
+            let reader = CameraS3HistoryReader(store: store, cameraID: camera, password: "test password", objects: objects,
+                now: { frozenNow }, decode: { _, _, _ in [decoded] })
+            let result = try await reader.fetch(request(entry.range))
+            XCTAssertFalse(try XCTUnwrap(result.pieces.first?.samples.first).isHidden)
+            let removed = try await reader.hidden(at: entry.range.start)
+            let retained = try await reader.hidden(at: entry.range.start + 2)
+            XCTAssertEqual(removed, false); XCTAssertEqual(retained, true)
+            await reader.close()
+        }
+    }
+
     func testIndexAbsentOrAccessDeniedIsErrorNotKnownEmptyFootage() async throws {
         let objects = S3ObjectStub(files: [:]), frozenNow = now
         let reader = CameraS3HistoryReader(store: store, cameraID: camera, password: nil, objects: objects, now: { frozenNow })

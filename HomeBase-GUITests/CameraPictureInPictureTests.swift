@@ -273,6 +273,9 @@ final class CameraPictureInPictureTests: XCTestCase {
 
 @MainActor
 private final class CameraPiPSourceLayerTestState: ObservableObject {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     @Published var isLive = true
     var appearances = 0
     var disappearances = 0

@@ -18,13 +18,13 @@ final class CameraS3ThumbnailTests: XCTestCase {
     func request(timestamp: Double? = nil) -> HBNVRThumbnailRequest {
         .init(requestID: UUID().uuidString, cameraID: camera, timeline: "canonical", timestamp: timestamp ?? slot, size: .init(width: 320, height: 180))
     }
-    func jpeg(cameraID: String? = nil, time: Double? = nil, width: Int = 1280, height: Int = 720, caption: Bool = true) throws -> Data {
+    func jpeg(cameraID: String? = nil, time: Double? = nil, width: Int = 1280, height: Int = 720, caption: Bool = true, tags: [String: String]? = nil) throws -> Data {
         let context = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
             bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
         context.setFillColor(CGColor(gray: 0.5, alpha: 1)); context.fill(CGRect(x: 0, y: 0, width: width, height: height))
         let output = NSMutableData(), image = try XCTUnwrap(context.makeImage())
         let destination = try XCTUnwrap(CGImageDestinationCreateWithData(output, UTType.jpeg.identifier as CFString, 1, nil))
-        let info = CameraS3Thumbnail.Caption(storeID: storeID, cameraID: cameraID ?? camera, slot: slot, timestamp: time ?? slot - 1)
+        let info = CameraS3Thumbnail.Caption(storeID: storeID, cameraID: cameraID ?? camera, slot: slot, timestamp: time ?? slot - 1, tags: tags)
         let text = String(decoding: try JSONEncoder().encode(info), as: UTF8.self)
         let properties: [CFString: Any] = caption ? [kCGImagePropertyIPTCDictionary: [kCGImagePropertyIPTCCaptionAbstract: text]] : [:]
         CGImageDestinationAddImage(destination, image, properties as CFDictionary)
@@ -37,6 +37,20 @@ final class CameraS3ThumbnailTests: XCTestCase {
         let box = try AES.GCM.seal(data, using: key, nonce: AES.GCM.Nonce(data: nonce), authenticating: header)
         return header + box.ciphertext + box.tag
     }
+    func testThumbnailUsesCurrentManifestInsteadOfOriginalCaption() async throws {
+        let helper = CameraS3HistoryTests()
+        let tags = CameraVideoTagTimeline(version: 2, changes: [.init(ticks: 0, frame: 0, tags: ["homebase.hidden": "true"])],
+            overrides: [.init(start: 0, end: 60_000, key: "homebase.hidden", value: nil)])
+        var (_, files) = try helper.fixture(start: slot - 30, tags: .init(timeline: tags, encrypted: nil))
+        let key = CameraS3Thumbnail.key(prefix: helper.store.prefix, cameraID: camera, slot: slot, encrypted: false)
+        files[key] = try jpeg(tags: ["homebase.hidden": "true"])
+        let reader = CameraS3ThumbnailReader(store: helper.store, cameraID: camera, password: nil,
+            objects: ThumbnailObjects(files: files))
+        let image = try await reader.thumbnail(request())
+        XCTAssertFalse(try XCTUnwrap(image).isHidden)
+        await reader.close()
+    }
+
     func testUTCKeyLayoutMatchesRecorderAndPreservesRawPrefix() {
         XCTAssertEqual(CameraS3Thumbnail.key(prefix: store().prefix, cameraID: camera, slot: slot, encrypted: true),
             "Room + %20/.hbnvr/playback/v1/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/thumbnails/2026-09-18/12-10.jpg.hbnvr")
@@ -55,7 +69,7 @@ final class CameraS3ThumbnailTests: XCTestCase {
             let result = try XCTUnwrap(response)
             XCTAssertEqual(result.width, 320); XCTAssertEqual(result.height, 180); XCTAssertEqual(result.timestamp, slot - 1)
             XCTAssertLessThan(result.data.count, original.count)
-            let reads = await objects.requests; XCTAssertEqual(reads, [key])
+            let reads = await objects.requests; XCTAssertEqual(reads, [key, CameraS3ManifestLayout.root(prefix: destination.prefix, cameraID: camera) + "catalog.json"])
             await reader.close()
             do { _ = try await reader.thumbnail(request()); XCTFail("Closed reader") } catch { XCTAssertTrue(error is CancellationError) }
             let closed = await objects.closed; XCTAssertTrue(closed)
@@ -73,10 +87,13 @@ final class CameraS3ThumbnailTests: XCTestCase {
     func testHistoricalSuffixFallbackAndMissingVersusDenied() async throws {
         let destination = store()
         let oldKey = CameraS3Thumbnail.key(prefix: destination.prefix, cameraID: camera, slot: slot, encrypted: true)
-        let objects = ThumbnailObjects(files: [oldKey: try encrypted(jpeg())], missing: .accessDenied)
+        let catalogKey = CameraS3ManifestLayout.root(prefix: destination.prefix, cameraID: camera) + "catalog.json"
+        let catalog = CameraS3Catalog(format: "hbnvr-s3-playback", schemaVersion: 1, storeID: storeID,
+            cameraID: camera, generatedAt: slot, days: [])
+        let objects = ThumbnailObjects(files: [oldKey: try encrypted(jpeg()), catalogKey: try JSONEncoder().encode(catalog)], missing: .accessDenied)
         let reader = CameraS3ThumbnailReader(store: destination, cameraID: camera, password: "test password", objects: objects)
         let found = try await reader.thumbnail(request()); XCTAssertNotNil(found)
-        let reads = await objects.requests; XCTAssertEqual(reads.count, 2); XCTAssertEqual(reads.last, oldKey)
+        let reads = await objects.requests; XCTAssertEqual(reads.count, 3); XCTAssertEqual(reads[1], oldKey); XCTAssertEqual(reads.last, catalogKey)
         for failure in [CameraS3ReadError.missing, .accessDenied] {
             let empty = CameraS3ThumbnailReader(store: destination, cameraID: camera, password: nil,
                 objects: ThumbnailObjects(files: [:], missing: failure))

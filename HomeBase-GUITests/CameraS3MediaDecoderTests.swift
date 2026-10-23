@@ -39,6 +39,7 @@ final class CameraS3MediaDecoderTests: XCTestCase {
             range: .init(start: 1001.2, end: 1001.8))
         let piece = try XCTUnwrap(pieces.first)
         XCTAssertEqual(piece.samples.first?.frame.presentationTicks, 90_000)
+        XCTAssertEqual(piece.samples.map(\.sourceFrame), Array(15...26).map { Int64($0) })
         XCTAssertEqual(piece.samples.first?.frame.keyFrame, true)
         XCTAssertEqual(piece.samples.first?.frame.preroll, true)
         XCTAssertEqual(piece.segment.range.start, 1001)

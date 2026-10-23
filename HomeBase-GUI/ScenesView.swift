@@ -432,6 +432,9 @@ private struct SceneActivationAccessory: View {
 
 @MainActor
 private final class ServerScenesModel: ObservableObject {
+    // SwiftUI may release this outside a Swift task; teardown needs no actor hop.
+    nonisolated deinit {}
+
     enum State: Equatable {
         case idle
         case loading

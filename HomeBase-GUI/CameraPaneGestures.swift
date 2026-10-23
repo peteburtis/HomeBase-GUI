@@ -4,6 +4,9 @@ import Foundation
 /// This never routes through the group's shared toolbar controls.
 @MainActor
 final class CameraPaneGestures {
+    // SwiftUI may release this outside a Swift task; teardown needs no actor hop.
+    nonisolated deinit {}
+
     private let model: LiveDeviceControlsModel
     private let panTilt: CameraPanTiltGestureController
     private let zoom: CameraZoomGestureController

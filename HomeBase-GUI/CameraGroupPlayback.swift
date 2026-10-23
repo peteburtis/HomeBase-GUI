@@ -10,6 +10,9 @@ import HomeBaseProtocol
 /// events: authorization, backgrounding, camera removal, and dismissal.
 @MainActor
 final class CameraSessionResourceCoordinator {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     typealias StartLiveVideo = @MainActor (CameraAccessSession?) async -> Void
     typealias StopLiveVideo = @MainActor (Bool) async -> Void
     typealias StartControls = @MainActor () async -> Void
@@ -169,6 +172,9 @@ struct CameraMultipleSelection {
 
 @MainActor
 final class CameraGroupSession: ObservableObject, Identifiable {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     let camera: CameraVideoDevice
     var id: String { camera.id }
     let playback: CameraLivePlaybackController
@@ -190,6 +196,16 @@ final class CameraGroupSession: ObservableObject, Identifiable {
     private var qualityRevision = 0
     private var isClosed = false
     let streamOwner: UUID
+    private(set) var veil: CameraVeilSession?
+    private var veilObservation: AnyCancellable?
+
+    func useVeil(_ veil: CameraVeilSession) {
+        self.veil = veil
+        veilObservation = veil.$showsHidden.sink { [weak self] value in
+            self?.playback.setShowsHiddenVideo(value)
+            self?.liveVideo.setShowsHiddenVideo(value)
+        }
+    }
 
     var historyAvailable: Bool { CameraPlaybackHistoryAvailability.isAvailable(in: controls.deviceMetadata) }
 
@@ -385,6 +401,11 @@ final class CameraGroupSession: ObservableObject, Identifiable {
 /// different speeds, but they never independently advance their visible cursor.
 @MainActor
 final class CameraGroupPlayback: ObservableObject {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
+    let veil: CameraVeilSession
+    private var veilObservation: AnyCancellable?
     enum Source: Equatable { case live, buffer, history }
     @Published private(set) var active = false
     // Picker selection style is independent of playback/layout. One selected
@@ -425,8 +446,10 @@ final class CameraGroupPlayback: ObservableObject {
     }
 
     init(client: HomeBaseWebSocketClient, initialSession: CameraGroupSession? = nil,
+         veil: CameraVeilSession? = nil,
          clock: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }) {
         self.client = client; self.clock = clock
+        self.veil = veil ?? CameraVeilSession()
         quality = initialSession?.quality ?? .automatic
         sharedControls = LiveDeviceControlsModel(device: nil, client: client)
         sharedControls.installWriteRouting(value: { [weak self] value, control, _ in
@@ -435,6 +458,7 @@ final class CameraGroupPlayback: ObservableObject {
         }, canonical: { _, _ in
             throw CameraGroupControlSnapshot.Failure(message: "PTZ gestures target individual cameras, not the group.")
         })
+        veilObservation = self.veil.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }
         if let initialSession {
             selection = CameraMultipleSelection(first: initialSession.id)
             sessions = [initialSession]
@@ -496,6 +520,7 @@ final class CameraGroupPlayback: ObservableObject {
     /// Phone inactivity conceals its UI; backgrounding suspends only its
     /// controls when the same media is still owned by a connected display.
     func suspendForPhone(stopImmediately: Bool = false, stopRecording: Bool = true) {
+        if stopImmediately { veil.hide() }
         phoneResourcesSuspended = true
 #if os(iOS)
         // External playback does not extend local recording into the background.
@@ -678,6 +703,7 @@ final class CameraGroupPlayback: ObservableObject {
     }
 
     private func observe(_ session: CameraGroupSession) {
+        session.useVeil(veil)
         session.playback.streamDidStop = { [weak self, weak session] in
             guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return }
             self.pauseForInterruption()
@@ -920,6 +946,7 @@ final class CameraGroupPlayback: ObservableObject {
         generation = UUID(); resolveTask?.cancel(); resolveTask = nil; resolvingTime = false
     }
     func deactivate() {
+        veil.hide()
         suspend()
         resourcesActive = false
         resourceAccess = nil

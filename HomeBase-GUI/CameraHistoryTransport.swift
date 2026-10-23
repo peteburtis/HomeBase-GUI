@@ -114,6 +114,8 @@ actor CameraHistoryTransport: CameraHistoryFetching {
     }
 
     func fetch(_ request: HBNVRMediaRequest, onBegin: CameraHistoryBeginHandler?) async throws -> CameraHistoryBatch {
+        var request = request
+        if request.operation == "frames" { request.includeTags = true }
         try request.validate()
         guard !closed, !busy else { throw CameraHistoryError.unavailable }
         busy = true

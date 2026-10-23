@@ -421,6 +421,9 @@ enum TriggerFiredPulsePresentation {
 
 @MainActor
 private final class ServerTriggersModel: ObservableObject {
+    // SwiftUI may release this outside a Swift task; teardown needs no actor hop.
+    nonisolated deinit {}
+
     enum State: Equatable {
         case idle
         case loading

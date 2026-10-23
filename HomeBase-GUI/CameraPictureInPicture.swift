@@ -90,6 +90,9 @@ struct CameraPiPViewerRegistry {
 
 @MainActor
 final class CameraPiPSession: Identifiable {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     let id = UUID()
     let camera: CameraVideoDevice
     let quality: CameraLiveQualitySelection
@@ -97,16 +100,22 @@ final class CameraPiPSession: Identifiable {
     let originViewerID: UUID
     let authorization: CameraStreamAuthorization
     let model: CameraLiveVideoModel
+    let veil: CameraVeilSession
+    private var veilObservation: AnyCancellable?
 
     init(camera: CameraVideoDevice, quality: CameraLiveQualitySelection,
          client: HomeBaseWebSocketClient, originViewerID: UUID,
-         authorization: CameraStreamAuthorization) {
+         authorization: CameraStreamAuthorization, veil: CameraVeilSession? = nil) {
         self.camera = camera; self.quality = quality; self.client = client
         self.originViewerID = originViewerID; self.authorization = authorization
+        self.veil = veil ?? CameraVeilSession()
         // Deliberately no history controller, replay buffer, S3 credentials,
         // camera controls, or recording controller. PiP is always live video.
         model = CameraLiveVideoModel(deviceIdentifier: camera.device.addressableName,
             quality: quality, client: client)
+        veilObservation = self.veil.$showsHidden.sink { [weak model] value in
+            model?.setShowsHiddenVideo(value)
+        }
     }
 }
 
@@ -224,20 +233,20 @@ final class CameraPictureInPictureController: NSObject, ObservableObject {
     }
 
     func start(camera: CameraVideoDevice, quality: CameraLiveQualitySelection,
-               client: HomeBaseWebSocketClient, viewerID: UUID, access: CameraAccessSession) {
+               client: HomeBaseWebSocketClient, viewerID: UUID, access: CameraAccessSession, veil: CameraVeilSession? = nil) {
         guard isSupported, !appIsBackgrounded, UIApplication.shared.applicationState == .active,
               UIApplication.shared.isProtectedDataAvailable, access.isUnlocked,
               availableViewers[viewerID]?.contains(camera.id) == true,
               camera.artificialFeed == nil, canStartOrSwap else { return }
         if session != nil {
             prepareSwap(camera: camera, quality: quality, client: client,
-                viewerID: viewerID, access: access)
+                viewerID: viewerID, access: access, veil: veil)
             return
         }
         do {
             let authorization = try access.authorizePictureInPicture(camera: camera.device.addressableName)
             let session = CameraPiPSession(camera: camera, quality: quality, client: client,
-                originViewerID: viewerID, authorization: authorization)
+                originViewerID: viewerID, authorization: authorization, veil: veil)
             self.session = session
             phase = .preparing; isPaused = false; errorMessage = nil
             sourceIsAttached = false
@@ -272,6 +281,15 @@ final class CameraPictureInPictureController: NSObject, ObservableObject {
 
     private func runStream(_ source: CameraPiPSession) -> Task<Void, Never> {
         Task { [weak self] in
+            // Native PiP has no SwiftUI overlay. End its presentation when
+            // footage becomes covered, including re-covering a paused frame.
+            let cover = Publishers.CombineLatest(source.model.$previewIsHidden, source.veil.$showsHidden)
+                .sink { [weak self] hidden, revealed in
+                    guard hidden && !revealed, let self else { return }
+                    if self.pendingSwap?.id == source.id { self.cancelSwap() }
+                    else if self.session?.id == source.id { self.stop() }
+                }
+            defer { cover.cancel() }
             await source.model.run(authorization: source.authorization)
             guard !Task.isCancelled, let self else { return }
             if self.pendingSwap?.id == source.id {
@@ -286,12 +304,12 @@ final class CameraPictureInPictureController: NSObject, ObservableObject {
     }
 
     private func prepareSwap(camera: CameraVideoDevice, quality: CameraLiveQualitySelection,
-                             client: HomeBaseWebSocketClient, viewerID: UUID, access: CameraAccessSession) {
+                             client: HomeBaseWebSocketClient, viewerID: UUID, access: CameraAccessSession, veil: CameraVeilSession? = nil) {
         guard phase == .active, controller?.isPictureInPictureActive == true else { return }
         do {
             let authorization = try access.authorizePictureInPicture(camera: camera.device.addressableName)
             let replacement = CameraPiPSession(camera: camera, quality: quality, client: client,
-                originViewerID: viewerID, authorization: authorization)
+                originViewerID: viewerID, authorization: authorization, veil: veil)
             pendingSwap = replacement
             swapSourceIsAttached = false
             errorMessage = nil
@@ -387,7 +405,11 @@ final class CameraPictureInPictureController: NSObject, ObservableObject {
         appIsBackgrounded = phase == .background
         // A replacement is foreground preparation, not a second background
         // camera grant. Keep only the already-active source when leaving.
-        if appIsBackgrounded { cancelSwap() }
+        if appIsBackgrounded {
+            session?.veil.hide()
+            pendingSwap?.veil.hide()
+            cancelSwap()
+        }
         // No automatic PiP, including an outstanding preparation request when
         // the user leaves the app before the system has actually started PiP.
         if appIsBackgrounded, !self.phase.mayContinueInBackground { stop() }
@@ -801,9 +823,9 @@ private struct ObservedCameraPiPMenuItems: View {
         } else if controller.isSupported, canStart, cameraSession.camera.artificialFeed == nil {
             Button(action.title, systemImage: action.systemImage) {
                 controller.start(camera: cameraSession.camera, quality: cameraSession.quality,
-                    client: cameraSession.client, viewerID: viewerID, access: access)
+                    client: cameraSession.client, viewerID: viewerID, access: access, veil: cameraSession.veil)
             }
-            .disabled(!controller.canStartOrSwap)
+            .disabled(!controller.canStartOrSwap || (cameraSession.liveVideo.previewIsHidden && cameraSession.veil?.showsHidden != true))
             .accessibilityHint("Shows this camera's live video in Picture in Picture")
         }
     }

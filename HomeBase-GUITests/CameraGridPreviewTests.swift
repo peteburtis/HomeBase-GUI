@@ -6,6 +6,22 @@ import XCTest
 
 @MainActor
 final class CameraGridPreviewTests: XCTestCase {
+    func testHiddenThumbnailReplacesPublicImageSurvivesFailureAndClearsAtPublicFootage() async throws {
+        let camera = try camera("Camera", playback: true)
+        let id = try playbackID(camera)
+        let fetcher = GridThumbnailFetcher(outcomes: [id: [.image(timestamp: 1), .hidden, .failure, .image(timestamp: 2)]])
+        let model = makeModel(fetcher)
+        _ = await model.refreshOnce(cameras: [camera], using: fetcher)
+        guard case .thumbnail = model.preview(for: camera.id) else { return XCTFail("Expected public thumbnail") }
+        for _ in 0..<2 {
+            _ = await model.refreshOnce(cameras: [camera], using: fetcher)
+            guard case .hidden = model.preview(for: camera.id) else { return XCTFail("Hidden footage must remain covered") }
+        }
+        _ = await model.refreshOnce(cameras: [camera], using: fetcher)
+        guard case .thumbnail(_, let time) = model.preview(for: camera.id) else { return XCTFail("Expected public thumbnail again") }
+        XCTAssertEqual(time, 2)
+    }
+
     func testPollIntervalIsTenSeconds() {
         XCTAssertEqual(CameraGridPreviewModel.pollingIntervalSeconds, 10)
     }
@@ -186,6 +202,7 @@ final class CameraGridPreviewTests: XCTestCase {
 private actor GridThumbnailFetcher: CameraThumbnailFetching {
     enum Outcome: Sendable {
         case image(timestamp: Double)
+        case hidden
         case missing
         case unsupported
         case failure
@@ -223,6 +240,8 @@ private actor GridThumbnailFetcher: CameraThumbnailFetching {
                 height: 1,
                 timestamp: timestamp
             )
+        case .hidden:
+            return CameraThumbnail(data: Data(), width: 1, height: 1, timestamp: 1.5, isHidden: true)
         case .missing:
             return nil
         case .unsupported:

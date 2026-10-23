@@ -122,8 +122,8 @@ struct DeviceDetailView: View {
                 await model.run(reactivating: true)
             }
         }
-        .onChange(of: privacyEnabled) { previousValue, currentValue in
-            guard CameraPrivacyStreamRecovery.shouldRequestRestart(
+        .onChange(of: shutterClosed) { previousValue, currentValue in
+            guard CameraShutterStreamRecovery.shouldRequestRestart(
                 from: previousValue,
                 to: currentValue
             ) else { return }
@@ -152,9 +152,9 @@ struct DeviceDetailView: View {
 #endif
     }
 
-    private var privacyEnabled: Bool? {
+    private var shutterClosed: Bool? {
         CameraDetailControlSet(controls: model.controls)
-            .observedPrivacyEnabled
+            .observedShutterClosed
     }
 
     @ViewBuilder
@@ -336,6 +336,9 @@ struct LiveDeviceControl: Identifiable {
 
 @MainActor
 final class LiveDeviceControlsModel: ObservableObject {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     enum State: Equatable {
         case idle
         case loading

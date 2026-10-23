@@ -202,20 +202,20 @@ final class CameraLiveVideoTests: XCTestCase {
     }
 
     func testDetailControlsDiscoverPartialCapabilitiesFromMetadata() {
-        let privacy = liveControl(
-            identifier: "Vendor.Privacy",
+        let shutter = liveControl(
+            identifier: "Vendor.Shutter",
             kind: "BinarySwitch",
             value: 1,
-            metadata: ["cameraPrivacy": true]
+            metadata: ["cameraShutter": true]
         )
         let pan = liveControl(
             identifier: "Vendor.HorizontalPosition",
             value: 0.25,
             metadata: axisMetadata(component: "PanTilt[0]")
         )
-        let controls = CameraDetailControlSet(controls: [privacy, pan])
+        let controls = CameraDetailControlSet(controls: [shutter, pan])
 
-        XCTAssertEqual(controls.privacy?.id, privacy.id)
+        XCTAssertEqual(controls.shutter?.id, shutter.id)
         XCTAssertEqual(controls.pan?.id, pan.id)
         XCTAssertNil(controls.tilt)
         XCTAssertNil(controls.zoom)
@@ -235,18 +235,18 @@ final class CameraLiveVideoTests: XCTestCase {
             value: 0.4,
             metadata: axisMetadata()
         )
-        let privacy = liveControl(
-            identifier: "Privacy.Enabled",
+        let shutter = liveControl(
+            identifier: "Shutter.Closed",
             kind: "BinarySwitch",
             value: 0
         )
         let controls = CameraDetailControlSet(
-            controls: [tilt, zoom, privacy]
+            controls: [tilt, zoom, shutter]
         )
 
         XCTAssertEqual(controls.tilt?.id, tilt.id)
         XCTAssertEqual(controls.zoom?.id, zoom.id)
-        XCTAssertEqual(controls.privacy?.id, privacy.id)
+        XCTAssertEqual(controls.shutter?.id, shutter.id)
         XCTAssertNil(controls.pan)
     }
 
@@ -266,7 +266,7 @@ final class CameraLiveVideoTests: XCTestCase {
             controls: [readOnlyZoom, rangeLessPan]
         )
 
-        XCTAssertNil(controls.privacy)
+        XCTAssertNil(controls.shutter)
         XCTAssertNil(controls.pan)
         XCTAssertNil(controls.tilt)
         XCTAssertNil(controls.zoom)
@@ -275,17 +275,17 @@ final class CameraLiveVideoTests: XCTestCase {
 
     func testDetailControlBooleanWritesPreserveWireRepresentation() {
         let boolean = liveControl(
-            identifier: "Privacy.Enabled",
+            identifier: "Shutter.Closed",
             kind: "BinarySwitch",
             value: .bool(false)
         )
         let number = liveControl(
-            identifier: "Privacy.Enabled",
+            identifier: "Shutter.Closed",
             kind: "BinarySwitch",
             value: .number(0)
         )
         let integer = liveControl(
-            identifier: "Privacy.Enabled",
+            identifier: "Shutter.Closed",
             kind: "BinarySwitch",
             value: .integer(0)
         )
@@ -295,19 +295,18 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertEqual(integer.cameraOverlayBooleanWireValue(true), .integer(1))
     }
 
-    func testPrivacyButtonIconReflectsPrivacyState() {
+    func testShutterButtonIconReflectsClosedState() {
         XCTAssertEqual(
-            CameraPrivacyButtonPresentation.systemImageName(
-                privacyEnabled: false
-            ),
-            "eye"
+            CameraShutterButtonPresentation.image(shutterClosed: false),
+            Image(systemName: "camera.aperture")
         )
         XCTAssertEqual(
-            CameraPrivacyButtonPresentation.systemImageName(
-                privacyEnabled: true
-            ),
-            "eye.slash"
+            CameraShutterButtonPresentation.image(shutterClosed: true),
+            Image("CameraShutterClosed").renderingMode(.template)
         )
+#if os(iOS)
+        XCTAssertNotNil(UIImage(named: "CameraShutterClosed"))
+#endif
     }
 
     func testDayNightModeUsesAdvertisedTapoChoicesAndWireValues() throws {
@@ -666,7 +665,7 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertTrue(CameraLiveVideoModel.State.playing.displaysVideo)
         XCTAssertFalse(
             CameraLiveVideoModel.State.ended(
-                "Privacy enabled",
+                "Shutter closed",
                 retryable: true
             ).displaysVideo
         )
@@ -675,36 +674,36 @@ final class CameraLiveVideoTests: XCTestCase {
         )
     }
 
-    func testPrivacyRecoveryRequiresConfirmedOnToOffTransition() {
-        XCTAssertTrue(CameraPrivacyStreamRecovery.shouldRequestRestart(
+    func testShutterRecoveryRequiresConfirmedClosedToOpenTransition() {
+        XCTAssertTrue(CameraShutterStreamRecovery.shouldRequestRestart(
             from: true,
             to: false
         ))
-        XCTAssertFalse(CameraPrivacyStreamRecovery.shouldRequestRestart(
+        XCTAssertFalse(CameraShutterStreamRecovery.shouldRequestRestart(
             from: nil,
             to: false
         ))
-        XCTAssertFalse(CameraPrivacyStreamRecovery.shouldRequestRestart(
+        XCTAssertFalse(CameraShutterStreamRecovery.shouldRequestRestart(
             from: false,
             to: false
         ))
-        XCTAssertFalse(CameraPrivacyStreamRecovery.shouldRequestRestart(
+        XCTAssertFalse(CameraShutterStreamRecovery.shouldRequestRestart(
             from: true,
             to: true
         ))
     }
 
-    func testPrivacyRecoveryIgnoresOptimisticPendingValue() {
-        var privacy = liveControl(
-            identifier: "Privacy.Enabled",
+    func testShutterRecoveryIgnoresOptimisticPendingValue() {
+        var shutter = liveControl(
+            identifier: "Shutter.Closed",
             kind: "BinarySwitch",
             value: .bool(true)
         )
-        privacy.pendingValue = .bool(false)
-        let controls = CameraDetailControlSet(controls: [privacy])
+        shutter.pendingValue = .bool(false)
+        let controls = CameraDetailControlSet(controls: [shutter])
 
-        XCTAssertEqual(privacy.cameraOverlayBooleanValue, false)
-        XCTAssertEqual(controls.observedPrivacyEnabled, true)
+        XCTAssertEqual(shutter.cameraOverlayBooleanValue, false)
+        XCTAssertEqual(controls.observedShutterClosed, true)
     }
 
     func testPanTiltGestureMapsScrollingToCanonicalPosition() throws {

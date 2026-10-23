@@ -5,7 +5,7 @@ extension ToolbarContent {
     /// moves the remaining toolbar items to a vertical edge.
     @ToolbarContentBuilder
     func cameraPlaybackHorizontalAxis() -> some ToolbarContent {
-#if os(iOS)
+#if os(iOS) && HOMEBASE_FOLDABLE_LAYOUT
         if #available(iOS 27.1, *) {
             axisBehavior(.horizontalOnly)
         } else {

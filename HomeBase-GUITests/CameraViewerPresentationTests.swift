@@ -127,9 +127,6 @@ final class CameraViewerPresentationTests: XCTestCase {
     }
 
     func testRealViewerPreservesCameraMatrixQualityAndOutputAcrossMinimizeRestore() async throws {
-        if #unavailable(iOS 27.0) {
-            throw XCTSkip("The current compiler/iOS 26 XCTest runtime crashes in CameraScreenSelection isolated-deinit during SwiftUI teardown. State and retained-host tests still run on iOS 26.")
-        }
         let (client, camera) = try fixture()
         let viewer = CameraViewerPresentation()
         let access = try XCTUnwrap(CameraPiPTestFixture.makeAccessSession(environment: [CameraPiPTestFixture.environmentVariable: "1"]))

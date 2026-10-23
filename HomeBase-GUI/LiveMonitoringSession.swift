@@ -8,7 +8,7 @@ final class LiveMonitoringSession {
     private var isActive = false
     private var operation: (@MainActor () async -> Void)?
 
-    deinit { task?.cancel() }
+    nonisolated deinit { task?.cancel() }
 
     func setActive(
         _ active: Bool,

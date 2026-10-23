@@ -125,7 +125,7 @@ nonisolated struct CameraTimelineDetents {
 @MainActor
 final class CameraTimelineModel: ObservableObject {
     enum Preview { case image(CGImage), empty, failed }
-    struct Entry { let preview: Preview; let expires: Double }
+    struct Entry { let preview: Preview; let expires: Double; var isHidden = false }
     @Published private(set) var cursor: Double?
     @Published private(set) var latest: Double?
     @Published private(set) var start: Double = 0
@@ -294,7 +294,7 @@ final class CameraTimelineModel: ObservableObject {
                     } else { preview = .empty }
                     // Recent/missing footage can change as shards become readable.
                     let lifetime: Double = result == nil || point < midpoint ? 60 : 3600
-                    self.previews[tile] = Entry(preview: preview, expires: self.clock() + lifetime)
+                    self.previews[tile] = Entry(preview: preview, expires: self.clock() + lifetime, isHidden: result?.isHidden ?? false)
                 } catch is CancellationError { return }
                 catch CameraThumbnailError.unsupported {
                     guard self.generation == token, !Task.isCancelled else { return }
@@ -378,6 +378,7 @@ private struct CameraTimelineTimeLabelLayout: Layout {
 }
 
 struct CameraHistoryTimeline: View {
+    @Environment(\.cameraShowsHiddenVideo) private var showsHiddenVideo
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.displayScale) private var displayScale
@@ -653,7 +654,11 @@ struct CameraHistoryTimeline: View {
                 thumbnailGridCell
                 if let entry = model.previews[tile] {
                     switch entry.preview {
-                    case .image(let image): Image(decorative: image, scale: 1).resizable().aspectRatio(contentMode: .fill)
+                    case .image(let image):
+                        if entry.isHidden && !showsHiddenVideo {
+                            Color.black
+                            Image(systemName: "eye.slash").foregroundStyle(.white).accessibilityLabel("Private Video")
+                        } else { Image(decorative: image, scale: 1).resizable().aspectRatio(contentMode: .fill) }
                     case .empty: Text("No preview").font(.caption2)
                     case .failed: Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
                     }

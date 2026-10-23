@@ -6,6 +6,29 @@ import XCTest
 
 @MainActor
 final class CameraHistoryExportTests: XCTestCase {
+    func testHiddenExportIncludesPrerollInVeilCheckAndRequiresReveal() async throws {
+        let original = try historyPiece(try await S3MediaFixture.make(count: 15))
+        var samples = original.samples
+        samples[0].isHidden = true
+        let piece = CameraHistoryPiece(id: UUID(), segment: original.segment, samples: samples)
+        let range = CameraHistoryRange(start: 1000.4, end: 1000.8)
+        let before = try temporaryMovies()
+        let blocked = ExportFixtureSource(pieces: [piece])
+        do {
+            _ = try await CameraHistoryExporter.export(cameraID: "camera", name: "Camera", range: range, source: blocked)
+            XCTFail("Hidden decoder preroll must not escape into a normal movie")
+        } catch CameraHistoryExportError.hiddenVideo {} catch { throw error }
+        let closed = await blocked.closed
+        XCTAssertTrue(closed)
+        XCTAssertEqual(try temporaryMovies(), before)
+        let allowed = try await CameraHistoryExporter.export(cameraID: "camera", name: "Camera", range: range,
+            source: ExportFixtureSource(pieces: [piece]), showsHiddenVideo: true)
+        defer { allowed.recordings.forEach { CameraLocalRecordingController.removeRecordingFile(at: $0.fileURL) } }
+        XCTAssertEqual(allowed.recordings.count, 1)
+        let movie = try await readMovie(try XCTUnwrap(allowed.recordings.first).fileURL)
+        XCTAssertFalse(movie.samples.isEmpty)
+    }
+
     func testDraftPreservesExactPlayheadAndValidatesBothEndModes() {
         let date = Date(timeIntervalSince1970: 1000.375)
         var draft = CameraHistoryExportDraft(start: date)

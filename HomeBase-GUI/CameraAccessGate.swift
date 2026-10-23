@@ -247,11 +247,12 @@ final class CameraAccessLifecycle: ObservableObject {
             enterBackgroundIfEverySceneIsBackgrounded()
         case .active:
             scenePhases[sceneID] = .active
+            let resumesAccess = isBackgrounded || isDeviceLocked
             isDeviceLocked = false
-            if isBackgrounded {
+            if resumesAccess {
                 session.resumeStreams()
             }
-            if isBackgrounded, !owners.isEmpty {
+            if resumesAccess, !owners.isEmpty {
                 session.enter()
             }
             isBackgrounded = false

@@ -428,8 +428,8 @@ actor CameraStreamArbiter {
                   CameraH264Renderer.isValidAVCCAccessUnit(frame.payload) else { throw CameraStreamError.invalidMedia }
             frame.generation = worker.generation
             let keyframe = frame.flags.contains(.keyFrame)
-            if keyframe { worker.gop = [frame]; worker.bytes = frame.payload.count }
-            else if !worker.gop.isEmpty { worker.gop.append(frame); worker.bytes += frame.payload.count }
+            if keyframe { worker.gop = [frame]; worker.bytes = frame.bufferedByteCount }
+            else if !worker.gop.isEmpty { worker.gop.append(frame); worker.bytes += frame.bufferedByteCount }
             if worker.bytes > policy.bootstrapBytes || worker.gop.count > policy.bootstrapFrames {
                 worker.gop.removeAll(); worker.bytes = 0 // Joiners wait for the next keyframe, never receive an incomplete GOP.
             }

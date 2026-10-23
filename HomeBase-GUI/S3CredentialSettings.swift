@@ -6,6 +6,9 @@ import SwiftUI
 /// and adding here does not grant camera access or verify AWS permissions.
 @MainActor
 final class S3CredentialSettingsModel: ObservableObject {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     @Published private(set) var presence: CameraS3CredentialPresence?
     @Published private(set) var isBusy = false
     @Published private(set) var errorMessage: String?

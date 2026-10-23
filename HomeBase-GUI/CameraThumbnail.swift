@@ -7,6 +7,7 @@ nonisolated struct CameraThumbnail: Sendable {
     let width: Int
     let height: Int
     let timestamp: Double
+    var isHidden = false
 }
 nonisolated protocol CameraThumbnailFetching: CameraHistoryFetching {
     func thumbnail(_ request: HBNVRThumbnailRequest) async throws -> CameraThumbnail?
@@ -19,6 +20,7 @@ nonisolated struct CameraThumbnailParser {
     private struct Header: Decodable {
         let mimeType: String; let width: Int; let height: Int; let byteCount: Int
         let timestamp: Double; let keyFrame: Bool
+        let tags: [String: String]?
     }
     private struct Record: Decodable {
         let type: String; let requestID: String
@@ -59,6 +61,7 @@ nonisolated struct CameraThumbnailParser {
                   (1...8 * 1024 * 1024).contains(image.byteCount), image.timestamp.isFinite, abs(image.timestamp) < 1e11 else {
                 throw CameraHistoryError.invalidResponse
             }
+            if let tags = image.tags { try HBVideoTags.validate(tags) }
             header = image
         case "end":
             guard began else { throw CameraHistoryError.invalidResponse }
@@ -66,7 +69,7 @@ nonisolated struct CameraThumbnailParser {
                 guard record.outcome == "complete", record.frames == 1, self.data.count == header.byteCount else {
                     throw CameraHistoryError.invalidResponse
                 }
-                result = CameraThumbnail(data: self.data, width: header.width, height: header.height, timestamp: header.timestamp)
+                result = CameraThumbnail(data: self.data, width: header.width, height: header.height, timestamp: header.timestamp, isHidden: CameraVideoTags.hidden(header.tags))
             } else {
                 guard record.outcome == "unavailable", record.frames == 0 else { throw CameraHistoryError.invalidResponse }
             }

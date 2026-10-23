@@ -27,13 +27,14 @@ struct CameraHistoryExportDraft {
 }
 
 enum CameraHistoryExportError: LocalizedError {
-    case noVideo, invalidRange, incomplete(String), writing
+    case noVideo, invalidRange, incomplete(String), writing, hiddenVideo
     var errorDescription: String? {
         switch self {
         case .noVideo: "No recorded video is available in this interval."
         case .invalidRange: "Choose an export interval between zero and 24 hours."
         case .incomplete(let message): "The complete interval could not be read. \(message)"
         case .writing: "The history video could not be written to a movie."
+        case .hiddenVideo: "This interval contains hidden footage. Show hidden video with the eye button before exporting it."
         }
     }
 }
@@ -50,9 +51,9 @@ enum CameraHistoryExporter {
 
     static func export(cameraID: String, name: String, range: CameraHistoryRange,
                        source: any CameraHistoryFetching,
-                       windowDuration: Double = 10,
+                       windowDuration: Double = 10, showsHiddenVideo: Bool = false,
                        progress: (Double) -> Void = { _ in }) async throws -> Result {
-        let movies = CameraHistoryMovieWriter(name: name, range: range)
+        let movies = CameraHistoryMovieWriter(name: name, range: range, showsHiddenVideo: showsHiddenVideo)
         do {
             guard range.isValid, range.duration <= CameraHistoryExportDraft.maximumDuration,
                   windowDuration > 0, windowDuration <= 120 else { throw CameraHistoryExportError.invalidRange }
@@ -96,6 +97,7 @@ enum CameraHistoryExporter {
 final class CameraHistoryMovieWriter {
     private let name: String
     private let range: CameraHistoryRange
+    private let showsHiddenVideo: Bool
     private var writer: AVAssetWriter?
     private var input: AVAssetWriterInput?
     private var url: URL?
@@ -107,7 +109,9 @@ final class CameraHistoryMovieWriter {
     private var creationTime: Double = 0
     private(set) var recordings: [CameraLocalRecording] = []
 
-    init(name: String, range: CameraHistoryRange) { self.name = name; self.range = range }
+    init(name: String, range: CameraHistoryRange, showsHiddenVideo: Bool = false) {
+        self.name = name; self.range = range; self.showsHiddenVideo = showsHiddenVideo
+    }
 
     func append(_ piece: CameraHistoryPiece, window: CameraHistoryRange) async throws {
         try Task.checkCancellation()
@@ -156,6 +160,9 @@ final class CameraHistoryMovieWriter {
             let sample = piece.samples[index]
             let time = sample.time(in: incoming)
             guard time < min(range.end, selected.end) else { break }
+            // Include decoder preroll in the check: these bytes are visible in
+            // the exported movie even if they precede the chosen interval.
+            guard showsHiddenVideo || !sample.isHidden else { throw CameraHistoryExportError.hiddenVideo }
             let raw = try CameraHistorySampleBuilder.sample(sample, segment: incoming, format: format, origin: 0, display: true)
             let scale = Int32(incoming.timescale)
             let pts = CMTimeAdd(chunkStart, CMTimeSubtract(CMTime(value: sample.frame.presentationTicks, timescale: scale), firstPTS))
@@ -228,6 +235,9 @@ final class CameraHistoryMovieWriter {
 
 @MainActor
 final class CameraHistoryExportController: ObservableObject {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     struct Target {
         let name: String
         let metadata: HBCameraPlaybackMetadata?
@@ -266,7 +276,7 @@ final class CameraHistoryExportController: ObservableObject {
         }
     }
 
-    func start(destination: any CameraRecordingDestination,
+    func start(destination: any CameraRecordingDestination, showsHiddenVideo: Bool = false,
                makeSource: @escaping (HBCameraPlaybackMetadata) async -> any CameraHistoryFetching) {
         guard !isBusy, let draft, draft.validationMessage == nil, !targets.isEmpty else { return }
         isExporting = true; error = nil; notices = []; progress = 0
@@ -284,7 +294,7 @@ final class CameraHistoryExportController: ObservableObject {
                     status = "Exporting \(target.name)…"
                     let source = await makeSource(metadata)
                     let result = try await CameraHistoryExporter.export(cameraID: metadata.cameraID,
-                        name: target.name, range: range, source: source) { fraction in
+                        name: target.name, range: range, source: source, showsHiddenVideo: showsHiddenVideo) { fraction in
                             if self.generation == id { self.progress = (Double(index) + fraction) / Double(targets.count) }
                         }
                     completed += result.recordings

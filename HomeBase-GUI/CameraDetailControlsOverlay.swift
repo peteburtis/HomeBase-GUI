@@ -9,13 +9,13 @@ import HomeBaseProtocol
 import SwiftUI
 
 struct CameraDetailControlSet {
-    let privacy: LiveDeviceControl?
+    let shutter: LiveDeviceControl?
     let pan: LiveDeviceControl?
     let tilt: LiveDeviceControl?
     let zoom: LiveDeviceControl?
 
     init(controls: [LiveDeviceControl]) {
-        privacy = Self.bestControl(for: .privacy, in: controls)
+        shutter = Self.bestControl(for: .shutter, in: controls)
         pan = Self.bestControl(for: .pan, in: controls)
         tilt = Self.bestControl(for: .tilt, in: controls)
         zoom = Self.bestControl(for: .zoom, in: controls)
@@ -28,15 +28,15 @@ struct CameraDetailControlSet {
     var hasPTZ: Bool { hasPanTilt || zoom != nil }
 
     var hasAnyControl: Bool {
-        privacy != nil || hasPanTilt || zoom != nil
+        shutter != nil || hasPanTilt || zoom != nil
     }
 
-    var observedPrivacyEnabled: Bool? {
-        privacy?.cameraOverlayObservedBooleanValue
+    var observedShutterClosed: Bool? {
+        shutter?.cameraOverlayObservedBooleanValue
     }
 
     private enum Role {
-        case privacy
+        case shutter
         case pan
         case tilt
         case zoom
@@ -52,7 +52,7 @@ struct CameraDetailControlSet {
             }
             let score = matchScore(control, for: role)
             guard score > 0 else { return nil }
-            if role != .privacy, control.cameraOverlayScalarRange == nil {
+            if role != .shutter, control.cameraOverlayScalarRange == nil {
                 return nil
             }
             return (score, control)
@@ -74,9 +74,9 @@ struct CameraDetailControlSet {
         ].map { $0.lowercased() }
 
         switch role {
-        case .privacy:
-            if metadata["cameraPrivacy"]?.boolValue == true { return 100 }
-            return semanticNames.contains("privacy.enabled") ? 50 : 0
+        case .shutter:
+            if metadata["cameraShutter"]?.boolValue == true { return 100 }
+            return semanticNames.contains("shutter.closed") ? 50 : 0
         case .pan:
             if canonicalComponent == "pantilt[0]" { return 100 }
             return semanticNames.contains("ptz.pan.position") ? 50 : 0
@@ -90,7 +90,7 @@ struct CameraDetailControlSet {
     }
 }
 
-enum CameraPrivacyStreamRecovery {
+enum CameraShutterStreamRecovery {
     static func shouldRequestRestart(
         from previousValue: Bool?,
         to currentValue: Bool?
@@ -244,6 +244,9 @@ struct CameraZoomGestureTarget {
 
 @MainActor
 final class CameraPanTiltGestureController: ObservableObject {
+    // SwiftUI may release this outside a Swift task; teardown needs no actor hop.
+    nonisolated deinit {}
+
     private struct WriteRequest {
         let target: CameraPanTiltGestureTarget
         let position: CameraPanTiltPosition
@@ -386,6 +389,9 @@ final class CameraPanTiltGestureController: ObservableObject {
 
 @MainActor
 final class CameraZoomGestureController: ObservableObject {
+    // SwiftUI may release this outside a Swift task; teardown needs no actor hop.
+    nonisolated deinit {}
+
     private struct WriteRequest {
         let target: CameraZoomGestureTarget
         let value: Double
@@ -541,9 +547,13 @@ extension View {
     }
 }
 
-enum CameraPrivacyButtonPresentation {
-    static func systemImageName(privacyEnabled: Bool) -> String {
-        privacyEnabled ? "eye.slash" : "eye"
+enum CameraShutterButtonPresentation {
+    static func image(shutterClosed: Bool) -> Image {
+        // SF Symbols has camera.aperture but no slashed variant. The bundled
+        // template adds a slash to that same symbol for the closed state.
+        shutterClosed
+            ? Image("CameraShutterClosed").renderingMode(.template)
+            : Image(systemName: "camera.aperture")
     }
 }
 
@@ -689,35 +699,37 @@ struct CameraDayNightModeTarget {
     }
 }
 
-struct CameraPrivacyToolbarControl: View {
+struct CameraShutterToolbarControl: View {
     let control: LiveDeviceControl
     @ObservedObject var model: LiveDeviceControlsModel
 
     var body: some View {
         Toggle(isOn: selection) {
-            Label("Privacy mode", systemImage:
-                CameraPrivacyButtonPresentation.systemImageName(
-                    privacyEnabled: isOn
-                ))
+            Label {
+                Text("Camera shutter")
+            } icon: {
+                CameraShutterButtonPresentation.image(shutterClosed: isClosed)
+            }
         }
         .toggleStyle(.button)
         .disabled(!isEnabled || control.isUpdating)
-        .accessibilityLabel("Privacy mode")
-        .accessibilityValue(isOn ? "On" : "Off")
+        .accessibilityLabel("Camera shutter")
+        .accessibilityValue(isClosed ? "Closed" : "Open")
+        .help(isClosed ? "Open camera shutter" : "Close camera shutter")
         .accessibilityHint(
-            isOn ? "Turns privacy mode off" : "Turns privacy mode on"
+            isClosed ? "Opens the camera shutter" : "Closes the camera shutter"
         )
     }
 
-    private var isOn: Bool {
+    private var isClosed: Bool {
         control.cameraOverlayBooleanValue ?? false
     }
 
     private var selection: Binding<Bool> {
         Binding(
-            get: { isOn },
+            get: { isClosed },
             set: { requestedValue in
-                guard requestedValue != isOn else { return }
+                guard requestedValue != isClosed else { return }
                 Task {
                     try? await model.setPresentedValue(
                         control.cameraOverlayBooleanWireValue(requestedValue),

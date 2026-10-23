@@ -23,12 +23,16 @@ nonisolated struct CameraS3ManifestShard: Codable, Equatable, Sendable {
     let encryption: String?
     let timing: CameraS3ShardTiming
     let endTicks: Int64
+    var tagMetadata: CameraStoredVideoTags? = nil
+    var tagRevision: String? = nil
     var range: CameraHistoryRange {
         .init(start: timing.time.canonicalUTC,
               end: timing.time.canonicalUTC + Double(endTicks) / Double(timing.timescale))
     }
 
     func validate(store: HBCameraPlaybackMetadata.S3Store, cameraID: String) throws {
+        try tagMetadata?.validate()
+        guard encryption == nil || tagMetadata?.timeline == nil else { throw CameraS3HistoryError.invalidManifest }
         guard UUID(uuidString: id) != nil, timing.shardID == id,
               timing.storeID == store.id, timing.cameraID == cameraID,
               timing.format == "com.graygoolabs.hbnvr.timing", timing.schemaVersion == 1,

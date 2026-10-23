@@ -725,6 +725,9 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
 
 @MainActor
 private final class LegacyCameraCanvasState: ObservableObject {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     @Published var ignoresSafeArea = true
     @Published var avoidsOcclusions = true
     @Published var verticalSizeClass: UserInterfaceSizeClass = .regular

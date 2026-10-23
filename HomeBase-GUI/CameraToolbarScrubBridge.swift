@@ -16,6 +16,9 @@ enum CameraToolbarScrubEvent {
 
 @MainActor
 final class CameraToolbarScrubRelay: ObservableObject {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     let events = PassthroughSubject<CameraToolbarScrubEvent, Never>()
 }
 

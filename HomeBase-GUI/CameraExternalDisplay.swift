@@ -51,6 +51,7 @@ final class CameraExternalDisplayPresentation: ObservableObject {
             authorizationObservation = lifecycle?.session.$isUnlocked.dropFirst().sink { [weak self] unlocked in
                 guard !unlocked, let self else { return }
                 self.releaseRetention()
+                self.group?.veil.hide()
                 self.group?.suspend()
                 self.group?.suspendResources(stopImmediately: true)
                 self.group?.sessions.forEach { $0.playback.revokeCameraAccess() }
@@ -164,13 +165,15 @@ final class CameraExternalDisplaySceneDelegate: NSObject, UIWindowSceneDelegate 
         guard session.role == .windowExternalDisplayNonInteractive,
               let scene = scene as? UIWindowScene else { return }
         externalScene = scene
+#if HOMEBASE_SCENE_ACCESSORIES
         if #available(iOS 27.0, *),
            let presentation = connectionOptions.sceneAccessoryUserInfo as? CameraExternalDisplayPresentation {
             show(presentation)
-        } else {
-            observation = CameraExternalDisplayRouter.shared.$active.sink { [weak self] presentation in
-                self?.show(presentation)
-            }
+            return
+        }
+#endif
+        observation = CameraExternalDisplayRouter.shared.$active.sink { [weak self] presentation in
+            self?.show(presentation)
         }
     }
 
@@ -276,14 +279,16 @@ final class CameraExternalDisplayViewController: UIViewController {
         guard !isPresenting else { return }
         isPresenting = true
         refreshPresentation()
+#if HOMEBASE_SCENE_ACCESSORIES
         if #available(iOS 27.0, *) {
             let configuration = UISceneConfiguration()
             configuration.delegateClass = CameraExternalDisplaySceneDelegate.self
             accessoryRegistration = registerSceneAccessory(.externalNonInteractive(
                 sceneConfiguration: configuration, userInfo: presentation))
-        } else {
-            CameraExternalDisplayRouter.shared.register(presentation, id: id)
+            return
         }
+#endif
+        CameraExternalDisplayRouter.shared.register(presentation, id: id)
     }
 
     override func viewDidDisappear(_ animated: Bool) {
@@ -308,9 +313,11 @@ final class CameraExternalDisplayViewController: UIViewController {
     }
 
     func stopPresenting() {
+#if HOMEBASE_SCENE_ACCESSORIES
         if #available(iOS 27.0, *), let registration = accessoryRegistration as? UISceneAccessoryRegistration {
             unregisterSceneAccessory(registration)
         }
+#endif
         accessoryRegistration = nil
         if isPresenting { CameraExternalDisplayRouter.shared.unregister(id) }
         isPresenting = false

@@ -3,6 +3,9 @@ import HomeBaseProtocol
 
 @MainActor
 final class CameraHistoryPlayback {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     enum State: Equatable { case idle, loading, ready, gap, failed(String) }
     private(set) var buffer = CameraHistoryBuffer()
     private(set) var isActive = false

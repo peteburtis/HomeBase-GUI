@@ -7,8 +7,12 @@ import SwiftUI
 
 @MainActor
 final class CameraGridPreviewModel: ObservableObject {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     enum Preview {
         case pending
+        case hidden
         case thumbnail(CGImage, timestamp: Double)
         case live
     }
@@ -100,6 +104,10 @@ final class CameraGridPreviewModel: ObservableObject {
                 try Task.checkCancellation()
                 guard generation == activeToken else { return false }
                 if let thumbnail {
+                    if thumbnail.isHidden {
+                        previews[camera.id] = .hidden
+                        continue
+                    }
                     previews[camera.id] = .thumbnail(
                         try decode(thumbnail),
                         timestamp: thumbnail.timestamp
@@ -122,6 +130,7 @@ final class CameraGridPreviewModel: ObservableObject {
                 // Preserve a successfully decoded image through transient
                 // worker/network failures. With no image yet, provide live.
                 if case .some(.thumbnail) = previews[camera.id] { continue }
+                if case .some(.hidden) = previews[camera.id] { continue }
                 previews[camera.id] = .live
             }
         }
@@ -182,6 +191,8 @@ struct CameraGridPreview: View {
             Color.black
                 .aspectRatio(16 / 9, contentMode: .fit)
                 .accessibilityLabel("Loading camera preview")
+        case .hidden:
+            CameraVeilCover().aspectRatio(16 / 9, contentMode: .fit)
         case .thumbnail(let image, _):
             Image(decorative: image, scale: 1)
                 .resizable()

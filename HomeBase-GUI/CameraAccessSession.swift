@@ -70,6 +70,7 @@ final class CameraSystemBiometricAuthenticator: CameraBiometricAuthenticating {
                 else { continuation.resume(throwing: CameraAccessError.authentication(error)) }
             }
         }
+        CameraBiometricConsent.hasAuthenticated = true
     }
 }
 

@@ -16,11 +16,13 @@ actor CameraS3ThumbnailReader: CameraS3ThumbnailReading {
     private let objects: any CameraS3ObjectReading
     private var password: String?
     private var closed = false
+    private let manifests: CameraS3HistoryReader
     init(store: HBCameraPlaybackMetadata.S3Store, cameraID: String, password: String?,
          objects: any CameraS3ObjectReading) {
         self.store = store; self.cameraID = cameraID; self.password = password; self.objects = objects
+        manifests = CameraS3HistoryReader(store: store, cameraID: cameraID, password: password, objects: objects)
     }
-    func close() async { closed = true; password = nil; await objects.close() }
+    func close() async { closed = true; password = nil; await manifests.close() }
     private func check() throws {
         try Task.checkCancellation()
         if closed { throw CancellationError() }
@@ -59,7 +61,14 @@ actor CameraS3ThumbnailReader: CameraS3ThumbnailReading {
             guard wire.count <= CameraS3Thumbnail.maximumBytes + 72 else { throw CameraHistoryError.tooLarge }
             if isEncrypted && !wire.starts(with: CameraS3Decryption.magic) { throw CameraS3Decryption.Failure.invalidEnvelope }
             let data = try CameraS3Decryption.decrypt(wire, password: password)
-            let image = try CameraS3Thumbnail.decode(data, storeID: store.id, cameraID: cameraID, slot: slot, size: request.size)
+            var image = try CameraS3Thumbnail.decode(data, storeID: store.id, cameraID: cameraID, slot: slot, size: request.size)
+            try check()
+            do {
+                if let hidden = try await manifests.hidden(at: image.timestamp) { image.isHidden = hidden }
+            } catch CameraS3ReadError.missing {
+                // Legacy previews can predate the playback index. Other errors
+                // remain errors: a failed read is not proof of public footage.
+            }
             try check()
             return image
         }
@@ -85,6 +94,7 @@ nonisolated enum CameraS3Thumbnail {
         let cameraID: String
         let slot: Double
         let timestamp: Double
+        var tags: [String: String]? = nil
     }
     static func decode(_ data: Data, storeID: String, cameraID: String, slot: Double,
                        size: HBNVRThumbnailRequest.Size) throws -> CameraThumbnail {
@@ -100,12 +110,13 @@ nonisolated enum CameraS3Thumbnail {
               let width = properties[kCGImagePropertyPixelWidth] as? Int, (1...1280).contains(width),
               let height = properties[kCGImagePropertyPixelHeight] as? Int, (1...720).contains(height),
               let iptc = properties[kCGImagePropertyIPTCDictionary] as? [CFString: Any],
-              let text = iptc[kCGImagePropertyIPTCCaptionAbstract] as? String, text.utf8.count <= 4096,
+              let text = iptc[kCGImagePropertyIPTCCaptionAbstract] as? String, text.utf8.count <= 16_384,
               let caption = try? JSONDecoder().decode(Caption.self, from: Data(text.utf8)),
               caption.format == "hbnvr-s3-thumbnail", caption.version == 1,
               caption.storeID == storeID, caption.cameraID == cameraID, caption.slot == slot,
               caption.timestamp.isFinite, caption.timestamp >= 0, caption.timestamp <= slot,
               slot - caption.timestamp <= 120 else { throw CameraHistoryError.invalidResponse }
+        if let tags = caption.tags { try HBVideoTags.validate(tags) }
         let scale = min(1, min(Double(size.width) / Double(width), Double(size.height) / Double(height)))
         let maximum = max(1, Int(floor(Double(max(width, height)) * scale)))
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
@@ -119,7 +130,7 @@ nonisolated enum CameraS3Thumbnail {
         }
         CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { throw CameraHistoryError.invalidResponse }
-        return .init(data: output as Data, width: image.width, height: image.height, timestamp: caption.timestamp)
+        return .init(data: output as Data, width: image.width, height: image.height, timestamp: caption.timestamp, isHidden: CameraVideoTags.hidden(caption.tags))
     }
 }
 

@@ -49,6 +49,9 @@ nonisolated enum CameraSwitchPosition: Equatable, Sendable {
 
 @MainActor
 final class CameraScreenSelection: ObservableObject {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     struct Session {
         let id: UUID
         let device: HBTopologyDeviceDescriptor
@@ -76,6 +79,9 @@ final class CameraScreenSelection: ObservableObject {
 
 @MainActor
 final class CameraPickerModel: ObservableObject {
+    // SwiftUI may release this outside a Swift task; teardown needs no actor hop.
+    nonisolated deinit {}
+
     @Published private(set) var cameras: [CameraVideoDevice] = []
     @Published private(set) var isLoading = false
     @Published private(set) var error: String?

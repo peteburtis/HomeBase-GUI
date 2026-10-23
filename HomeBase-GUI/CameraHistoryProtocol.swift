@@ -46,6 +46,9 @@ nonisolated struct CameraHistorySegment: Codable, Equatable, Sendable {
     let codec: String
     let parameterSets: [Data]
     let nalUnitLengthBytes: Int
+    var tagRangesVersion: Int? = nil
+    var tagFrameCount: Int? = nil
+    var tagByteCount: Int? = nil
 
     func validate() throws {
         guard number >= 0, range.isValid, timescale > 0, timescale <= Int32.max,
@@ -75,6 +78,9 @@ nonisolated struct CameraHistoryFrame: Codable, Equatable, Sendable {
 nonisolated struct CameraHistorySample: Sendable {
     let frame: CameraHistoryFrame
     let data: Data
+    var isHidden = false
+    /// Original shard ordinal for S3 prospective tags; independent of rounded PTS.
+    var sourceFrame: Int64? = nil
     func time(in segment: CameraHistorySegment) -> Double {
         segment.time.canonicalUTC + Double(frame.presentationTicks) / Double(segment.timescale)
     }
@@ -170,6 +176,14 @@ nonisolated struct CameraHistoryResponseParser {
     private var receivedBytes = 0
     private var frameCount = 0
     private var recordCount = 0
+    private var tagBytesRemaining = 0
+    private var tagPayload = Data()
+    private var hiddenFrames = IndexSet()
+    private var expectedTagFrames: Int?
+
+    private func validateTagFrameCount() throws {
+        if let expectedTagFrames, pieces.last?.samples.count != expectedTagFrames { throw CameraHistoryError.invalidResponse }
+    }
 
     init(request: HBNVRMediaRequest, maximumBytes: Int = 64 * 1024 * 1024) {
         self.request = request
@@ -177,7 +191,7 @@ nonisolated struct CameraHistoryResponseParser {
     }
 
     mutating func text(_ data: Data) throws {
-        guard result == nil, pending == nil, data.count <= 65_536, recordCount < 65_536 else {
+        guard result == nil, pending == nil, tagBytesRemaining == 0, data.count <= 65_536, recordCount < 65_536 else {
             throw CameraHistoryError.invalidResponse
         }
         recordCount += 1
@@ -204,7 +218,16 @@ nonisolated struct CameraHistoryResponseParser {
                   !pieces.contains(where: { $0.segment.number == segment.number }) else {
                 throw CameraHistoryError.invalidResponse
             }
+            try validateTagFrameCount()
             try segment.validate()
+            hiddenFrames = []; expectedTagFrames = nil
+            if segment.tagRangesVersion != nil || segment.tagByteCount != nil || segment.tagFrameCount != nil {
+                guard segment.tagRangesVersion == 1, let count = segment.tagFrameCount, (1...1_000_000).contains(count),
+                      let bytes = segment.tagByteCount, (2...4_194_304).contains(bytes),
+                      receivedBytes + bytes <= maximumBytes else { throw CameraHistoryError.invalidResponse }
+                expectedTagFrames = count; tagBytesRemaining = bytes; tagPayload = Data()
+                receivedBytes += bytes
+            }
             pieces.append(CameraHistoryPiece(id: UUID(), segment: segment, samples: []))
         case "frame":
             guard request.operation == "frames", range != nil, let frame = record.frame, let piece = pieces.last,
@@ -248,6 +271,7 @@ nonisolated struct CameraHistoryResponseParser {
             }
             neighbors = value
         case "end":
+            try validateTagFrameCount()
             if request.operation == "neighbors" {
                 guard let range, let neighbors, record.outcome == "complete", record.frames == 0 else {
                     throw CameraHistoryError.invalidResponse
@@ -266,6 +290,15 @@ nonisolated struct CameraHistoryResponseParser {
     }
 
     mutating func bytes(_ data: Data) throws {
+        if tagBytesRemaining > 0 {
+            guard !data.isEmpty, data.count <= 65_536, data.count <= tagBytesRemaining else { throw CameraHistoryError.invalidResponse }
+            tagPayload.append(data); tagBytesRemaining -= data.count
+            if tagBytesRemaining == 0 {
+                hiddenFrames = try CameraVideoTags.hiddenFrames(tagPayload, count: expectedTagFrames!)
+                tagPayload = Data()
+            }
+            return
+        }
         guard let pending, !data.isEmpty, data.count <= 65_536,
               payload.count + data.count <= pending.byteCount else { throw CameraHistoryError.invalidResponse }
         payload.append(data)
@@ -274,7 +307,7 @@ nonisolated struct CameraHistoryResponseParser {
               Self.validAccessUnit(payload, lengthBytes: segment.nalUnitLengthBytes) else {
             throw CameraHistoryError.invalidResponse
         }
-        pieces[pieces.count - 1].samples.append(CameraHistorySample(frame: pending, data: payload))
+        pieces[pieces.count - 1].samples.append(CameraHistorySample(frame: pending, data: payload, isHidden: hiddenFrames.contains(pieces.last!.samples.count)))
         receivedBytes += payload.count
         frameCount += 1
         self.pending = nil

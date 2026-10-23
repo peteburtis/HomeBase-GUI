@@ -214,6 +214,9 @@ private struct SettingsFixture {
 
 @MainActor
 private final class SettingsCredentialStore: CameraS3CredentialStoring {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     let bundle = CameraS3Credentials(destinationID: "fixture-store", accessKeyID: "DUMMY", secretAccessKey: "DUMMY", encryptionPassword: nil)
     var presence: CameraS3CredentialPresence = .missing
     var inspections = 0, loads = 0, saves = 0, deletions = 0
@@ -242,6 +245,9 @@ private final class SettingsCredentialStore: CameraS3CredentialStoring {
 
 @MainActor
 private final class SettingsAuthenticator: CameraBiometricAuthenticating {
+    // SwiftUI may release this outside a Swift task; teardown needs no actor hop.
+    nonisolated deinit {}
+
     var attempts: [CameraAuthenticationAttempt] = []
     var failure: CameraAccessError?
     var suspends = false

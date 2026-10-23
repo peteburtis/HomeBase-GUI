@@ -6,6 +6,32 @@ import XCTest
 
 @MainActor
 final class CameraLivePlaybackTests: XCTestCase {
+    func testExternalDisplayCannotRevealHiddenBootstrapOrRetainImageAfterReCovering() async throws {
+        let clip = try video(), owner = UUID()
+        let playback = CameraLivePlaybackController()
+        _ = try playback.configure(clip.configuration, ownerID: owner)
+        defer { playback.close() }
+        for var frame in clip.frames.prefix(2) {
+            frame.tags = ["homebase.hidden": "true"]
+            XCTAssertNil(try playback.receive(frame, ownerID: owner))
+        }
+        let output = CameraDisplayOutputSpy()
+        playback.renderer.displayRelay.attach(output)
+        XCTAssertEqual(output.samples.count, 2)
+        XCTAssertTrue(output.samples.indices.allSatisfy(output.isHidden(at:)))
+        playback.setShowsHiddenVideo(true)
+        var revealed = clip.frames[2]; revealed.tags = ["homebase.hidden": "true"]
+        XCTAssertNotNil(try playback.receive(revealed, ownerID: owner))
+        XCTAssertFalse(output.isHidden(at: output.samples.count - 1))
+        playback.setShowsHiddenVideo(false)
+        XCTAssertEqual(output.flushes.last, true)
+        let reconnected = CameraDisplayOutputSpy()
+        playback.renderer.displayRelay.attach(reconnected)
+        XCTAssertTrue(reconnected.samples.isEmpty, "A newly connected screen cannot bootstrap the revealed private image")
+        playback.renderer.displayRelay.detach(output)
+        playback.renderer.displayRelay.detach(reconnected)
+    }
+
     func testExternalDisplayCanDecodeTheCurrentPictureAfterConnecting() async throws {
         let clip = try video()
         let renderer = CameraH264Renderer()
@@ -97,7 +123,7 @@ final class CameraLivePlaybackTests: XCTestCase {
         for relay in [CameraVideoDisplayRelay(maximumSamples: 2), CameraVideoDisplayRelay(maximumBytes: 1)] {
             for (index, frame) in frames.enumerated() { relay.enqueue(frame, keyFrame: index == 0) }
             var output: CameraDisplayOutputSpy? = CameraDisplayOutputSpy()
-            weak let weakOutput = output
+            weak var weakOutput = output
             relay.attach(try XCTUnwrap(output))
             XCTAssertTrue(try XCTUnwrap(output).samples.isEmpty)
             output = nil
@@ -740,6 +766,34 @@ final class CameraLivePlaybackTests: XCTestCase {
         XCTAssertFalse(controller.isPaused)
         XCTAssertEqual(controller.timeline.position, controller.timeline.head)
         XCTAssertGreaterThan(controller.timeline.retainedBytes, bytes)
+    }
+
+    func testVeilDecodesHiddenLiveFramesAndPublicPFrameResumesImmediately() async throws {
+        let fixture = try video(), owner = UUID()
+        let controller = CameraLivePlaybackController()
+        _ = try controller.configure(fixture.configuration, ownerID: owner)
+        var first = fixture.frames[0]; first.tags = ["homebase.hidden": "true"]
+        XCTAssertNil(try controller.receive(first, ownerID: owner))
+        XCTAssertTrue(controller.isVeiled)
+        XCTAssertFalse(fixture.frames[1].flags.contains(.keyFrame))
+        var publicFrame = fixture.frames[1]; publicFrame.tags = [:]
+        XCTAssertNotNil(try controller.receive(publicFrame, ownerID: owner))
+        XCTAssertFalse(controller.isVeiled)
+        controller.setShowsHiddenVideo(true)
+        var hidden = fixture.frames[2]; hidden.tags = ["homebase.hidden": "true"]
+        XCTAssertNotNil(try controller.receive(hidden, ownerID: owner))
+        XCTAssertTrue(controller.isFrameHidden); XCTAssertFalse(controller.isVeiled)
+        controller.togglePause()
+        controller.setShowsHiddenVideo(false)
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertTrue(controller.isVeiled)
+        controller.setShowsHiddenVideo(true)
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertFalse(controller.isVeiled); XCTAssertNil(controller.errorMessage)
+        controller.close()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            controller.renderer.layer.sampleBufferRenderer.flush(removingDisplayedImage: true) { continuation.resume() }
+        }
     }
 
     func testRendererMarksPrerollDecodeOnlyAndFlushRequiresKeyframe() async throws {

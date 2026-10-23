@@ -399,7 +399,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         let fixture = try await makeFixture()
         defer { fixture.close() }
         let tabs = try XCTUnwrap(descendant(UITabBarController.self, in: fixture.host))
-        XCTAssertEqual(tabs.tabs.count, 4)
+        XCTAssertEqual(tabs.viewControllers?.count, 4)
 
         for (index, title) in [(2, "Scenes"), (3, "Triggers")] {
             let controller = try await selectTab(index, in: tabs)

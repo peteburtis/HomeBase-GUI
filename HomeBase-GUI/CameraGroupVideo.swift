@@ -537,9 +537,11 @@ struct CameraGroupCanvas<Content: View>: View {
 
     private func activeOcclusionFrames(in proxy: GeometryProxy) -> [CGRect] {
 #if os(iOS)
+#if HOMEBASE_FOLDABLE_LAYOUT
         if #available(iOS 27.1, *) {
             return proxy.reservedRegions(kind: .occlusion).map(\.frame)
         }
+#endif
         return CameraGroupLayout.legacyOcclusionFrames(in: proxy.size,
             isPhone: UIDevice.current.userInterfaceIdiom == .phone, ignoresSafeArea: ignoresSafeArea,
             vertical: verticalSizeClass)
@@ -549,7 +551,7 @@ struct CameraGroupCanvas<Content: View>: View {
     }
 
     private func firstActiveDivision(in proxy: GeometryProxy) -> CameraGroupLayout.Division? {
-#if os(iOS)
+#if os(iOS) && HOMEBASE_FOLDABLE_LAYOUT
         if #available(iOS 27.1, *) {
             guard let region = proxy.reservedRegions(kind: .division).first else { return nil }
             return CameraGroupLayout.Division(
@@ -569,7 +571,7 @@ struct CameraDeviceHingeObserver: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
-#if os(iOS)
+#if os(iOS) && HOMEBASE_FOLDABLE_LAYOUT
         if #available(iOS 27.1, *) {
             content.onHingeChange { _, context in
                 state = CameraDeviceHingeState(
@@ -751,7 +753,7 @@ private struct CameraGroupPane: View {
     }
 
     private var timeZone: TimeZone { CameraHistoryTimestamp.timeZone(in: controls.deviceMetadata) }
-    private var privacy: Bool? { CameraDetailControlSet(controls: controls.controls).observedPrivacyEnabled }
+    private var shutter: Bool? { CameraDetailControlSet(controls: controls.controls).observedShutterClosed }
     private var isLive: Bool { group.active ? group.isLive : playback.isLive }
     private var isHistory: Bool { group.active ? group.source == .history : playback.isUsingHistory }
     private var gesturesEnabled: Bool {
@@ -785,6 +787,9 @@ private struct CameraGroupPane: View {
                             onMagnify: magnify, onSingleTap: onSingleTap, onTwoFingerTap: { session.gestures.recenter() })
                     }
                 }
+            if playback.isVeiled {
+                CameraVeilCover()
+            }
             if group.resolvingTime {
                 status("Loading history…", loading: true)
             } else if !isLive {
@@ -854,8 +859,8 @@ private struct CameraGroupPane: View {
         .accessibilityAction(named: "Recenter \(session.camera.device.displayName)") {
             if gesturesEnabled { session.gestures.recenter() }
         }
-        .onChange(of: privacy) { old, new in
-            if !isExternalDisplay, CameraPrivacyStreamRecovery.shouldRequestRestart(from: old, to: new) {
+        .onChange(of: shutter) { old, new in
+            if !isExternalDisplay, CameraShutterStreamRecovery.shouldRequestRestart(from: old, to: new) {
                 session.restartLiveVideoIfNeeded()
             }
         }

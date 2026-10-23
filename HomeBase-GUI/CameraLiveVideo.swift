@@ -378,6 +378,9 @@ nonisolated final class HomeBaseMediaConnection: @unchecked Sendable {
 
 @MainActor
 final class CameraH264Renderer: ObservableObject {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     enum RendererError: Error, LocalizedError {
         case unsupportedCodec(String)
         case invalidParameterSets
@@ -694,6 +697,9 @@ struct CameraLiveVideoRunOwnership {
 
 @MainActor
 final class CameraLiveVideoModel: ObservableObject {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     enum State: Equatable {
         case idle
         case connecting
@@ -706,6 +712,15 @@ final class CameraLiveVideoModel: ObservableObject {
     @Published private(set) var state: State = .idle
     @Published private(set) var aspectRatio: CGFloat = 16 / 9
     @Published private(set) var qualityWarning: String?
+    @Published private(set) var previewIsHidden = false
+    @Published private(set) var showsHiddenVideo = false
+    var usesPlaybackController: Bool { playbackController != nil }
+
+    func setShowsHiddenVideo(_ value: Bool) {
+        guard showsHiddenVideo != value else { return }
+        showsHiddenVideo = value
+        if !value && previewIsHidden && !usesPlaybackController { renderer.reset() }
+    }
 
     let renderer: CameraH264Renderer
 
@@ -918,15 +933,19 @@ final class CameraLiveVideoModel: ObservableObject {
             }
             if state != .playing { state = .waiting("Waiting for video…") }
         case .videoAccessUnit:
+            let hidden = CameraVideoTags.hidden(frame.tags)
+            if previewIsHidden != hidden { previewIsHidden = hidden }
             let sampleBuffer: CMSampleBuffer?
             if let playbackController {
                 sampleBuffer = try playbackController.receive(
                     frame, ownerID: ownerID
                 )
             } else {
-                sampleBuffer = try renderer.enqueue(frame)
+                sampleBuffer = try renderer.enqueue(frame, display: !previewIsHidden || showsHiddenVideo)
             }
-            if let sampleBuffer {
+            let recordingIsVeiled = CameraVideoTags.hidden(frame.tags) && !showsHiddenVideo
+            if recordingIsVeiled { await recordingController?.stop() }
+            if let sampleBuffer, !recordingIsVeiled {
                 recordingController?.append(
                     sampleBuffer,
                     ownerID: ownerID,
@@ -1143,6 +1162,9 @@ struct CameraLiveVideoSurface: View {
             }
         }
         .aspectRatio(model.aspectRatio, contentMode: .fit)
+        .overlay {
+            if !model.usesPlaybackController && model.previewIsHidden && !model.showsHiddenVideo { CameraVeilCover() }
+        }
         .accessibilityLabel(usesHistory ? "Recorded camera video" : "Live camera video")
         .overlay(alignment: .top) {
             if !usesHistory, let warning = model.qualityWarning {
@@ -1759,6 +1781,7 @@ private struct CameraFullScreenCameraContent: View {
     @StateObject private var playbackOwner: CameraViewerPlaybackOwner
     private var initialSession: CameraGroupSession { playbackOwner.initialSession }
     private var group: CameraGroupPlayback { playbackOwner.group }
+    private var veil: CameraVeilSession { group.veil }
     @State private var focusedCameraID: String?
     private var presentation: CameraGroupPresentation {
         CameraGroupPresentation(sessions: group.sessions, focusedCameraID: focusedCameraID)
@@ -1888,11 +1911,13 @@ private struct CameraFullScreenCameraContent: View {
 
     private var cameraPresentation: some View {
         liveVideo
+        .environment(\.cameraShowsHiddenVideo, veil.showsHidden)
         .onAppear {
             reconcilePhonePlayback()
             applyInitialPositionIfAuthorized()
         }
         .onDisappear {
+            veil.hide()
             cancelHistoryRestore()
             cameraSwitchTask?.cancel(); cameraSwitchTask = nil
             stopLiveCameraGestures()
@@ -1909,6 +1934,12 @@ private struct CameraFullScreenCameraContent: View {
 #else
             group.deactivate()
 #endif
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background { veil.hide() }
+        }
+        .onChange(of: access.isAuthorized) { _, authorized in
+            if !authorized { veil.hide() }
         }
         .onChange(of: cameraControlsEnabled) { _, enabled in
             if !enabled { stopLiveCameraGestures() }
@@ -1969,6 +2000,9 @@ private struct CameraFullScreenCameraContent: View {
     private var recordingPresentation: some View {
 #if os(iOS)
         cameraPresentation
+        .onChange(of: veil.showsHidden) { wasRevealed, revealed in
+            if wasRevealed && !revealed { cancelHistoryExport() }
+        }
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.didReceiveMemoryWarningNotification
         )) { _ in
@@ -2210,9 +2244,12 @@ private struct CameraFullScreenCameraContent: View {
         }
         .overlayPreferenceValue(CameraTimelineBoundsPreference.self) { timelineBounds in
             if visiblePlayerControls {
-                if let destination = lockedS3Destination, access.session != nil {
-                    CameraPlayerPanelPlacement(panel: panel, timelineBounds: timelineBounds, leading: true) {
-                        CameraS3PadlockButton { s3Destination = destination }
+                CameraPlayerPanelPlacement(panel: panel, timelineBounds: timelineBounds, leading: true) {
+                    HStack(spacing: 12) {
+                        CameraVeilButton(veil: veil)
+                        if let destination = lockedS3Destination, access.session != nil {
+                            CameraS3PadlockButton { s3Destination = destination }
+                        }
                     }
                 }
             }
@@ -2322,8 +2359,8 @@ private struct CameraFullScreenCameraContent: View {
                             dayNightModeControl
                         }
                     }
-                    if let privacyControl {
-                        ToolbarItem(placement: .bottomBar) { privacyControl }
+                    if let shutterControl {
+                        ToolbarItem(placement: .bottomBar) { shutterControl }
                     }
                 }
                 if toolbarArrangement.playbackControlsInBottomTrailing,
@@ -2386,8 +2423,8 @@ private struct CameraFullScreenCameraContent: View {
                         dayNightModeControl
                     }
                 }
-                if let privacyControl {
-                    ToolbarItem(placement: .bottomBar) { privacyControl }
+                if let shutterControl {
+                    ToolbarItem(placement: .bottomBar) { shutterControl }
                 }
             }
 
@@ -2454,9 +2491,9 @@ private struct CameraFullScreenCameraContent: View {
                     dayNightModeControl
                 }
             }
-            if let privacyControl {
+            if let shutterControl {
                 ToolbarItem(placement: .primaryAction) {
-                    privacyControl
+                    shutterControl
                 }
             }
             ToolbarSpacer(.fixed, placement: .primaryAction)
@@ -2609,7 +2646,7 @@ private struct CameraFullScreenCameraContent: View {
             } else if !isLive {
                 prepareHistoryExport()
             } else {
-                guard cameraControlsEnabled else { return }
+                guard cameraControlsEnabled, presentation.visibleSessions.allSatisfy({ !$0.playback.isVeiled }) else { return }
                 Task {
                     await startRecording()
                 }
@@ -2624,7 +2661,7 @@ private struct CameraFullScreenCameraContent: View {
                     && pendingRecordings.isEmpty
                     && (isLive
                         ? (presentation.visibleSessions.isEmpty
-                            || !presentation.visibleSessions.allSatisfy({ $0.recordingController.isStreamAvailable })
+                            || !presentation.visibleSessions.allSatisfy({ $0.recordingController.isStreamAvailable && !$0.playback.isVeiled })
                             || !cameraControlsEnabled)
                         : !canExportHistory))
         )
@@ -2677,7 +2714,7 @@ private struct CameraFullScreenCameraContent: View {
     private func startHistoryExport() {
         guard access.isUnlocked, !isPhoneViewerMinimized else { cancelHistoryExport(); return }
         let credentials = access.session?.unlockedCredentials
-        historyExport.start(destination: CameraPhotoLibraryRecordingDestination()) { metadata in
+        historyExport.start(destination: CameraPhotoLibraryRecordingDestination(), showsHiddenVideo: veil.showsHidden) { metadata in
             await CameraHistorySources.make(metadata: metadata, client: client, credentials: credentials)
         }
     }
@@ -3060,20 +3097,20 @@ private struct CameraFullScreenCameraContent: View {
 
     private var showsQualityControl: Bool { cameraControlsEnabled && playbackActionsEnabled }
 
-    private var privacyControl: CameraPrivacyToolbarControl? {
+    private var shutterControl: CameraShutterToolbarControl? {
         guard cameraControlsEnabled, activeControls.state == .live else {
             return nil
         }
         let controls = CameraDetailControlSet(
             controls: activeControls.controls
         )
-        guard let privacy = controls.privacy,
-              privacy.valid != false,
-              privacy.cameraOverlayBooleanValue != nil else {
+        guard let shutter = controls.shutter,
+              shutter.valid != false,
+              shutter.cameraOverlayBooleanValue != nil else {
             return nil
         }
-        return CameraPrivacyToolbarControl(
-            control: privacy,
+        return CameraShutterToolbarControl(
+            control: shutter,
             model: activeControls
         )
     }
@@ -3097,7 +3134,7 @@ private struct CameraFullScreenCameraContent: View {
     private var hasLiveToolbarControls: Bool {
         showsQualityControl
             || dayNightModeControl != nil
-            || privacyControl != nil
+            || shutterControl != nil
     }
 
     private var qualityControl: some View {
@@ -3125,7 +3162,7 @@ private struct CameraFullScreenCameraContent: View {
         }
         .accessibilityLabel("Video quality")
         .accessibilityValue(
-            displayedQuality.map(CameraLiveQualityPresentation.title(for:)) ?? "Mixed"
+            displayedQuality.map { CameraLiveQualityPresentation.title(for: $0) } ?? "Mixed"
         )
         .disabled(!cameraControlsEnabled)
     }

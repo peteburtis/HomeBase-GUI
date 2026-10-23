@@ -426,7 +426,7 @@ the whole group. A camera without NVR shows unavailable in history, not live.
 Joining/removing a camera retains the group cursor. Readers have independent
 connections and caches; the existing buffer limits below apply **per camera**.
 
-Privacy and day/night controls are shown only when every selected
+Camera shutter and day/night controls are shown only when every selected
 camera advertises the corresponding valid, writable capability. PTZ buttons and
 sliders are hidden with two or more selected cameras. Drag, pinch, and two-finger recenter operate
 only on the touched pane's camera, according to that camera's capabilities; they
@@ -1198,3 +1198,58 @@ deduplication, shard rebasing, concatenation across gaps/epochs/rounding and
 one-frame discontinuities, a three-hour/1,080-chunk single-file export, genuine
 codec-change splits, failure/cancellation cleanup, native
 range layouts, and deferred Photos access.
+
+## Veil
+
+A frame with `homebase.hidden` is covered by black, `eye.slash`, and **Private
+Video**. Presence counts regardless of the string value. Legacy footage without
+a known hidden tag remains visible. The eye button beside the S3 padlock reveals
+hidden footage for the current viewer, its camera panes, and timeline previews.
+It changes to `eye`; tapping again covers hidden footage. Reveal resets on
+dismissal, backgrounding, or loss of camera authorization. Seeking and Live/history
+switching retain it. Grid/detail previews never inherit reveal. Polling grid thumbnails retain a hidden marker instead of decoding or caching a visible private image.
+
+Veil uses a separate `LAContext.evaluatePolicy` check, without Keychain access
+or passcode fallback. Unavailable, unenrolled, or locked-out biometrics permit
+reveal; failure/cancellation leaves the veil up. Face ID has no public permission
+status query, so Veil attempts it only after a successful biometric check in this
+process proves consent already exists. Otherwise it reveals without prompting for
+permission. Available Touch ID can be used directly. Existing camera/S3 access
+authentication is unchanged.
+
+Hidden samples still feed decoder references but use `DoNotDisplay`, allowing
+normal hidden/public boundaries without waiting for another keyframe. Explicit
+re-covering clears the old revealed image; Live may briefly wait for a keyframe
+after that action. Photos recording is disabled while covered and stops if
+covered footage arrives. The current recording finalizes through the normal export choices.
+
+The group owns reveal state, so focus changes, additional panes, and external
+displays use the same decision without a secondary view changing playback state.
+PiP shares the originating session's reveal. Native PiP cannot host the SwiftUI
+veil overlay, so it closes when hidden footage becomes covered; reveal hidden
+video before starting it. Backgrounding also clears reveal for retained PiP.
+History export requests tag metadata and refuses covered samples, including
+keyframe preroll that would otherwise appear in the exported movie. Reveal first
+to export an interval containing hidden footage; re-covering cancels active export.
+
+Live tags travel through HomeBase's HBM1 type-7 metadata. Local history requests
+`includeTags: true` and validates segment maps before video. S3 playback resolves
+plain/encrypted manifest timelines using exact original sample ordinals and
+historical PTS overrides. The current manifest overrides embedded MP4/JPEG
+creation tags, including removals. Local thumbnails use their selected keyframe's
+tags; S3 thumbnails consult the manifest, using the caption only for legacy
+missing metadata. Cached metadata remains a snapshot; tag-change subscriptions
+are deferred.
+
+Deploy the GUI with its HomeBase relay changes and HBNVR 0.23.0. Normal NVR frames
+have exact snapshots; direct RTSP fallback uses the last observed camera tags,
+updated on NVR tag refresh, without an exact recorder sampling boundary. Veil is
+a local viewing preference; media still reaches the client and its RAM buffers.
+
+### SDK selection
+
+The project selects `HOMEBASE_SCENE_ACCESSORIES` for iOS 27 SDK builds and
+`HOMEBASE_FOLDABLE_LAYOUT` for the 27.1/27.2 SDKs that contain the new toolbar and
+hinge APIs. Xcode 26 builds keep the existing external-display router and legacy
+safe-area layout, even when that binary runs on a newer phone. Runtime
+availability checks remain in place for binaries built with the newer SDKs.

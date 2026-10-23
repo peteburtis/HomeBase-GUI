@@ -82,6 +82,9 @@ struct CameraPhotoLibraryRecordingDestination: CameraRecordingDestination {
 
 @MainActor
 final class CameraLocalRecordingController: ObservableObject {
+    // Lifecycle cleanup is explicit; SwiftUI can release this outside a Swift task.
+    nonisolated deinit {}
+
     enum State: Equatable {
         case idle
         case waitingForKeyFrame

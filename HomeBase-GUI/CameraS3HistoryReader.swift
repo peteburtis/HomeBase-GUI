@@ -95,7 +95,14 @@ actor CameraS3HistoryReader: CameraHistoryFetching {
                 // small shard to avoid re-downloading it across 30s refills.
                 mediaCache = data.count <= 16 * 1024 * 1024 ? (shard.key, shard.sha256, data) : nil
             }
-            let decoded = try await decode(data, shard, range)
+            let tags = try shard.tagMetadata?.thaw(password: password)
+            var decoded = try await decode(data, shard, range)
+            for piece in decoded.indices {
+                for sample in decoded[piece].samples.indices {
+                    let value = decoded[piece].samples[sample]
+                    decoded[piece].samples[sample].isHidden = tags?.hidden(ticks: value.frame.presentationTicks, frame: value.sourceFrame) ?? false
+                }
+            }
             try check()
             bytes += decoded.reduce(0) { $0 + $1.samples.reduce(0) { $0 + $1.data.count } }
             frames += decoded.reduce(0) { $0 + $1.samples.count }
@@ -108,6 +115,19 @@ actor CameraS3HistoryReader: CameraHistoryFetching {
             }
         }
         return .init(id: UUID(), range: range, anchor: nil, pieces: pieces, gaps: range.subtracting(coverage))
+    }
+
+    /// A thumbnail's JPEG is immutable; historical edits live in its manifest.
+    /// Nil means a legacy shard has no tag timeline, so its caption is usable.
+    func hidden(at timestamp: Double) async throws -> Bool? {
+        try check()
+        let catalog = try await catalog()
+        let shards = try await entries(days: catalog.days.filter { $0.range.contains(timestamp) }, catalog: catalog)
+        guard let shard = shards.first(where: { $0.range.contains(timestamp) }) else { return nil }
+        let ticks = Int64(((timestamp - shard.timing.time.canonicalUTC) * Double(shard.timing.timescale)).rounded())
+        let tags = try shard.tagMetadata?.thaw(password: password)
+        try check()
+        return tags?.hidden(ticks: ticks, frame: nil)
     }
 
     private func check() throws {

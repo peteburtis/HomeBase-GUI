@@ -6,7 +6,7 @@ import HomeBaseProtocol
 /// actions fan out. Values are translated into each camera's own wire format.
 @MainActor
 struct CameraGroupControlSnapshot {
-    enum Role { case privacy, dayNight }
+    enum Role { case shutter, dayNight }
     struct Write {
         let model: LiveDeviceControlsModel
         let control: LiveDeviceControl
@@ -24,10 +24,10 @@ struct CameraGroupControlSnapshot {
         self.models = models
         guard !models.isEmpty, models.allSatisfy({ $0.state == .live }) else { return }
         let sets = models.map { CameraDetailControlSet(controls: $0.controls) }
-        for role in [Role.privacy, .dayNight] {
+        for role in [Role.shutter, .dayNight] {
             let matched: [LiveDeviceControl] = models.indices.compactMap { index in
                 switch role {
-                case .privacy: return sets[index].privacy
+                case .shutter: return sets[index].shutter
                 case .dayNight: return CameraDayNightModeTarget(controls: models[index].controls)?.control
                 }
             }
@@ -35,7 +35,7 @@ struct CameraGroupControlSnapshot {
                   var lead = matched.first else { continue }
             var metadata = lead.cameraOverlayMetadata
             switch role {
-            case .privacy:
+            case .shutter:
                 guard matched.allSatisfy({ $0.cameraOverlayBooleanValue != nil }) else { continue }
             case .dayNight:
                 let targets = models.compactMap { CameraDayNightModeTarget(controls: $0.controls) }
@@ -59,9 +59,9 @@ struct CameraGroupControlSnapshot {
         return try peers.enumerated().map { index, peer in
             let translated: HBJSONValue
             switch role {
-            case .privacy:
+            case .shutter:
                 guard let flag = value.boolValue ?? value.numberValue.map({ $0 > 0 }) else {
-                    throw Failure(message: "Invalid privacy value.")
+                    throw Failure(message: "Invalid shutter value.")
                 }
                 translated = peer.cameraOverlayBooleanWireValue(flag)
             case .dayNight:

@@ -94,7 +94,7 @@ nonisolated enum CameraS3MediaDecoder {
         // undocumented AVAssetReader seek-preroll behavior and retains only one
         // scanned compressed sample at a time.
         let (scan, scanOutput) = try reader()
-        var keyTicks: Int64?, scanned = 0
+        var keyTicks: Int64?, keyFrame: Int64 = 0, scanned = 0
         defer { scan.cancelReading() }
         while let sample = scanOutput.copyNextSampleBuffer() {
             try check()
@@ -104,9 +104,9 @@ nonisolated enum CameraS3MediaDecoder {
             let pts = try ticks(CMSampleBufferGetPresentationTimeStamp(sample), scale: scale)
             guard pts >= 0, pts < expected.endTicks else { throw CameraHistoryError.invalidResponse }
             let time = anchor + Double(pts) / Double(scale)
-            if isKey(sample), time <= requested.start { keyTicks = pts }
+            if isKey(sample), time <= requested.start { keyTicks = pts; keyFrame = Int64(scanned - 1) }
             if time >= requested.start {
-                if keyTicks == nil, isKey(sample), time < requested.end { keyTicks = pts }
+                if keyTicks == nil, isKey(sample), time < requested.end { keyTicks = pts; keyFrame = Int64(scanned - 1) }
                 if keyTicks != nil || time >= requested.end { break }
             }
         }
@@ -116,6 +116,7 @@ nonisolated enum CameraS3MediaDecoder {
         let (video, output) = try reader(start: start)
         defer { video.cancelReading() }
         var samples: [CameraHistorySample] = [], bytes = 0
+        var sourceFrame = keyFrame
         var segment: CameraHistorySegment?, firstFormat: CMFormatDescription?, previous: Int64?
         while let sample = output.copyNextSampleBuffer() {
             try check()
@@ -160,7 +161,8 @@ nonisolated enum CameraS3MediaDecoder {
             }
             samples.append(.init(frame: .init(segment: 0, presentationTicks: pts, decodeTicks: dts,
                 durationTicks: duration, keyFrame: isKey(sample), preroll: time < requested.start,
-                byteCount: size), data: payload))
+                byteCount: size), data: payload, sourceFrame: sourceFrame))
+            sourceFrame += 1
             bytes += size; previous = pts
         }
         try check()

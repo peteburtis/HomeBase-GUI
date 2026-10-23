@@ -5,6 +5,42 @@ import XCTest
 
 @MainActor
 final class CameraGroupTests: XCTestCase {
+    func testVeilFollowsRetainedSessionsAndNewPanesAndResetsBeforeBackground() async throws {
+        let veil = CameraVeilSession(authenticator: GroupVeilAuthenticator())
+        let client = try makeClient()
+        let initial = CameraGroupSession(camera: try camera("A"), client: client)
+        let group = CameraGroupPlayback(client: client, initialSession: initial, veil: veil)
+        defer { group.deactivate() }
+        XCTAssertFalse(initial.playback.showsHiddenVideo)
+        veil.toggle()
+        for _ in 0..<100 where !veil.showsHidden { await Task.yield() }
+        XCTAssertTrue(initial.playback.showsHiddenVideo)
+        XCTAssertTrue(initial.liveVideo.showsHiddenVideo)
+#if os(iOS)
+        let pip = CameraPiPSession(camera: initial.camera, quality: .high, client: client,
+            originViewerID: UUID(), authorization: CameraStreamAuthorization(camera: "A"), veil: veil)
+        XCTAssertTrue(pip.model.showsHiddenVideo, "Independent live PiP inherits the viewer decision")
+#endif
+        group.toggle(try camera("B"))
+        XCTAssertEqual(group.sessions.count, 2)
+        XCTAssertTrue(group.sessions.allSatisfy { $0.veil === veil && $0.playback.showsHiddenVideo })
+#if os(iOS)
+        let external = CameraExternalDisplayPresentation()
+        external.update(group: group, isVisible: true)
+        XCTAssertTrue(external.group?.veil === veil)
+        external.clear()
+        XCTAssertTrue(veil.showsHidden, "A secondary view must not own or reset reveal")
+#endif
+        group.suspendForPhone(stopImmediately: true)
+        XCTAssertFalse(veil.showsHidden)
+#if os(iOS)
+        XCTAssertFalse(pip.model.showsHiddenVideo, "Retained PiP re-covers immediately too")
+#endif
+        XCTAssertTrue(group.sessions.allSatisfy { !$0.playback.showsHiddenVideo && !$0.liveVideo.showsHiddenVideo })
+        group.resume()
+        XCTAssertFalse(veil.showsHidden, "Returning to the viewer cannot silently reveal footage")
+    }
+
     func testFullScreenFocusPreservesGroupSessionsAndPausedHistory() async throws {
         let group = try makeGroup()
         defer { group.deactivate() }
@@ -927,8 +963,10 @@ final class CameraGroupTests: XCTestCase {
     func testUnobscuredRectangleFindsGlobalMaximumRatherThanGreedilyTrimmingEachRegion() {
         let size = CGSize(width: 8, height: 8)
         for seed in 0..<20 {
-            let obstacles = (0..<3).map { index in
-                CGRect(x: (seed + index * 3) % 7, y: (seed * 3 + index * 2) % 7, width: 2, height: 2)
+            let obstacles: [CGRect] = (0..<3).map { index in
+                let x = (seed + index * 3) % 7
+                let y = (seed * 3 + index * 2) % 7
+                return CGRect(x: CGFloat(x), y: CGFloat(y), width: 2, height: 2)
             }
             let balancesVertically = obstacles.contains { $0.maxY <= size.height / 4 }
             var largestArea = 0
@@ -1165,13 +1203,13 @@ final class CameraGroupTests: XCTestCase {
         var aWrites: [HBJSONValue] = [], bWrites: [HBJSONValue] = []
         a.installWriteRouting(value: { value, _, _ in aWrites.append(value) }, canonical: { _, _ in })
         b.installWriteRouting(value: { value, _, _ in bWrites.append(value) }, canonical: { _, _ in })
-        a.installAggregatePresentation([control("A", "Privacy", value: .bool(false)), dayNight("A", values: [.integer(0), .integer(1)], current: .integer(0))])
-        b.installAggregatePresentation([control("B", "Privacy", value: .integer(1)), dayNight("B", values: [.string("DAY"), .string("NIGHT")], current: .string("NIGHT"))])
+        a.installAggregatePresentation([control("A", "Shutter.Closed", value: .bool(false)), dayNight("A", values: [.integer(0), .integer(1)], current: .integer(0))])
+        b.installAggregatePresentation([control("B", "Shutter.Closed", value: .integer(1)), dayNight("B", values: [.string("DAY"), .string("NIGHT")], current: .string("NIGHT"))])
         let snapshot = CameraGroupControlSnapshot(models: [a, b])
         XCTAssertTrue(aWrites.isEmpty && bWrites.isEmpty)
-        let privacy = try XCTUnwrap(CameraDetailControlSet(controls: snapshot.controls).privacy)
-        XCTAssertEqual(privacy.value, .bool(false))
-        try await CameraGroupControlSnapshot.perform(snapshot.writes(value: .bool(true), control: privacy))
+        let shutter = try XCTUnwrap(CameraDetailControlSet(controls: snapshot.controls).shutter)
+        XCTAssertEqual(shutter.value, .bool(false))
+        try await CameraGroupControlSnapshot.perform(snapshot.writes(value: .bool(true), control: shutter))
         XCTAssertEqual(aWrites, [.bool(true)])
         XCTAssertEqual(bWrites, [.integer(1)])
         let day = try XCTUnwrap(CameraDayNightModeTarget(controls: snapshot.controls))
@@ -1188,7 +1226,7 @@ final class CameraGroupTests: XCTestCase {
         let a = LiveDeviceControlsModel(device: nil, client: client)
         let b = LiveDeviceControlsModel(device: nil, client: client)
         let aggregate = LiveDeviceControlsModel(device: nil, client: client)
-        var item = control("A", "Privacy", value: .bool(false))
+        var item = control("A", "Shutter.Closed", value: .bool(false))
         a.installAggregatePresentation([item]); b.installAggregatePresentation([item])
         item.isUpdating = true; a.installAggregatePresentation([item])
         aggregate.installAggregatePresentation(CameraGroupControlSnapshot(models: [a, b]).controls)
@@ -1207,8 +1245,8 @@ final class CameraGroupTests: XCTestCase {
         var attempted: Set<String> = []
         a.installWriteRouting(value: { _, _, _ in attempted.insert("A"); throw CameraHistoryError.unavailable }, canonical: { _, _ in })
         b.installWriteRouting(value: { _, _, _ in attempted.insert("B") }, canonical: { _, _ in })
-        a.installAggregatePresentation([control("A", "Privacy", value: .bool(false))])
-        b.installAggregatePresentation([control("B", "Privacy", value: .bool(false))])
+        a.installAggregatePresentation([control("A", "Shutter.Closed", value: .bool(false))])
+        b.installAggregatePresentation([control("B", "Shutter.Closed", value: .bool(false))])
         let snapshot = CameraGroupControlSnapshot(models: [a, b])
         do {
             try await CameraGroupControlSnapshot.perform(snapshot.writes(value: .bool(true), control: snapshot.controls[0]))
@@ -1322,7 +1360,7 @@ final class CameraGroupTests: XCTestCase {
     }
     private func control(_ device: String, _ id: String, value: HBJSONValue, metadata: [String: HBJSONValue] = [:]) -> LiveDeviceControl {
         var metadata = metadata.merging(["readable": .bool(true), "writable": .bool(true), "structured": .bool(false), "valid": .bool(true)]) { a, _ in a }
-        if id == "Privacy" { metadata["cameraPrivacy"] = .bool(true) }
+        if id == "Shutter.Closed" { metadata["cameraShutter"] = .bool(true) }
         return LiveDeviceControl(descriptor: .init(control: "\(device):\(id)", deviceIdentifier: device, controlIdentifier: id, displayName: id, kind: id, metadata: metadata),
             details: .init(identifier: id, name: id, kind: id, value: value, metadata: metadata), value: value, valid: true)
     }
@@ -1378,4 +1416,9 @@ private actor GroupHistoryFetcher: CameraHistoryFetching {
             pieces: [], gaps: request.operation == "neighbors" ? [] : [range],
             neighbors: request.operation == "neighbors" ? neighbors : nil)
     }
+}
+
+@MainActor private struct GroupVeilAuthenticator: CameraVeilAuthenticating {
+    func authenticateIfAvailable() async -> Bool { true }
+    func cancel() {}
 }
