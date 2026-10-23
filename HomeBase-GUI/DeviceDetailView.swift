@@ -10,10 +10,15 @@ import SwiftUI
 
 struct DeviceDetailView: View {
     @Environment(\.scenePhase) private var scenePhase
+#if os(iOS)
+    @Environment(\.cameraViewerPresentation) private var cameraViewer
+    @Environment(\.cameraViewerIsPresented) private var viewerIsPresented
+#endif
 
     let device: HBTopologyDeviceDescriptor
     private let client: HomeBaseWebSocketClient
     @StateObject private var model: LiveDeviceControlsModel
+    @State private var monitoring = LiveMonitoringSession()
     @State private var isShowingFullScreenVideo = false
     @State private var videoRestartRequest = 0
 
@@ -48,10 +53,10 @@ struct DeviceDetailView: View {
                     CameraProtectedPreview(access: access) {
                         CameraLiveVideoPlayer(
                             deviceIdentifier: device.addressableName,
-                            quality: cameraCapability.previewQuality,
+                            quality: CameraLiveQualitySelection(cameraCapability.previewQuality),
                             client: client,
                             allowsRetry: false,
-                            isStreamEnabled: !isShowingFullScreenVideo,
+                            isStreamEnabled: access.canStream && !isShowingVideo,
                             restartRequest: videoRestartRequest
                         )
                         .clipShape(RoundedRectangle(cornerRadius: 10))
@@ -69,6 +74,12 @@ struct DeviceDetailView: View {
                         .contentShape(Rectangle())
                         .onTapGesture {
                             guard access.isUnlocked else { return }
+#if os(iOS)
+                            if let cameraViewer {
+                                cameraViewer.open(device: device, quality: cameraCapability.fullScreenQuality, client: client)
+                                return
+                            }
+#endif
                             isShowingFullScreenVideo = true
                         }
                         .accessibilityAddTraits(.isButton)
@@ -104,20 +115,11 @@ struct DeviceDetailView: View {
         }
         .navigationTitle(device.displayName)
         .connectionStatusOverlay(model.state.connectionStatusPresentation) {
-            Task {
-                await model.run()
-            }
+            monitoring.restart()
         }
-        .task(id: scenePhase) {
-            if scenePhase == .active {
+        .onChange(of: scenePhase == .active, initial: true) { _, active in
+            monitoring.setActive(active) { [model] in
                 await model.run(reactivating: true)
-            } else {
-                await model.stop()
-            }
-        }
-        .onDisappear {
-            Task {
-                await model.stop()
             }
         }
         .onChange(of: privacyEnabled) { previousValue, currentValue in
@@ -140,6 +142,14 @@ struct DeviceDetailView: View {
 
     private var cameraCapability: CameraLiveVideoCapability? {
         CameraLiveVideoCapability(metadata: model.deviceMetadata)
+    }
+
+    private var isShowingVideo: Bool {
+#if os(iOS)
+        isShowingFullScreenVideo || viewerIsPresented
+#else
+        isShowingFullScreenVideo
+#endif
     }
 
     private var privacyEnabled: Bool? {
@@ -404,15 +414,6 @@ final class LiveDeviceControlsModel: ObservableObject {
             let details = metadata.details
             try Task.checkCancellation()
             deviceMetadata = metadata.metadata
-            metadataTask?.cancel()
-            metadataTask = Task { [weak self] in
-                do {
-                    for try await values in metadata.events {
-                        guard !Task.isCancelled else { return }
-                        self?.deviceMetadata = values
-                    }
-                } catch {} // Control subscription owns connection-error presentation.
-            }
             suggestedControlOrder = SuggestedControlDisplayOrder(
                 metadata: details.metadata
             )
@@ -434,7 +435,24 @@ final class LiveDeviceControlsModel: ObservableObject {
             ) else {
                 install([])
                 state = .live
+                // Even an empty control list still owns a metadata observer.
+                // Keep its lifetime scoped to this monitoring session.
+                for try await values in metadata.events {
+                    try Task.checkCancellation()
+                    deviceMetadata = values
+                }
+                if Task.isCancelled { state = .idle }
+                await stopSubscription()
                 return
+            }
+
+            metadataTask = Task { [weak self] in
+                do {
+                    for try await values in metadata.events {
+                        guard !Task.isCancelled else { return }
+                        self?.deviceMetadata = values
+                    }
+                } catch {} // Control subscription owns connection-error presentation.
             }
 
             // Interactive controls present the engine's authoritative target.
@@ -467,11 +485,11 @@ final class LiveDeviceControlsModel: ObservableObject {
             }
         } catch is CancellationError {
             state = .idle
-            return
         } catch {
             state = .failed(error.localizedDescription)
         }
 
+        if Task.isCancelled { state = .idle }
         await stopSubscription()
     }
 

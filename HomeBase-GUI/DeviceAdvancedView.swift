@@ -15,6 +15,7 @@ struct DeviceAdvancedView: View {
     private let title: String
     private let client: HomeBaseWebSocketClient
     @StateObject private var model: DeviceAdvancedModel
+    @State private var monitoring = LiveMonitoringSession()
 
     init(
         device: HBTopologyDeviceDescriptor,
@@ -55,23 +56,14 @@ struct DeviceAdvancedView: View {
         .navigationBarTitleDisplayMode(.inline)
 #endif
         .refreshable {
-            await model.restart()
+            monitoring.restart()
         }
         .connectionStatusOverlay(model.state.connectionStatusPresentation) {
-            Task {
-                await model.run()
-            }
+            monitoring.restart()
         }
-        .task(id: scenePhase) {
-            if scenePhase == .active {
+        .onChange(of: scenePhase == .active, initial: true) { _, active in
+            monitoring.setActive(active) { [model] in
                 await model.run(reactivating: true)
-            } else {
-                await model.stop()
-            }
-        }
-        .onDisappear {
-            Task {
-                await model.stop()
             }
         }
     }
@@ -943,6 +935,7 @@ private final class DeviceAdvancedModel: ObservableObject {
             state = .failed(error.localizedDescription)
         }
 
+        if Task.isCancelled { state = .idle }
         await stopSubscriptions()
     }
 

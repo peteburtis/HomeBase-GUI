@@ -534,6 +534,17 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		C7A000000000000000000001 /* XCRemoteSwiftPackageReference "aws-sdk-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/awslabs/aws-sdk-swift";
+			requirement = {
+				kind = exactVersion;
+				version = 1.7.78;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		C7A000000000000000000002 /* AWSS3 */ = {
 			isa = XCSwiftPackageProductDependency;
@@ -546,14 +557,6 @@
 			productName = HomeBaseProtocol;
 		};
 /* End XCSwiftPackageProductDependency section */
-
-/* Begin XCRemoteSwiftPackageReference section */
-		C7A000000000000000000001 /* XCRemoteSwiftPackageReference "aws-sdk-swift" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/awslabs/aws-sdk-swift";
-			requirement = {kind = exactVersion; version = 1.7.78; };
-		};
-/* End XCRemoteSwiftPackageReference section */
 	};
 	rootObject = E2CD70E930269489002FCE2D /* Project object */;
 }

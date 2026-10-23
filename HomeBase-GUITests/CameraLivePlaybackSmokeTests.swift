@@ -36,7 +36,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
                 model.state == .playing && playback.timeline.entries.count > 10
             }
             observer = model.$state.sink { if $0 != .playing { interruptions.append($0) } }
-            for quality in [HBCameraLiveQuality.high, .low] {
+            for quality in [CameraLiveQualitySelection.high, .low] {
                 let epoch = playback.timeline.sourceEpoch
                 let bytes = playback.timeline.retainedBytes
                 await model.setQuality(quality)
@@ -78,7 +78,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
         }
         let playback = CameraLivePlaybackController()
         let model = CameraLiveVideoModel(deviceIdentifier: camera.device.addressableName,
-            quality: camera.capability.fullScreenQuality, client: client, playbackController: playback)
+            quality: .automatic, client: client, playbackController: playback)
         let stream = Task { await model.run() }
         do {
             try await eventually("Live footage collected for speed smoke") { (playback.timeline.head ?? 0) >= 6 }
@@ -135,7 +135,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
             VStack {
                 ForEach(cameras) { camera in
                     CameraLiveVideoPlayer(deviceIdentifier: camera.device.addressableName,
-                        quality: camera.capability.previewQuality, client: client, allowsRetry: false,
+                        quality: CameraLiveQualitySelection(camera.capability.previewQuality), client: client, allowsRetry: false,
                         isStreamEnabled: previewsEnabled,
                         onStateChanged: {
                             states[camera.id] = $0
@@ -144,7 +144,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
                 }
                 // Independent subscription: suspending previews must not suspend this player.
                 CameraLiveVideoPlayer(deviceIdentifier: fullScreenCamera.device.addressableName,
-                    quality: fullScreenCamera.capability.fullScreenQuality, client: client,
+                    quality: .automatic, client: client,
                     allowsRetry: false, playbackController: playback,
                     onStateChanged: { print("Preview visibility smoke: independent player: \($0)") })
             }
@@ -209,6 +209,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
         guard cameras.count >= 2 else { await client.disconnect(); throw XCTSkip("Two NVR cameras required") }
         let first = CameraGroupSession(camera: cameras[0], client: client)
         let group = CameraGroupPlayback(client: client, initialSession: first)
+        group.activateResources(access: nil)
         let host = NSHostingView(rootView: CameraGroupVideo(group: group,
             cameraControlsEnabled: false, controlsVisible: true, onSingleTap: {}).environment(\.scenePhase, .active))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 852, height: 393),
@@ -216,6 +217,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
         window.contentView = host; window.orderFront(nil)
         func background() async throws {
             group.suspend()
+            group.suspendResources(stopImmediately: true)
             host.rootView = CameraGroupVideo(group: group, cameraControlsEnabled: false,
                 controlsVisible: true, onSingleTap: {}).environment(\.scenePhase, .background)
             try await eventually("Background unloads mounted streams") { group.sessions.allSatisfy { $0.liveState == .idle } }
@@ -223,6 +225,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
         func foreground() async throws {
             let epochs = group.sessions.map { $0.playback.timeline.sourceEpoch }
             group.resume()
+            group.activateResources(access: nil)
             host.rootView = CameraGroupVideo(group: group, cameraControlsEnabled: false,
                 controlsVisible: true, onSingleTap: {}).environment(\.scenePhase, .active)
             try await eventually("Foreground reconnects mounted streams") {
@@ -286,6 +289,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
         guard cameras.count >= 2 else { await client.disconnect(); throw XCTSkip("Two cameras required") }
         let original = CameraGroupSession(camera: cameras[0], client: client, quality: .medium)
         let group = CameraGroupPlayback(client: client, initialSession: original)
+        group.activateResources(access: nil)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 852, height: 393),
             styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentView = NSHostingView(rootView: CameraGroupVideo(group: group,
@@ -373,7 +377,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
                 guard heads.count == 2, tails.count == 2 else { return false }
                 return heads.min()! > tails.max()! + 1
             }
-            XCTAssertTrue(group.sessions.allSatisfy { $0.quality == .high })
+            XCTAssertTrue(group.sessions.allSatisfy { $0.quality == .automatic })
             group.togglePause()
             let paused = try XCTUnwrap(group.cursor)
             try await eventually("Both live buffers continue while group is paused") {
@@ -407,7 +411,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
             XCTAssertTrue(group.isPaused)
             group.goLive()
             XCTAssertTrue(group.sessions.allSatisfy { $0.playback.isLive })
-            print("Multiple-camera smoke passed: high-quality live, shared paused buffers, synchronized playing history, and per-pane gap navigation")
+            print("Multiple-camera smoke passed: default live quality, shared paused buffers, synchronized playing history, and per-pane gap navigation")
         } catch {
             for (model, task) in streams { task.cancel(); await model.stop(); await task.value }
             group.deactivate(); await client.disconnect(); throw error
@@ -631,7 +635,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
                 let playback = CameraLivePlaybackController()
                 playback.prepareHistory(metadata: camera.device.metadata, client: client)
                 let model = CameraLiveVideoModel(deviceIdentifier: camera.device.addressableName,
-                    quality: camera.capability.previewQuality, client: client, playbackController: playback)
+                    quality: CameraLiveQualitySelection(camera.capability.previewQuality), client: client, playbackController: playback)
                 let stream = Task { await model.run() }
                 do {
                     try await eventually("\(camera.device.displayName): live buffer ready") { playback.canControlPlayback }
@@ -687,7 +691,7 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
                 let playback = CameraLivePlaybackController()
                 let model = CameraLiveVideoModel(
                     deviceIdentifier: camera.device.addressableName,
-                    quality: camera.capability.previewQuality,
+                    quality: CameraLiveQualitySelection(camera.capability.previewQuality),
                     client: client, playbackController: playback
                 )
                 let stream = Task { await model.run() }

@@ -2,6 +2,160 @@ import Combine
 import Foundation
 import HomeBaseProtocol
 
+/// Serializes the camera resources that belong to one selected camera.
+///
+/// SwiftUI views only render these resources.  Their appearance, disappearance,
+/// geometry, and size-class changes must never start or stop network work.
+/// The screen/group owner drives this coordinator for the actual lifecycle
+/// events: authorization, backgrounding, camera removal, and dismissal.
+@MainActor
+final class CameraSessionResourceCoordinator {
+    typealias StartLiveVideo = @MainActor (CameraAccessSession?) async -> Void
+    typealias StopLiveVideo = @MainActor (Bool) async -> Void
+    typealias StartControls = @MainActor () async -> Void
+    typealias StopControls = @MainActor () async -> Void
+
+    private let startLiveVideo: StartLiveVideo
+    private let stopLiveVideo: StopLiveVideo
+    private let startControls: StartControls
+    private let stopControls: StopControls
+
+    private(set) var isActive = false
+    private(set) var controlsActive = false
+    private var isClosed = false
+    private var access: CameraAccessSession?
+    private var liveRevision = 0
+    private var controlsRevision = 0
+    private var liveTask: Task<Void, Never>?
+    private var controlsTask: Task<Void, Never>?
+
+    init(
+        startLiveVideo: @escaping StartLiveVideo,
+        stopLiveVideo: @escaping StopLiveVideo,
+        startControls: @escaping StartControls,
+        stopControls: @escaping StopControls
+    ) {
+        self.startLiveVideo = startLiveVideo
+        self.stopLiveVideo = stopLiveVideo
+        self.startControls = startControls
+        self.stopControls = stopControls
+    }
+
+    func setActive(
+        _ active: Bool,
+        access: CameraAccessSession?,
+        stopImmediately: Bool = false,
+        controlsEnabled: Bool = true
+    ) {
+        guard !isClosed else { return }
+        let accessChanged = accessIdentity(self.access) != accessIdentity(access)
+        if active != isActive || (active && accessChanged) {
+            isActive = active
+            self.access = active ? access : nil
+            transitionLiveVideo(
+                shouldRun: active,
+                access: active ? access : nil,
+                stopImmediately: stopImmediately
+            )
+        }
+        let shouldRunControls = active && controlsEnabled
+        if shouldRunControls != controlsActive {
+            controlsActive = shouldRunControls
+            transitionControls(shouldRun: shouldRunControls)
+        }
+    }
+
+    func restartLiveVideo() {
+        guard isActive, !isClosed else { return }
+        transitionLiveVideo(
+            shouldRun: true,
+            access: access,
+            stopImmediately: false
+        )
+    }
+
+    func restartControls() {
+        guard controlsActive, !isClosed else { return }
+        transitionControls(shouldRun: true)
+    }
+
+    func close(stopImmediately: Bool = false) {
+        guard !isClosed else { return }
+        isClosed = true
+        isActive = false
+        controlsActive = false
+        access = nil
+        transitionLiveVideo(
+            shouldRun: false,
+            access: nil,
+            stopImmediately: stopImmediately
+        )
+        transitionControls(shouldRun: false)
+    }
+
+    /// Test/support hook that waits for finite transition closures. Production
+    /// start closures remain alive while their subscriptions are active.
+    func waitForTransitions() async {
+        let liveTask = liveTask
+        let controlsTask = controlsTask
+        await liveTask?.value
+        await controlsTask?.value
+    }
+
+    private func transitionLiveVideo(
+        shouldRun: Bool,
+        access: CameraAccessSession?,
+        stopImmediately: Bool
+    ) {
+        liveRevision &+= 1
+        let revision = liveRevision
+        let previous = liveTask
+        liveTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            // Tell the model how to release the current subscription before
+            // cancellation lets run() enter its own cleanup path. In
+            // particular, backgrounding and access revocation must bypass the
+            // arbiter's ordinary handoff grace period.
+            await self.stopLiveVideo(stopImmediately)
+            previous?.cancel()
+            await previous?.value
+            guard !Task.isCancelled,
+                  self.liveRevision == revision,
+                  shouldRun,
+                  self.isActive,
+                  !self.isClosed,
+                  self.accessIdentity(self.access) == self.accessIdentity(access)
+            else { return }
+            await self.startLiveVideo(access)
+        }
+    }
+
+    private func transitionControls(shouldRun: Bool) {
+        controlsRevision &+= 1
+        let revision = controlsRevision
+        let previous = controlsTask
+        controlsTask = Task { @MainActor [weak self] in
+            previous?.cancel()
+            await previous?.value
+            guard let self, self.controlsRevision == revision else { return }
+
+            await self.stopControls()
+            guard !Task.isCancelled,
+                  self.controlsRevision == revision,
+                  shouldRun,
+                  self.controlsActive,
+                  !self.isClosed
+            else { return }
+            await self.startControls()
+        }
+    }
+
+    private func accessIdentity(_ access: CameraAccessSession?) -> ObjectIdentifier? {
+        access.map(ObjectIdentifier.init)
+    }
+}
+
 /// Selection order is also the control-display order. Never an empty group.
 struct CameraMultipleSelection {
     private(set) var ids: [String]
@@ -17,31 +171,163 @@ struct CameraMultipleSelection {
 final class CameraGroupSession: ObservableObject, Identifiable {
     let camera: CameraVideoDevice
     var id: String { camera.id }
-    let playback = CameraLivePlaybackController()
+    let playback: CameraLivePlaybackController
     let controls: LiveDeviceControlsModel
+    let liveVideo: CameraLiveVideoModel
     let gestures: CameraPaneGestures
     @Published var liveState: CameraLiveVideoModel.State = .idle
     private(set) var hostOrigin: Double?
-    @Published var quality: HBCameraLiveQuality
+    @Published private(set) var quality: CameraLiveQualitySelection
 #if os(iOS)
-    let recordingController = CameraLocalRecordingController(destination: CameraPhotoLibraryRecordingDestination())
+    let recordingController: CameraLocalRecordingController
 #endif
-    var videoRecordingController: CameraLocalRecordingController? {
-#if os(iOS)
-        recordingController
-#else
-        nil
-#endif
-    }
+    let client: HomeBaseWebSocketClient
+    private let resources: CameraSessionResourceCoordinator
+    private var observations: Set<AnyCancellable> = []
+    private var resourceAccess: CameraAccessSession?
+    private var controlsRetryTask: Task<Void, Never>?
+    private var qualityTask: Task<Void, Never>?
+    private var qualityRevision = 0
+    private var isClosed = false
+    let streamOwner: UUID
+
     var historyAvailable: Bool { CameraPlaybackHistoryAvailability.isAvailable(in: controls.deviceMetadata) }
 
-    init(camera: CameraVideoDevice, client: HomeBaseWebSocketClient, quality: HBCameraLiveQuality = .high) {
+    init(camera: CameraVideoDevice, client: HomeBaseWebSocketClient, quality: CameraLiveQualitySelection? = nil) {
         self.camera = camera
-        self.quality = quality
+        let streamOwner = UUID()
+        self.streamOwner = streamOwner
+        let initialQuality = quality ?? camera.capability.fullScreenQuality
+        self.quality = initialQuality
+        self.client = client
+        let playback = CameraLivePlaybackController()
+        self.playback = playback
         let controls = LiveDeviceControlsModel(device: camera.device, client: client)
         self.controls = controls
+#if os(iOS)
+        let recordingController = CameraLocalRecordingController(
+            destination: CameraPhotoLibraryRecordingDestination()
+        )
+        self.recordingController = recordingController
+        let liveVideo = CameraLiveVideoModel(
+            deviceIdentifier: camera.device.addressableName,
+            quality: initialQuality,
+            client: client,
+            recordingController: recordingController,
+            playbackController: playback,
+            artificialFeed: camera.artificialFeed
+        )
+#else
+        let liveVideo = CameraLiveVideoModel(
+            deviceIdentifier: camera.device.addressableName,
+            quality: initialQuality,
+            client: client,
+            playbackController: playback,
+            artificialFeed: camera.artificialFeed
+        )
+#endif
+        self.liveVideo = liveVideo
         gestures = CameraPaneGestures(model: controls)
+        resources = CameraSessionResourceCoordinator(
+            startLiveVideo: { access in
+                await liveVideo.run(access: access, viewerStreamOwner: streamOwner)
+            },
+            stopLiveVideo: { immediately in
+                await liveVideo.stop(immediately: immediately)
+            },
+            startControls: {
+                if camera.artificialFeed == nil {
+                    await controls.run(reactivating: true)
+                }
+            },
+            stopControls: {
+                await controls.stop()
+            }
+        )
+
+        liveVideo.$state
+            .sink { [weak self] state in self?.liveState = state }
+            .store(in: &observations)
+        liveVideo.$aspectRatio
+            .dropFirst()
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &observations)
+        controls.$deviceMetadata
+            .dropFirst()
+            .sink { [weak self] metadata in
+                self?.prepareHistory(metadata: metadata)
+            }
+            .store(in: &observations)
+        controls.$state
+            .dropFirst()
+            .sink { [weak self] state in
+                self?.scheduleControlsRetry(for: state)
+            }
+            .store(in: &observations)
     }
+
+    var resourcesActive: Bool { resources.isActive }
+
+    func setResourcesActive(
+        _ active: Bool,
+        access: CameraAccessSession?,
+        stopImmediately: Bool = false,
+        controlsEnabled: Bool = true
+    ) {
+        guard !isClosed else { return }
+        if !active {
+            if stopImmediately { resourceAccess?.revokeViewerStream(streamOwner) }
+            else { resourceAccess?.releaseViewerStream(owner: streamOwner) }
+        }
+        resourceAccess = active ? access : nil
+        resources.setActive(
+            active,
+            access: access,
+            stopImmediately: stopImmediately,
+            controlsEnabled: controlsEnabled
+        )
+        if active {
+            prepareHistory(metadata: controls.deviceMetadata)
+            scheduleControlsRetry(for: controls.state)
+        }
+        if !active || !controlsEnabled {
+            controlsRetryTask?.cancel()
+            controlsRetryTask = nil
+            gestures.update(enabled: false)
+        }
+    }
+
+    /// Update history credentials without changing live/control resource
+    /// lifetime. A credential result may arrive after the app backgrounds.
+    func refreshHistoryAccess(_ access: CameraAccessSession?) {
+        guard !isClosed, resourcesActive else { return }
+        resourceAccess = access
+        prepareHistory(metadata: controls.deviceMetadata)
+    }
+
+    func setQuality(_ quality: CameraLiveQualitySelection) {
+        guard !isClosed, quality != self.quality else { return }
+        self.quality = quality
+        qualityRevision &+= 1
+        let revision = qualityRevision
+        let previous = qualityTask
+        qualityTask = Task { @MainActor [weak self] in
+            previous?.cancel()
+            await previous?.value
+            guard let self,
+                  !Task.isCancelled,
+                  !self.isClosed,
+                  self.qualityRevision == revision
+            else { return }
+            await self.liveVideo.setQuality(quality)
+        }
+    }
+
+    func restartLiveVideoIfNeeded() {
+        guard resourcesActive, !liveVideo.state.displaysVideo else { return }
+        resources.restartLiveVideo()
+    }
+
     func captureHostOrigin() {
         guard hostOrigin == nil,
               let head = playback.timeline.head, let arrival = playback.timeline.lastFrameArrival else { return }
@@ -50,10 +336,48 @@ final class CameraGroupSession: ObservableObject, Identifiable {
     var hostHead: Double? { hostOrigin.flatMap { origin in playback.timeline.head.map { origin + $0 } } }
     var hostTail: Double? { hostOrigin.flatMap { origin in playback.timeline.tail.map { origin + $0 } } }
     func localTime(_ host: Double) -> Double? { hostOrigin.map { host - $0 } }
-    func close() {
+    func close(stopImmediately: Bool = false) {
+        guard !isClosed else { return }
+        isClosed = true
+        if stopImmediately { resourceAccess?.revokeViewerStream(streamOwner) }
+        else { resourceAccess?.releaseViewerStream(owner: streamOwner) }
+        resourceAccess = nil
+        controlsRetryTask?.cancel()
+        controlsRetryTask = nil
+        qualityTask?.cancel()
+        qualityTask = nil
         gestures.update(enabled: false)
         playback.close()
-        Task { await controls.stop() }
+        resources.close(stopImmediately: stopImmediately)
+    }
+
+    private func prepareHistory(metadata: [String: HBJSONValue]) {
+        guard !isClosed, resourcesActive else { return }
+        playback.prepareHistory(
+            metadata: metadata,
+            client: client,
+            credentials: resourceAccess?.unlockedCredentials
+        )
+    }
+
+    private func scheduleControlsRetry(for state: LiveDeviceControlsModel.State) {
+        controlsRetryTask?.cancel()
+        controlsRetryTask = nil
+        guard !isClosed, resources.controlsActive, case .failed = state else { return }
+
+        controlsRetryTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch {
+                return
+            }
+            guard let self,
+                  !self.isClosed,
+                  self.resources.controlsActive,
+                  case .failed = self.controls.state
+            else { return }
+            self.resources.restartControls()
+        }
     }
 }
 
@@ -66,7 +390,7 @@ final class CameraGroupPlayback: ObservableObject {
     // Picker selection style is independent of playback/layout. One selected
     // camera remains an ordinary single-camera player even with this enabled.
     @Published private(set) var multipleSelectionEnabled = true
-    @Published private(set) var quality: HBCameraLiveQuality
+    @Published private(set) var quality: CameraLiveQualitySelection
     @Published private(set) var sessions: [CameraGroupSession] = []
     @Published private(set) var source: Source = .live
     @Published private(set) var isPaused = false
@@ -86,14 +410,24 @@ final class CameraGroupPlayback: ObservableObject {
     private var generation = UUID()
     private var lastTick: Double?
     private var edgeAnchor: (canonical: Double, host: Double)?
+    private var liveSynchronization = CameraLiveSynchronization()
     private var subscriptions: [String: Set<AnyCancellable>] = [:]
     private var updatingControls = false
     private var isSuspended = false
+    private var resourcesActive = false
+    private var resourceAccess: CameraAccessSession?
+    private var externalDisplayOwners: Set<UUID> = []
+    private weak var externalAccess: CameraAccessSession?
+    private var phoneResourcesSuspended = false
+
+    var hasActiveExternalDisplay: Bool {
+        !externalDisplayOwners.isEmpty && externalAccess?.isUnlocked == true && !sessions.isEmpty
+    }
 
     init(client: HomeBaseWebSocketClient, initialSession: CameraGroupSession? = nil,
          clock: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }) {
         self.client = client; self.clock = clock
-        quality = initialSession?.quality ?? .high
+        quality = initialSession?.quality ?? .automatic
         sharedControls = LiveDeviceControlsModel(device: nil, client: client)
         sharedControls.installWriteRouting(value: { [weak self] value, control, _ in
             guard let self else { throw CancellationError() }
@@ -110,24 +444,113 @@ final class CameraGroupPlayback: ObservableObject {
 
     var isLive: Bool { source == .live }
     var hasMultipleCameras: Bool { sessions.count > 1 }
-    var hasHistory: Bool { sessions.contains { $0.historyAvailable } }
+    var historySourceSession: CameraGroupSession? {
+        sessions.first(where: \.historyAvailable)
+    }
+    var hasHistory: Bool { historySourceSession != nil }
     var playbackDate: Date? { source == .history ? cursor.map(Date.init(timeIntervalSince1970:)) : nil }
     var liveEdge: Double? { edgeAnchor.map { $0.canonical + max(0, clock() - $0.host) } }
 
-    var availableQualities: Set<HBCameraLiveQuality> {
+    var availableConcreteQualities: Set<HBCameraLiveQuality> {
         sessions.reduce(Set(HBCameraLiveQuality.allCases)) { result, session in
             result.intersection(CameraLiveVideoCapability(metadata: session.controls.deviceMetadata)?.qualities ?? session.camera.capability.qualities)
         }
     }
 
-    func setQuality(_ value: HBCameraLiveQuality) {
-        guard value != quality else { return }
+    var supportsDefaultQuality: Bool {
+        !sessions.isEmpty && sessions.allSatisfy { session in
+            (CameraLiveVideoCapability(metadata: session.controls.deviceMetadata)
+                ?? session.camera.capability).supportsDefaultQuality
+        }
+    }
+
+    var availableQualities: Set<CameraLiveQualitySelection> {
+        var result = Set(availableConcreteQualities.map(CameraLiveQualitySelection.init))
+        if supportsDefaultQuality { result.insert(.automatic) }
+        return result
+    }
+
+    func setQuality(_ value: CameraLiveQualitySelection) {
+        // A focused pane can change its own quality without changing the group
+        // preference. Reapplying that preference must still update that pane.
+        guard value != quality || sessions.contains(where: { $0.quality != value }) else { return }
         guard availableQualities.contains(value) else {
             error = "This video quality is not supported by every selected camera."
             return
         }
         quality = value
-        sessions.forEach { $0.quality = value }
+        sessions.forEach { $0.setQuality(value) }
+    }
+
+    /// Resource lifetime is driven only by the stable full-screen owner.
+    /// Layout, toolbar, and pane view changes never call these methods.
+    func activateResources(access: CameraAccessSession?) {
+        phoneResourcesSuspended = false
+        resourcesActive = true
+        resourceAccess = access
+        sessions.forEach {
+            $0.setResourcesActive(true, access: access)
+        }
+    }
+
+    /// Phone inactivity conceals its UI; backgrounding suspends only its
+    /// controls when the same media is still owned by a connected display.
+    func suspendForPhone(stopImmediately: Bool = false, stopRecording: Bool = true) {
+        phoneResourcesSuspended = true
+#if os(iOS)
+        // External playback does not extend local recording into the background.
+        let recordings = sessions.map(\.recordingController).filter(\.isRecording)
+        if stopRecording, !recordings.isEmpty {
+            Task { for recording in recordings { await recording.stop() } }
+        }
+#endif
+        if hasActiveExternalDisplay, resourcesActive {
+            sessions.forEach {
+                $0.setResourcesActive(true, access: resourceAccess, controlsEnabled: false)
+            }
+        } else {
+            suspend()
+            suspendResources(stopImmediately: stopImmediately)
+        }
+    }
+
+    func setExternalDisplayActive(_ enabled: Bool, owner: UUID, access: CameraAccessSession) {
+        if enabled {
+            guard access.isUnlocked, !access.streamsSuspended else { return }
+            externalDisplayOwners.insert(owner)
+            externalAccess = access
+            sessions.forEach { access.retainViewerStream(owner: $0.streamOwner) }
+        } else {
+            externalDisplayOwners.remove(owner)
+            if externalDisplayOwners.isEmpty {
+                sessions.forEach { externalAccess?.releaseViewerStream(owner: $0.streamOwner) }
+                externalAccess = nil
+                if phoneResourcesSuspended {
+                    suspend()
+                    suspendResources(stopImmediately: true)
+                }
+            }
+        }
+    }
+
+    func suspendResources(stopImmediately: Bool = false) {
+        resourcesActive = false
+        resourceAccess = nil
+        sessions.forEach {
+            $0.setResourcesActive(
+                false,
+                access: nil,
+                stopImmediately: stopImmediately
+            )
+        }
+    }
+
+    /// Credential changes affect optional history reads only. In particular,
+    /// they must never turn background-suspended camera resources back on.
+    func refreshHistoryAccess(_ access: CameraAccessSession?) {
+        guard resourcesActive else { return }
+        resourceAccess = access
+        sessions.forEach { $0.refreshHistoryAccess(access) }
     }
 
     func setPlaybackSpeed(_ speed: CameraPlaybackSpeed) {
@@ -142,7 +565,12 @@ final class CameraGroupPlayback: ObservableObject {
     }
 
     func activate(camera: CameraVideoDevice, position: CameraSwitchPosition) {
+        let shouldReactivateResources = resourcesActive
+        let retainedAccess = resourceAccess
         deactivate()
+        resourcesActive = shouldReactivateResources
+        resourceAccess = retainedAccess
+        quality = camera.capability.fullScreenQuality
         selection = CameraMultipleSelection(first: camera.id)
         sessions = [makeSession(camera)]
         sessions[0].playback.useGroupClock()
@@ -203,8 +631,9 @@ final class CameraGroupPlayback: ObservableObject {
     func canToggle(_ camera: CameraVideoDevice) -> Bool { selection?.canToggle(camera.id) == true && !resolvingTime }
     func toggle(_ camera: CameraVideoDevice) {
         guard canToggle(camera) else { return }
-        if !sessions.contains(where: { $0.id == camera.id }), !camera.capability.qualities.contains(quality) {
-            error = "\(camera.device.displayName) does not support \(quality.rawValue) quality. Select a supported quality before adding it."
+        if !sessions.contains(where: { $0.id == camera.id }),
+           !supports(quality, on: camera.capability) {
+            error = "\(camera.device.displayName) does not support \(CameraLiveQualityPresentation.title(for: quality)) quality. Select a supported quality before adding it."
             return
         }
         if !active { setMultiple(true) }
@@ -228,9 +657,23 @@ final class CameraGroupPlayback: ObservableObject {
         }
     }
 
+    private func supports(
+        _ selection: CameraLiveQualitySelection,
+        on capability: CameraLiveVideoCapability
+    ) -> Bool {
+        if let requestedQuality = selection.requestedQuality {
+            return capability.qualities.contains(requestedQuality)
+        }
+        return capability.supportsDefaultQuality
+    }
+
     private func makeSession(_ camera: CameraVideoDevice) -> CameraGroupSession {
         let session = CameraGroupSession(camera: camera, client: client, quality: quality)
+        if !externalDisplayOwners.isEmpty { externalAccess?.retainViewerStream(owner: session.streamOwner) }
         observe(session)
+        if resourcesActive {
+            session.setResourcesActive(true, access: resourceAccess)
+        }
         return session
     }
 
@@ -280,10 +723,12 @@ final class CameraGroupPlayback: ObservableObject {
         lastTick = clock(); drive(seeking: true)
     }
 
-    func seek(to date: Date) {
+    func seek(to date: Date, paused requestedPause: Bool? = nil) {
         guard hasHistory else { return }
         cancelResolution()
-        source = .history; cursor = date.timeIntervalSince1970
+        source = .history
+        cursor = date.timeIntervalSince1970
+        if let requestedPause { isPaused = requestedPause }
         lastTick = clock(); drive(seeking: true)
     }
 
@@ -311,14 +756,14 @@ final class CameraGroupPlayback: ObservableObject {
         if isLive { return .live }
         guard let cursor else { return .live }
         if source == .history { return .canonical(cursor, paused: isPaused) }
-        guard let session = sessions.first(where: { $0.historyAvailable }),
+        guard let session = historySourceSession,
               let metadata = CameraPlaybackHistoryAvailability.metadata(in: session.controls.deviceMetadata) else { return .live }
         let now = clock()
         return .relative(cameraID: metadata.cameraID, offset: min(0, cursor - now), capturedAt: now, paused: isPaused)
     }
 
     private func resolveHistory(at hostTime: Double) {
-        guard !resolvingTime, let session = sessions.first(where: { $0.historyAvailable }),
+        guard !resolvingTime, let session = historySourceSession,
               let metadata = CameraPlaybackHistoryAvailability.metadata(in: session.controls.deviceMetadata) else { return }
         let id = UUID(); generation = id
         let now = clock(), paused = isPaused
@@ -392,6 +837,16 @@ final class CameraGroupPlayback: ObservableObject {
     }
 
     private func drive(seeking: Bool) {
+        let synchronize = isLive && sessions.count > 1
+        let heads = synchronize ? sessions.compactMap { session -> CameraLiveSynchronization.Head? in
+            guard let head = session.playback.liveSynchronizationHead else { return nil }
+            return .init(id: session.id, cameraUTC: head.cameraUTC, receivedAt: head.receivedAt)
+        } : []
+        let targets = liveSynchronization.targets(for: heads, now: clock())
+        for session in sessions {
+            session.playback.setLiveSynchronization(synchronize)
+            if synchronize { session.playback.followGroupLive(cameraTarget: targets[session.id]) }
+        }
         sessions.forEach { drive($0, seeking: seeking) }
         refreshPresentation()
     }
@@ -465,10 +920,15 @@ final class CameraGroupPlayback: ObservableObject {
         generation = UUID(); resolveTask?.cancel(); resolveTask = nil; resolvingTime = false
     }
     func deactivate() {
-        suspend(); sessions.forEach { $0.close() }; sessions = []; subscriptions = [:]
+        suspend()
+        resourcesActive = false
+        resourceAccess = nil
+        sessions.forEach { $0.close() }
+        sessions = []; subscriptions = [:]
         selection = nil; active = false; source = .live; cursor = nil; isPaused = false
         playbackSpeed = .normal
         edgeAnchor = nil; error = nil
+        liveSynchronization = CameraLiveSynchronization()
         sharedControls.installAggregatePresentation([])
     }
 

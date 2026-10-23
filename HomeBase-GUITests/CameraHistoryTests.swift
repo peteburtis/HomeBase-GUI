@@ -379,6 +379,22 @@ final class CameraHistoryTests: XCTestCase {
         controller.close()
     }
 
+    func testCalendarPlayResumesPreviouslyPausedHistoryAtTheChosenDate() async throws {
+        let controller = CameraLivePlaybackController()
+        defer { controller.close() }
+        controller.setNVRHistoryAvailable(true)
+        controller.history.configure(cameraID: camera, transport: HistoryFetcher())
+        controller.seek(to: Date(timeIntervalSince1970: 500), paused: true)
+        try await settled(controller.history)
+        XCTAssertTrue(controller.isPaused)
+        controller.seek(to: Date(timeIntervalSince1970: 400), paused: false)
+        XCTAssertFalse(controller.isPaused)
+        XCTAssertEqual(controller.playbackDate, Date(timeIntervalSince1970: 400))
+        try await settled(controller.history)
+        XCTAssertTrue(controller.isUsingHistory)
+        XCTAssertFalse(controller.isPaused)
+    }
+
     func testAvailabilityParserAcceptsCoverageWithoutFramesAndRejectsItOnFrameRequests() throws {
         let request = HBNVRMediaRequest(requestID: UUID().uuidString, operation: "availability", cameraID: camera,
             timeline: "canonical", range: .init(start: -1, end: 0), relativeTo: "live")

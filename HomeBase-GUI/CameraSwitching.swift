@@ -10,6 +10,24 @@ nonisolated enum CameraSwitchPosition: Equatable, Sendable {
     case canonical(Double, paused: Bool)
     case relative(cameraID: String, offset: Double, capturedAt: Double, paused: Bool)
 
+    /// A history bookmark is a frozen cursor even when playback was running
+    /// when the viewer returned to Live.
+    var paused: Self {
+        switch self {
+        case .live:
+            return .live
+        case .canonical(let time, _):
+            return .canonical(time, paused: true)
+        case .relative(let cameraID, let offset, let capturedAt, _):
+            return .relative(
+                cameraID: cameraID,
+                offset: offset,
+                capturedAt: capturedAt,
+                paused: true
+            )
+        }
+    }
+
     func resolve(using transport: any CameraHistoryFetching,
                  clock: @Sendable () -> Double = { ProcessInfo.processInfo.systemUptime }) async throws -> Self {
         guard case .relative(let cameraID, let offset, let capturedAt, let paused) = self else { return self }
@@ -34,14 +52,14 @@ final class CameraScreenSelection: ObservableObject {
     struct Session {
         let id: UUID
         let device: HBTopologyDeviceDescriptor
-        let quality: HBCameraLiveQuality
+        let quality: CameraLiveQualitySelection
         let position: CameraSwitchPosition
-        init(id: UUID = UUID(), device: HBTopologyDeviceDescriptor, quality: HBCameraLiveQuality, position: CameraSwitchPosition) {
+        init(id: UUID = UUID(), device: HBTopologyDeviceDescriptor, quality: CameraLiveQualitySelection, position: CameraSwitchPosition) {
             self.id = id; self.device = device; self.quality = quality; self.position = position
         }
     }
     @Published private(set) var session: Session
-    init(device: HBTopologyDeviceDescriptor, quality: HBCameraLiveQuality) {
+    init(device: HBTopologyDeviceDescriptor, quality: CameraLiveQualitySelection) {
         session = Session(device: device, quality: quality, position: .live)
     }
     func select(_ camera: CameraVideoDevice, position: CameraSwitchPosition) {
@@ -50,7 +68,7 @@ final class CameraScreenSelection: ObservableObject {
             position: CameraPlaybackHistoryAvailability.isAvailable(in: camera.device.metadata) ? position : .live)
     }
 
-    func retain(_ camera: CameraVideoDevice, quality: HBCameraLiveQuality) {
+    func retain(_ camera: CameraVideoDevice, quality: CameraLiveQualitySelection) {
         guard camera.id != session.device.identifier || quality != session.quality else { return }
         session = Session(id: session.id, device: camera.device, quality: quality, position: session.position)
     }
@@ -75,6 +93,9 @@ final class CameraPickerModel: ObservableObject {
             try Task.checkCancellation()
             guard generation == id else { return }
             cameras = CameraVideoCatalog.cameras(in: devices).sorted {
+                if ($0.artificialFeed == nil) != ($1.artificialFeed == nil) {
+                    return $0.artificialFeed == nil
+                }
                 let order = $0.device.displayName.localizedStandardCompare($1.device.displayName)
                 return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
             }

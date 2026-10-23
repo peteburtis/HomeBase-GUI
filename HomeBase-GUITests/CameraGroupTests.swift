@@ -5,6 +5,79 @@ import XCTest
 
 @MainActor
 final class CameraGroupTests: XCTestCase {
+    func testFullScreenFocusPreservesGroupSessionsAndPausedHistory() async throws {
+        let group = try makeGroup()
+        defer { group.deactivate() }
+        group.activate(camera: try camera("A"), position: .canonical(500, paused: true))
+        group.toggle(try camera("B"))
+        group.toggle(try camera("C", history: false))
+        for session in group.sessions where session.historyAvailable {
+            session.playback.history.configure(cameraID: session.id, transport: GroupHistoryFetcher())
+            try await settled(session.playback.history)
+        }
+        let ids = group.sessions.map(\.id)
+        let sessions = group.sessions.map(ObjectIdentifier.init)
+        let renderers = group.sessions.map { ObjectIdentifier($0.playback.renderer) }
+        let batches = group.sessions.map { $0.playback.history.buffer.batches.map(\.batch.id) }
+        for focusedID in [nil, ids[1], ids[2], nil, ids[0], nil] {
+            let presentation = CameraGroupPresentation(sessions: group.sessions, focusedCameraID: focusedID)
+            XCTAssertEqual(presentation.focusedSession?.id, focusedID)
+            XCTAssertEqual(presentation.visibleSessions.map(\.id), focusedID.map { [$0] } ?? ids)
+            XCTAssertEqual(presentation.showsMultipleCameras, focusedID == nil)
+            XCTAssertEqual(group.sessions.map(ObjectIdentifier.init), sessions)
+            XCTAssertEqual(group.sessions.map { ObjectIdentifier($0.playback.renderer) }, renderers)
+            XCTAssertEqual(group.sessions.map { $0.playback.history.buffer.batches.map(\.batch.id) }, batches)
+            XCTAssertEqual(group.cursor, 500)
+            XCTAssertTrue(group.isPaused)
+            XCTAssertTrue(group.active)
+        }
+        let invalid = CameraGroupPresentation(sessions: group.sessions, focusedCameraID: "removed")
+        XCTAssertNil(invalid.focusedSession)
+        XCTAssertEqual(invalid.visibleSessions.map(\.id), ids)
+        group.toggle(try camera("C", history: false))
+        group.toggle(try camera("B"))
+        XCTAssertNil(CameraGroupPresentation(sessions: group.sessions, focusedCameraID: ids[0]).focusedSession,
+            "Collapsing to one camera removes the Back override")
+    }
+
+    func testFullScreenUsesSingleCameraFrameWhileHiddenPanesRetainTheirFrames() async throws {
+        let client = try makeClient()
+        let sessions = try ["A", "B", "C", "D"].map { CameraGroupSession(camera: try camera($0), client: client) }
+        defer { sessions.forEach { $0.close() } }
+        let size = CGSize(width: 900, height: 600)
+        let divisions: [CameraGroupLayout.Division?] = [nil,
+            .init(frame: CGRect(x: 440, y: 0, width: 20, height: 600), margins: EdgeInsets()),
+            .init(frame: CGRect(x: 0, y: 290, width: 900, height: 20), margins: EdgeInsets())]
+        for division in divisions {
+            let cells = division.map { CameraGroupLayout.cells(count: 4, in: size, division: $0) }
+                ?? CameraGroupLayout.cells(count: 4, in: size)
+            for focused in sessions {
+                let presentation = CameraGroupPresentation(sessions: sessions, focusedCameraID: focused.id)
+                for (index, session) in sessions.enumerated() {
+                    let expected = session === focused
+                        ? (division.map { CameraGroupLayout.cells(count: 1, in: size, division: $0)[0] }
+                            ?? CGRect(origin: .zero, size: size)) : cells[index]
+                    XCTAssertEqual(presentation.frame(for: session, normal: cells[index], size: size, division: division), expected)
+                    XCTAssertEqual(presentation.isVisible(session), session === focused)
+                }
+            }
+        }
+    }
+
+    func testFocusedQualityDoesNotChangeOtherCamerasAndGroupCanReapplyItsPreference() async throws {
+        let group = try makeGroup()
+        defer { group.deactivate() }
+        group.activate(camera: try camera("A"), position: .live)
+        group.toggle(try camera("B"))
+        group.setQuality(.high)
+        let presentation = CameraGroupPresentation(sessions: group.sessions, focusedCameraID: "B")
+        try XCTUnwrap(presentation.focusedSession).setQuality(.medium)
+        XCTAssertEqual(group.sessions.map(\.quality), [.high, .medium])
+        XCTAssertEqual(group.quality, .high)
+        group.setQuality(.high)
+        XCTAssertEqual(group.sessions.map(\.quality), [.high, .high])
+    }
+
     func testPickerDefaultsToMultipleWithoutChangingSingleCameraPlayback() async throws {
         let client = try makeClient()
         let session = CameraGroupSession(camera: try camera("A"), client: client, quality: .high)
@@ -94,6 +167,24 @@ final class CameraGroupTests: XCTestCase {
         XCTAssertFalse(group.active, "A rejected selection must not start a shared clock")
         XCTAssertEqual(group.sessions.count, 1)
         XCTAssertNotNil(group.error)
+    }
+
+    func testHistorySourceFallsForwardToFirstSelectedCameraWithHistory() async throws {
+        let client = try makeClient()
+        let noHistory = try camera("No History", history: false)
+        let firstHistory = try camera("First History")
+        let secondHistory = try camera("Second History")
+        let initial = CameraGroupSession(camera: noHistory, client: client)
+        let group = CameraGroupPlayback(client: client, initialSession: initial)
+        defer { group.deactivate() }
+
+        XCTAssertNil(group.historySourceSession)
+        group.toggle(firstHistory)
+        group.toggle(secondHistory)
+        XCTAssertEqual(group.historySourceSession?.id, firstHistory.id)
+
+        group.toggle(firstHistory)
+        XCTAssertEqual(group.historySourceSession?.id, secondHistory.id)
     }
 
     func testSharedSpeedKeepsEveryHistoryPaneInLockstepAndSurvivesMultipleToggle() async throws {
@@ -233,6 +324,129 @@ final class CameraGroupTests: XCTestCase {
         XCTAssertEqual(session.playback.history.position, 500)
     }
 
+    func testCameraResourcesSerializeRapidSuspendAndResume() async throws {
+        let spy = CameraSessionResourceSpy()
+        let coordinator = CameraSessionResourceCoordinator(
+            startLiveVideo: { _ in await spy.start("video") },
+            stopLiveVideo: { immediately in
+                spy.stop("video", immediately: immediately)
+            },
+            startControls: { await spy.start("controls") },
+            stopControls: { spy.stop("controls") }
+        )
+
+        coordinator.setActive(true, access: nil)
+        for _ in 0..<100 {
+            if spy.startCount["video"] == 1,
+               spy.startCount["controls"] == 1 { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(spy.startCount["video"], 1)
+        XCTAssertEqual(spy.startCount["controls"], 1)
+
+        // The second activation arrives before the suspended generation has
+        // finished tearing down. The final start must nevertheless be last.
+        coordinator.setActive(false, access: nil, stopImmediately: true)
+        coordinator.setActive(true, access: nil)
+        await coordinator.waitForTransitions()
+
+        XCTAssertTrue(coordinator.isActive)
+        XCTAssertEqual(spy.startCount["video"], 2)
+        XCTAssertEqual(spy.startCount["controls"], 2)
+        XCTAssertEqual(spy.events.filter { $0.hasPrefix("video.") }.last, "video.start.2")
+        XCTAssertEqual(spy.events.filter { $0.hasPrefix("controls.") }.last, "controls.start.2")
+        XCTAssertTrue(
+            spy.events.contains("video.stop.immediately"),
+            "Access/background teardown must reach the running stream before cancellation cleanup"
+        )
+
+        let settledEvents = spy.events
+        coordinator.setActive(true, access: nil)
+        await coordinator.waitForTransitions()
+        XCTAssertEqual(spy.events, settledEvents, "Duplicate activation is a lifecycle no-op")
+
+        coordinator.close(stopImmediately: true)
+        await coordinator.waitForTransitions()
+        XCTAssertFalse(coordinator.isActive)
+        XCTAssertEqual(
+            spy.events.filter { $0.hasPrefix("video.") }.last,
+            "video.stop.immediately"
+        )
+        XCTAssertEqual(spy.events.filter { $0.hasPrefix("controls.") }.last, "controls.stop")
+    }
+
+    func testFailedControlsCanRestartWithoutTogglingCameraLifecycle() async {
+        var videoStarts = 0
+        var controlsStarts = 0
+        let coordinator = CameraSessionResourceCoordinator(
+            startLiveVideo: { _ in videoStarts += 1 },
+            stopLiveVideo: { _ in },
+            startControls: { controlsStarts += 1 },
+            stopControls: {}
+        )
+
+        coordinator.setActive(true, access: nil)
+        await coordinator.waitForTransitions()
+        XCTAssertTrue(coordinator.isActive)
+        XCTAssertEqual(videoStarts, 1)
+        XCTAssertEqual(controlsStarts, 1)
+
+        // A failed monitor is restarted in place. The camera session remains
+        // active and its live stream is not used as a recovery side effect.
+        coordinator.restartControls()
+        await coordinator.waitForTransitions()
+        XCTAssertTrue(coordinator.isActive)
+        XCTAssertEqual(videoStarts, 1)
+        XCTAssertEqual(controlsStarts, 2)
+
+        coordinator.close()
+        await coordinator.waitForTransitions()
+    }
+
+    func testRetainedDisplayStopsPhoneControlsWithoutRestartingVideo() async {
+        var videoStarts = 0, videoStops = 0, controlsStarts = 0
+        let coordinator = CameraSessionResourceCoordinator(
+            startLiveVideo: { _ in videoStarts += 1 },
+            stopLiveVideo: { _ in videoStops += 1 },
+            startControls: { controlsStarts += 1 }, stopControls: {})
+        coordinator.setActive(true, access: nil)
+        await coordinator.waitForTransitions()
+        coordinator.setActive(true, access: nil, controlsEnabled: false)
+        await coordinator.waitForTransitions()
+        XCTAssertTrue(coordinator.isActive)
+        XCTAssertFalse(coordinator.controlsActive)
+        coordinator.restartControls()
+        await coordinator.waitForTransitions()
+        XCTAssertEqual(controlsStarts, 1, "Background controls must not retry")
+        coordinator.setActive(true, access: nil)
+        await coordinator.waitForTransitions()
+        XCTAssertEqual(videoStarts, 1)
+        XCTAssertEqual(videoStops, 1, "Only the original start's serialized cleanup")
+        XCTAssertEqual(controlsStarts, 2)
+        coordinator.close()
+        await coordinator.waitForTransitions()
+    }
+
+    func testHistoryCredentialRefreshCannotReactivateSuspendedResources() async throws {
+        let client = try makeClient()
+        let session = CameraGroupSession(
+            camera: try camera("A"),
+            client: client
+        )
+        let group = CameraGroupPlayback(
+            client: client,
+            initialSession: session
+        )
+        defer { group.deactivate() }
+
+        XCTAssertFalse(session.resourcesActive)
+        group.refreshHistoryAccess(nil)
+        XCTAssertFalse(
+            session.resourcesActive,
+            "A late credential result must not restart background resources"
+        )
+    }
+
     func testMultipleToggleRetainsSessionRendererQualityAndHistoryCache() async throws {
         let client = try makeClient()
         let session = CameraGroupSession(camera: try camera("A"), client: client, quality: .high)
@@ -323,13 +537,418 @@ final class CameraGroupTests: XCTestCase {
         XCTAssertTrue(CameraGroupLayout.cells(count: 2, in: .zero).isEmpty)
     }
 
-    func testColumnSelectionDependsOnBothSizeClassesNotOrientation() {
+    func testLandscapeGridVideoFramesGravitateTowardCenterSeams() {
+        let size = CGSize(width: 852, height: 393)
+        for count in 2...4 {
+            let cells = CameraGroupLayout.cells(count: count, in: size)
+            let videos = cells.enumerated().map { index, cell in
+                CameraGroupLayout.videoFrame(
+                    in: cell,
+                    aspectRatio: 16 / 9,
+                    gravity: CameraGroupLayout.videoGravity(
+                        index: index,
+                        count: count,
+                        arrangement: .grid
+                    )
+                )
+            }
+
+            XCTAssertEqual(videos[0].maxX, size.width / 2, accuracy: 0.0001)
+            XCTAssertEqual(videos[1].minX, size.width / 2, accuracy: 0.0001)
+            if count > 2 {
+                XCTAssertEqual(videos[0].maxY, size.height / 2, accuracy: 0.0001)
+                XCTAssertEqual(videos[2].minY, size.height / 2, accuracy: 0.0001)
+                XCTAssertEqual(videos[2].maxX, size.width / 2, accuracy: 0.0001)
+            }
+        }
+    }
+
+    func testVerticalDivisionUsesFoldAsGutterAndFillsRowsInCameraOrder() {
+        let size = CGSize(width: 1_000, height: 800)
+        let division = CameraGroupLayout.Division(
+            frame: CGRect(x: 490, y: 0, width: 20, height: 800),
+            margins: EdgeInsets(top: 0, leading: 10, bottom: 0, trailing: 10)
+        )
+        XCTAssertEqual(division.axis, .vertical)
+        XCTAssertEqual(
+            CameraGroupLayout.cells(count: 1, in: size, division: division),
+            [CGRect(x: 0, y: 0, width: 480, height: 800)]
+        )
+        XCTAssertEqual(
+            CameraGroupLayout.cells(count: 2, in: size, division: division),
+            [
+                CGRect(x: 0, y: 0, width: 480, height: 800),
+                CGRect(x: 520, y: 0, width: 480, height: 800),
+            ]
+        )
+        XCTAssertEqual(
+            CameraGroupLayout.cells(count: 4, in: size, division: division),
+            [
+                CGRect(x: 0, y: 0, width: 480, height: 400),
+                CGRect(x: 520, y: 0, width: 480, height: 400),
+                CGRect(x: 0, y: 400, width: 480, height: 400),
+                CGRect(x: 520, y: 400, width: 480, height: 400),
+            ]
+        )
+        XCTAssertEqual(
+            CameraGroupLayout.cells(count: 3, in: size, division: division),
+            Array(CameraGroupLayout.cells(count: 4, in: size, division: division).prefix(3))
+        )
+    }
+
+    func testHorizontalDivisionTransposesFoldLayout() {
+        let size = CGSize(width: 800, height: 1_000)
+        let division = CameraGroupLayout.Division(
+            frame: CGRect(x: 0, y: 490, width: 800, height: 20),
+            margins: EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0)
+        )
+        XCTAssertEqual(division.axis, .horizontal)
+        XCTAssertEqual(
+            CameraGroupLayout.cells(count: 2, in: size, division: division),
+            [
+                CGRect(x: 0, y: 0, width: 800, height: 480),
+                CGRect(x: 0, y: 520, width: 800, height: 480),
+            ]
+        )
+        XCTAssertEqual(
+            CameraGroupLayout.cells(count: 4, in: size, division: division),
+            [
+                CGRect(x: 0, y: 0, width: 400, height: 480),
+                CGRect(x: 0, y: 520, width: 400, height: 480),
+                CGRect(x: 400, y: 0, width: 400, height: 480),
+                CGRect(x: 400, y: 520, width: 400, height: 480),
+            ]
+        )
+    }
+
+    func testFoldPaneVideosTouchWithoutClosingTheReservedDivision() {
+        // Both canvases leave spare space between aspect-fitted videos when
+        // centered individually, including the less common horizontal case.
+        let scenarios: [(CGSize, CameraGroupLayout.Division)] = [
+            (CGSize(width: 1_000, height: 800), .init(
+                frame: CGRect(x: 490, y: 0, width: 20, height: 800),
+                margins: EdgeInsets(top: 0, leading: 10, bottom: 0, trailing: 10)
+            )),
+            (CGSize(width: 1_600, height: 800), .init(
+                frame: CGRect(x: 0, y: 390, width: 1_600, height: 20),
+                margins: EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0)
+            )),
+        ]
+        for (size, division) in scenarios {
+            for count in 1...4 {
+                let cells = CameraGroupLayout.cells(count: count, in: size, division: division)
+                let videos = cells.enumerated().map { index, cell in
+                    CameraGroupLayout.videoFrame(
+                        in: cell,
+                        aspectRatio: 16 / 9,
+                        gravity: CameraGroupLayout.videoGravity(
+                            index: index, count: count, divisionAxis: division.axis
+                        )
+                    )
+                }
+                for index in videos.indices {
+                    XCTAssertTrue(cells[index].contains(videos[index]))
+                    XCTAssertFalse(videos[index].intersects(division.reservedFrame))
+                    if count <= 2 {
+                        XCTAssertEqual(videos[index].midX, cells[index].midX, accuracy: 0.0001)
+                        XCTAssertEqual(videos[index].midY, cells[index].midY, accuracy: 0.0001)
+                    } else if index >= 2 {
+                        switch division.axis {
+                        case .vertical:
+                            XCTAssertEqual(videos[index - 2].maxY, videos[index].minY, accuracy: 0.0001)
+                        case .horizontal:
+                            XCTAssertEqual(videos[index - 2].maxX, videos[index].minX, accuracy: 0.0001)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testDivisionLabelsFollowOutsideEdgesOfSideBySidePanes() {
+        for index in 0..<4 {
+            XCTAssertEqual(
+                CameraGroupLayout.labelAnchor(index: index, count: 4, divisionAxis: .vertical),
+                index.isMultiple(of: 2) ? .leading : .trailing
+            )
+            XCTAssertEqual(
+                CameraGroupLayout.labelAnchor(index: index, count: 4, divisionAxis: .horizontal),
+                index < 2 ? .leading : .trailing
+            )
+        }
+        XCTAssertEqual(
+            CameraGroupLayout.labelAnchor(index: 1, count: 2, divisionAxis: .horizontal),
+            .leading
+        )
+        XCTAssertTrue(CameraGroupLayout.labelsBelowVideo(count: 2, divisionAxis: .vertical))
+        XCTAssertFalse(CameraGroupLayout.labelsBelowVideo(count: 2, divisionAxis: .horizontal))
+    }
+
+    func testGridLabelsAnchorTowardOutsideEdgesAndColumnLabelsStayLeading() {
+        let cell = CGRect(x: 0, y: 0, width: 320, height: 180)
+        let labelSize = CGSize(width: 100, height: 24)
+
+        for index in 0..<4 {
+            let anchor = CameraGroupLayout.labelAnchor(
+                index: index,
+                arrangement: .grid
+            )
+            let frame = CameraGroupLayout.labelFrame(
+                in: cell,
+                safeBounds: cell,
+                aspectRatio: 16 / 9,
+                labelSize: labelSize,
+                belowVideo: false,
+                anchor: anchor
+            )
+            if index.isMultiple(of: 2) {
+                XCTAssertEqual(anchor, .leading)
+                XCTAssertEqual(frame.minX, cell.minX)
+            } else {
+                XCTAssertEqual(anchor, .trailing)
+                XCTAssertEqual(frame.maxX, cell.maxX)
+            }
+            XCTAssertEqual(
+                CameraGroupLayout.labelAnchor(
+                    index: index,
+                    arrangement: .column
+                ),
+                .leading
+            )
+        }
+    }
+
+    func testArrangementMaximizesDisplayedVideoAreaForEachCameraCount() {
+        let portrait = CGSize(width: 393, height: 852)
+        let landscape = CGSize(width: 852, height: 393)
+        for count in 2...4 {
+            XCTAssertEqual(CameraGroupLayout.arrangement(count: count, in: portrait), .column)
+            XCTAssertEqual(CameraGroupLayout.arrangement(count: count, in: landscape), .grid)
+        }
+
+        let square = CGSize(width: 600, height: 600)
+        XCTAssertEqual(CameraGroupLayout.arrangement(count: 1, in: square), .grid)
+        XCTAssertEqual(CameraGroupLayout.arrangement(count: 2, in: square), .column)
+        XCTAssertEqual(CameraGroupLayout.arrangement(count: 3, in: square), .column)
+        XCTAssertEqual(CameraGroupLayout.arrangement(count: 4, in: square), .grid)
+
+        XCTAssertEqual(
+            CameraGroupLayout.arrangement(
+                count: 3,
+                in: square,
+                aspectRatios: Array(repeating: 4 / 3, count: 3)
+            ),
+            .grid,
+            "Actual camera ratios, rather than a generic 16:9 feed, decide which layout shows more picture"
+        )
+    }
+
+    func testSafeAreaPolicyLimitsCompactWidthExemptionToDevicesWithHinges() {
         let classes: [UserInterfaceSizeClass?] = [nil, .compact, .regular]
         for horizontal in classes {
             for vertical in classes {
-                XCTAssertEqual(CameraGroupLayout.arrangement(horizontal: horizontal, vertical: vertical),
-                    horizontal == .compact && vertical != .compact ? .column : .grid)
+                for controlsVisible in [true, false] {
+                    for hasDeviceHinge in [true, false] {
+                        XCTAssertEqual(
+                            CameraGroupLayout.ignoresSafeArea(
+                                horizontal: horizontal,
+                                vertical: vertical,
+                                controlsVisible: controlsVisible,
+                                hasDeviceHinge: hasDeviceHinge
+                            ),
+                            !controlsVisible || vertical == .compact
+                                || (hasDeviceHinge && horizontal == .compact)
+                        )
+                    }
+                }
             }
+        }
+    }
+
+    func testOcclusionPolicyOnlyExemptsClosedHingedDevicesInCompactWidth() {
+        let classes: [UserInterfaceSizeClass?] = [nil, .regular, .compact]
+        for horizontal in classes {
+            for hinge in [CameraDeviceHingeState(),
+                          CameraDeviceHingeState(isPresent: true, isClosed: false),
+                          CameraDeviceHingeState(isPresent: true, isClosed: true)] {
+                XCTAssertEqual(CameraGroupLayout.avoidsOcclusions(horizontal: horizontal, hinge: hinge),
+                    horizontal == .compact && !(hinge.isPresent && hinge.isClosed))
+                // Hiding controls may expand the canvas, but must not weaken
+                // the independent hardware-occlusion policy.
+                XCTAssertTrue(CameraGroupLayout.ignoresSafeArea(horizontal: horizontal, vertical: .regular,
+                    controlsVisible: false, hasDeviceHinge: hinge.isPresent))
+            }
+        }
+    }
+
+    func testOcclusionsTrimPortraitTopAndEitherLandscapeSide() {
+        XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(
+            in: CGSize(width: 400, height: 800),
+            occlusions: [CGRect(x: 140, y: 10, width: 120, height: 40)]),
+            CGRect(x: 0, y: 50, width: 400, height: 700))
+        for left in [true, false] {
+            XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(
+                in: CGSize(width: 800, height: 400),
+                occlusions: [CGRect(x: left ? 10 : 750, y: 140, width: 40, height: 120)]),
+                CGRect(x: left ? 50 : 0, y: 0, width: 750, height: 400))
+        }
+    }
+
+    func testLegacyOcclusionFallbackReservesSixtyFourPointsAtTopAndBottom() {
+        for size in [CGSize(width: 393, height: 852), CGSize(width: 402, height: 874)] {
+            let regions = CameraGroupLayout.legacyOcclusionFrames(in: size, isPhone: true,
+                ignoresSafeArea: true, vertical: .regular)
+            let frame = CameraGroupLayout.unobscuredContentRect(in: size, occlusions: regions)
+            XCTAssertEqual(frame, CGRect(x: 0, y: 64, width: size.width, height: size.height - 128))
+            XCTAssertEqual(frame.midY, size.height / 2)
+            XCTAssertTrue(regions.allSatisfy { frame.intersection($0).isEmpty })
+        }
+    }
+
+    func testLegacyOcclusionFallbackDoesNotInsetCompactHeightEvenWithCompactWidth() {
+        XCTAssertTrue(CameraGroupLayout.avoidsOcclusions(horizontal: .compact, hinge: CameraDeviceHingeState()))
+        let classes: [UserInterfaceSizeClass?] = [.compact, nil]
+        for vertical in classes {
+            let size = CGSize(width: 852, height: 393)
+            let regions = CameraGroupLayout.legacyOcclusionFrames(in: size, isPhone: true,
+                ignoresSafeArea: true, vertical: vertical)
+            XCTAssertTrue(regions.isEmpty)
+            XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: size, occlusions: regions),
+                CGRect(origin: .zero, size: size))
+        }
+    }
+
+    func testLegacyOcclusionFallbackDoesNotDoubleInsetSafeAreasOrAffectOtherDevices() {
+        let size = CGSize(width: 393, height: 852)
+        for (isPhone, ignoresSafeArea) in [(true, false), (false, false), (false, true)] {
+            XCTAssertTrue(CameraGroupLayout.legacyOcclusionFrames(in: size,
+                isPhone: isPhone, ignoresSafeArea: ignoresSafeArea, vertical: .regular).isEmpty)
+        }
+        XCTAssertTrue(CameraGroupLayout.legacyOcclusionFrames(in: .zero,
+            isPhone: true, ignoresSafeArea: true, vertical: .regular).isEmpty)
+        let tiny = CGSize(width: 200, height: 100)
+        let regions = CameraGroupLayout.legacyOcclusionFrames(in: tiny, isPhone: true,
+            ignoresSafeArea: true, vertical: .regular)
+        XCTAssertTrue(regions.allSatisfy { CGRect(origin: .zero, size: tiny).contains($0) })
+        XCTAssertTrue(CameraGroupLayout.unobscuredContentRect(in: tiny, occlusions: regions).isEmpty)
+    }
+
+    func testTopQuarterOcclusionsBalanceAtBoundaryButNotBelowIt() {
+        let size = CGSize(width: 400, height: 800)
+        XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: size,
+            occlusions: [CGRect(x: 0, y: 100, width: 400, height: 100)]),
+            CGRect(x: 0, y: 200, width: 400, height: 400),
+            "The complete occlusion must fit within the top quarter, including its boundary")
+        let belowQuarter = CameraGroupLayout.unobscuredContentRect(in: size,
+            occlusions: [CGRect(x: 0, y: 100, width: 400, height: 101)])
+        XCTAssertEqual(belowQuarter, CGRect(x: 0, y: 201, width: 400, height: 599))
+        XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: size,
+            occlusions: [CGRect(x: 140, y: 750, width: 120, height: 40)]),
+            CGRect(x: 0, y: 0, width: 400, height: 750),
+            "A bottom-only obstruction does not enable the top-cutout heuristic")
+    }
+
+    func testTopOcclusionBalancesAgainstLargerBottomObstruction() {
+        let size = CGSize(width: 400, height: 800)
+        let obstacles = [CGRect(x: 140, y: -10, width: 120, height: 60),
+                         CGRect(x: 100, y: 720, width: 200, height: 80)]
+        for regions in [obstacles, Array(obstacles.reversed())] {
+            let actual = CameraGroupLayout.unobscuredContentRect(in: size, occlusions: regions)
+            XCTAssertEqual(actual, CGRect(x: 0, y: 80, width: 400, height: 640))
+            XCTAssertEqual(actual.midY, size.height / 2)
+            XCTAssertTrue(regions.allSatisfy { actual.intersection($0).isEmpty })
+        }
+    }
+
+    func testTopCornerOcclusionCanKeepFullHeightWhenSideAvoidanceIsLarger() {
+        XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: CGSize(width: 400, height: 800),
+            occlusions: [CGRect(x: 0, y: 10, width: 20, height: 40)]),
+            CGRect(x: 20, y: 0, width: 380, height: 800),
+            "Balance is vertical; don't force top/bottom padding if the best rectangle already avoids the cutout")
+    }
+
+    func testBalancedRectangleNeverExpandsAGapThatDoesNotCrossTheCenter() {
+        XCTAssertTrue(CameraGroupLayout.unobscuredContentRect(in: CGSize(width: 400, height: 800),
+            occlusions: [CGRect(x: 140, y: 0, width: 120, height: 40),
+                         CGRect(x: 0, y: 350, width: 400, height: 100)]).isEmpty,
+            "If no centered rectangle is possible, don't turn negative height into an overlapping rectangle")
+    }
+
+    func testUnobscuredRectangleAvoidsEveryRegionRegardlessOfEnumerationOrder() {
+        let size = CGSize(width: 400, height: 800)
+        let obstacles = [CGRect(x: 140, y: -10, width: 120, height: 60),
+                         CGRect(x: 0, y: 300, width: 30, height: 100),
+                         CGRect(x: 380, y: 500, width: 40, height: 80),
+                         CGRect(x: 80, y: 780, width: 100, height: 40)]
+        let expected = CGRect(x: 30, y: 50, width: 350, height: 700)
+        XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: size, occlusions: obstacles), expected)
+        XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: size, occlusions: obstacles.reversed()), expected)
+        for count in 1...4 {
+            let arrangement = CameraGroupLayout.arrangement(count: count, in: expected.size)
+            for cell in CameraGroupLayout.cells(count: count, in: expected.size, arrangement: arrangement) {
+                let global = cell.offsetBy(dx: expected.minX, dy: expected.minY)
+                XCTAssertTrue(expected.contains(global))
+                XCTAssertTrue(obstacles.allSatisfy { global.intersection($0).isEmpty })
+            }
+        }
+    }
+
+    func testOcclusionsOutsideCanvasOrAlreadyAboveSafeAreaDoNotReserveExtraSpace() {
+        let size = CGSize(width: 400, height: 700)
+        let bounds = CGRect(origin: .zero, size: size)
+        for obstacles in [[], [.zero], [.null],
+                          [CGRect(x: 100, y: -50, width: 120, height: 40)],
+                          [CGRect(x: 400, y: 200, width: 30, height: 40)]] as [[CGRect]] {
+            XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: size, occlusions: obstacles), bounds)
+        }
+        XCTAssertEqual(CameraGroupLayout.unobscuredContentRect(in: .zero, occlusions: []), .zero)
+        XCTAssertTrue(CameraGroupLayout.unobscuredContentRect(in: size, occlusions: [bounds]).isEmpty)
+    }
+
+    func testOcclusionPlacementTranslatesSafeLabelBoundsAndFoldIntoNewCanvas() {
+        let placement = CameraGroupLayout.CanvasPlacement(
+            size: CGSize(width: 1_000, height: 800),
+            safeBounds: CGRect(x: 10, y: 70, width: 940, height: 660),
+            division: .init(frame: CGRect(x: 490, y: 0, width: 20, height: 800), margins: .init()),
+            occlusions: [CGRect(x: 0, y: 350, width: 40, height: 100),
+                         CGRect(x: 100, y: 0, width: 100, height: 50)]
+        )
+        XCTAssertEqual(placement.frame, CGRect(x: 40, y: 50, width: 960, height: 700))
+        XCTAssertEqual(placement.safeBounds, CGRect(x: -30, y: 20, width: 940, height: 660))
+        XCTAssertEqual(placement.division?.frame, CGRect(x: 450, y: -50, width: 20, height: 800))
+        guard let division = placement.division else { return XCTFail("Lost the fold") }
+        for cell in CameraGroupLayout.cells(count: 4, in: placement.frame.size, division: division) {
+            let global = cell.offsetBy(dx: placement.frame.minX, dy: placement.frame.minY)
+            XCTAssertTrue(placement.frame.contains(global))
+            XCTAssertTrue(global.intersection(CGRect(x: 490, y: 0, width: 20, height: 800)).isEmpty)
+        }
+    }
+
+    func testUnobscuredRectangleFindsGlobalMaximumRatherThanGreedilyTrimmingEachRegion() {
+        let size = CGSize(width: 8, height: 8)
+        for seed in 0..<20 {
+            let obstacles = (0..<3).map { index in
+                CGRect(x: (seed + index * 3) % 7, y: (seed * 3 + index * 2) % 7, width: 2, height: 2)
+            }
+            let balancesVertically = obstacles.contains { $0.maxY <= size.height / 4 }
+            var largestArea = 0
+            for x in 0..<8 {
+                for y in 0..<8 {
+                    for right in (x + 1)...8 {
+                        for bottom in (y + 1)...8 {
+                            let candidate = CGRect(x: x, y: y, width: right - x, height: bottom - y)
+                            if (!balancesVertically || candidate.midY == size.height / 2),
+                               obstacles.allSatisfy({ candidate.intersection($0).isEmpty }) {
+                                largestArea = max(largestArea, (right - x) * (bottom - y))
+                            }
+                        }
+                    }
+                }
+            }
+            let actual = CameraGroupLayout.unobscuredContentRect(in: size, occlusions: obstacles)
+            XCTAssertEqual(actual.width * actual.height, CGFloat(largestArea), "Obstacle set \(seed)")
+            XCTAssertTrue(obstacles.allSatisfy { actual.intersection($0).isEmpty })
+            if balancesVertically, !actual.isEmpty { XCTAssertEqual(actual.midY, size.height / 2) }
         }
     }
 
@@ -385,12 +1004,12 @@ final class CameraGroupTests: XCTestCase {
         XCTAssertFalse(CameraGroupLayout.labelsBelowVideo(count: 4, arrangement: .grid))
     }
 
-    func testAllSessionsStartHighAndSelectionPreservesSharedCursorAndPause() async throws {
+    func testAllSessionsStartWithDefaultQualityAndSelectionPreservesSharedCursorAndPause() async throws {
         let group = try makeGroup()
         defer { group.deactivate() }
         group.activate(camera: try camera("A"), position: .canonical(500, paused: true))
         group.toggle(try camera("B")); group.toggle(try camera("C", history: false))
-        XCTAssertEqual(group.sessions.map(\.quality), [.high, .high, .high])
+        XCTAssertEqual(group.sessions.map(\.quality), [.automatic, .automatic, .automatic])
         XCTAssertTrue(group.sessions.allSatisfy { $0.playback.externallyClocked })
         XCTAssertEqual(group.cursor, 500)
         XCTAssertTrue(group.isPaused)
@@ -409,7 +1028,7 @@ final class CameraGroupTests: XCTestCase {
         defer { group.deactivate() }
         group.activate(camera: try camera("A"), position: .live)
         group.toggle(try camera("B"))
-        XCTAssertEqual(group.quality, .high)
+        XCTAssertEqual(group.quality, .automatic)
         let first = group.sessions[0]
         group.setQuality(.medium)
         XCTAssertEqual(group.sessions.map(\.quality), [.medium, .medium])
@@ -428,6 +1047,7 @@ final class CameraGroupTests: XCTestCase {
         let group = try makeGroup()
         defer { group.deactivate() }
         group.activate(camera: try camera("A"), position: .live)
+        group.setQuality(.high)
         let low = CameraVideoDevice(device: try camera("Low-only").device,
             capability: CameraLiveVideoCapability(qualities: [.low]))
         group.toggle(low)
@@ -442,13 +1062,22 @@ final class CameraGroupTests: XCTestCase {
         let safe = CGRect(x: 62, y: 50, width: 728, height: 322)
         for count in 1...4 {
             let cells = CameraGroupLayout.cells(count: count, in: size)
-            for cell in cells {
+            for (index, cell) in cells.enumerated() {
+                let anchor = CameraGroupLayout.labelAnchor(
+                    index: index,
+                    arrangement: .grid
+                )
                 let label = CameraGroupLayout.labelFrame(in: cell, safeBounds: safe, aspectRatio: 16 / 9,
-                    labelSize: CGSize(width: 120, height: 24), belowVideo: count == 2)
+                    labelSize: CGSize(width: 120, height: 24), belowVideo: count == 2,
+                    anchor: anchor)
                 let video = CameraGroupLayout.videoFrame(in: cell, aspectRatio: 16 / 9)
                 XCTAssertTrue(safe.contains(label))
                 XCTAssertTrue(cell.contains(label))
-                XCTAssertEqual(label.minX, max(video.minX, safe.minX))
+                if anchor == .leading {
+                    XCTAssertEqual(label.minX, max(video.minX, safe.minX))
+                } else {
+                    XCTAssertEqual(label.maxX, min(video.maxX, safe.maxX))
+                }
                 if count == 2 { XCTAssertEqual(label.minY, video.maxY) }
                 else { XCTAssertLessThanOrEqual(label.maxY, video.maxY) }
             }
@@ -685,7 +1314,8 @@ final class CameraGroupTests: XCTestCase {
     }
     private func camera(_ name: String, history: Bool = true) throws -> CameraVideoDevice {
         var metadata: [String: HBJSONValue] = [CameraLiveVideoCapability.availableMetadataKey: .bool(true),
-            CameraLiveVideoCapability.qualitiesMetadataKey: .array([.string("medium"), .string("high")])]
+            CameraLiveVideoCapability.qualitiesMetadataKey: .array([.string("medium"), .string("high")]),
+            CameraLiveVideoCapability.streamPolicyMetadataKey: .object(["version": .integer(1)])]
         if history { metadata[HBDeviceMetadataKeys.cameraPlayback] = try HBJSONValue(encoding:
             HBCameraPlaybackMetadata(nvrInstanceID: "nvr", cameraID: UUID().uuidString, stores: [.init(id: "local", name: "Local")])) }
         return try XCTUnwrap(CameraVideoCatalog.cameras(in: [.init(identifier: name, addressableName: name, displayName: name, metadata: metadata)]).first)
@@ -705,6 +1335,31 @@ final class CameraGroupTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(5))
         }
         XCTFail("History did not settle: \(history.state)")
+    }
+}
+
+@MainActor
+private final class CameraSessionResourceSpy {
+    var events: [String] = []
+    var startCount: [String: Int] = [:]
+
+    func start(_ resource: String) async {
+        let count = (startCount[resource] ?? 0) + 1
+        startCount[resource] = count
+        events.append("\(resource).start.\(count)")
+        guard count == 1 else { return }
+        do {
+            try await Task.sleep(for: .seconds(60))
+        } catch {}
+        events.append("\(resource).end.\(count)")
+    }
+
+    func stop(_ resource: String) {
+        events.append("\(resource).stop")
+    }
+
+    func stop(_ resource: String, immediately: Bool) {
+        events.append("\(resource).stop\(immediately ? ".immediately" : "")")
     }
 }
 

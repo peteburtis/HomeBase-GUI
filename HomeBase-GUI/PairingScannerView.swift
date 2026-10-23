@@ -11,14 +11,25 @@ import UIKit
 struct PairingScannerView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var cameraError: CameraError?
+    @State private var isShowingManualEntry: Bool
 
+    private let hasCamera: Bool
     let onPairingCode: (HomeBaseEndpoint) -> Void
+
+    init(
+        hasCamera: Bool = AVCaptureDevice.default(for: .video) != nil,
+        onPairingCode: @escaping (HomeBaseEndpoint) -> Void
+    ) {
+        self.hasCamera = hasCamera
+        self.onPairingCode = onPairingCode
+        _isShowingManualEntry = State(initialValue: !hasCamera)
+    }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            if let cameraError {
+            if let cameraError = cameraError ?? (hasCamera ? nil : .unavailable) {
                 ContentUnavailableView {
                     Label(cameraError.title, systemImage: "camera.fill")
                 } description: {
@@ -34,17 +45,26 @@ struct PairingScannerView: View {
                     onPairingCode(endpoint)
                 }
                 .ignoresSafeArea()
+            }
 
-                VStack {
-                    Spacer()
+            VStack(spacing: 12) {
+                Spacer()
+
+                if cameraError == nil, hasCamera {
                     Label("Scan a HomeBase pairing code", systemImage: "qrcode.viewfinder")
                         .font(.headline)
                         .padding(.horizontal, 18)
                         .padding(.vertical, 12)
                         .foregroundStyle(.white)
                         .background(.black.opacity(0.65), in: Capsule())
-                        .padding(.bottom, 36)
                 }
+
+                Button("Enter Address Manually", systemImage: "keyboard") {
+                    isShowingManualEntry = true
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.black.opacity(0.65))
+                .padding(.bottom, 36)
             }
 
             VStack {
@@ -61,6 +81,14 @@ struct PairingScannerView: View {
                     .padding()
                 }
                 Spacer()
+            }
+        }
+        .sheet(isPresented: $isShowingManualEntry) {
+            ManualServerEntryView(onEndpoint: onPairingCode)
+        }
+        .onChange(of: cameraError) { _, cameraError in
+            if cameraError == .unavailable {
+                isShowingManualEntry = true
             }
         }
     }

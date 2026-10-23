@@ -3,7 +3,7 @@ import XCTest
 
 @MainActor
 final class CameraPlaybackInteractionTests: XCTestCase {
-    func testEveryLiveStatusScreenKeepsControlsVisible() async {
+    func testEveryLiveStatusScreenAllowsControlsToToggle() async {
         let states: [CameraLiveVideoModel.State] = [
             .idle, .connecting, .waiting("Reconnecting"),
             .ended("Offline", retryable: true), .ended("Stopped", retryable: false), .failed("Error")
@@ -33,7 +33,7 @@ final class CameraPlaybackInteractionTests: XCTestCase {
             historyState: .idle, playbackFailed: false))
     }
 
-    func testPlaybackErrorsKeepControlsVisibleForEitherSource() async {
+    func testPlaybackErrorsAllowControlsToToggleForEitherSource() async {
         for history in [true, false] {
             assertStatusScreen(CameraPlaybackInteraction(liveState: .playing, usesHistory: history,
                 historyState: .ready, playbackFailed: true))
@@ -43,8 +43,8 @@ final class CameraPlaybackInteractionTests: XCTestCase {
     private func assertStatusScreen(_ presentation: CameraPlaybackInteraction) {
         XCTAssertFalse(presentation.showsVideo)
         for requested in [true, false] {
-            XCTAssertTrue(presentation.controlsVisible(requested: requested))
-            XCTAssertTrue(presentation.togglingControls(from: requested))
+            XCTAssertEqual(presentation.controlsVisible(requested: requested), requested)
+            XCTAssertEqual(presentation.togglingControls(from: requested), !requested)
         }
     }
 

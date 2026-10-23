@@ -41,7 +41,7 @@ final class CameraS3CredentialsTests: XCTestCase {
         let initialPresence = try await store.inspect()
         XCTAssertEqual(initialPresence, .missing)
         do {
-            try await store.save(CameraS3Credentials(destinationID: "test", accessKeyID: "DUMMY", secretAccessKey: "DUMMY", encryptionPassword: nil), using: attempt)
+            try await store.add(CameraS3Credentials(destinationID: "test", accessKeyID: "DUMMY", secretAccessKey: "DUMMY", encryptionPassword: nil), using: attempt)
         } catch CameraAccessError.keychain(let status) where [errSecNotAvailable, errSecAuthFailed, errSecInteractionNotAllowed].contains(status) {
             throw XCTSkip("This simulator cannot provision a biometric item without interaction (\(status)).")
         }
@@ -60,6 +60,16 @@ final class CameraS3CredentialsTests: XCTestCase {
             XCTAssertNotNil(attributes[kSecAttrAccessControl as String])
             XCTAssertEqual(attributes[kSecAttrGeneric as String] as? Data, CameraKeychainCredentialStore.biometricMarker)
         }
+        do {
+            try await store.add(CameraS3Credentials(destinationID: "another", accessKeyID: "OTHER", secretAccessKey: "OTHER", encryptionPassword: nil), using: attempt)
+            XCTFail("Adding must never replace an existing credential")
+        } catch {
+            XCTAssertEqual(error as? CameraAccessError, .credentialsAlreadySaved)
+        }
+        try await store.delete()
+        let deletedPresence = try await store.inspect()
+        XCTAssertEqual(deletedPresence, .missing)
+        try await store.delete() // Already absent is also successful.
 #else
         throw XCTSkip("Real Keychain fixture is simulator-only; deterministic policy tests run on every platform.")
 #endif

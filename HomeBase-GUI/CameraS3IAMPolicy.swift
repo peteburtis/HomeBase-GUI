@@ -8,7 +8,7 @@ import AppKit
 #endif
 
 /// Identity policy for the client, never the recorder's write credential.
-/// Predictable manifest keys and their referenced objects need no bucket list.
+/// Object reads remain sufficient; optional scoped listing improves gap navigation.
 enum CameraS3ReadPolicy {
     enum Failure: Error, LocalizedError {
         case unsafeDestination
@@ -38,6 +38,12 @@ enum CameraS3ReadPolicy {
                 "Effect": "Allow",
                 "Action": ["s3:GetObject"],
                 "Resource": "arn:\(partition):s3:::\(store.bucket)/\(store.prefix)*",
+            ], [
+                "Sid": "LocateRetainedHomeBaseRecordings",
+                "Effect": "Allow",
+                "Action": ["s3:ListBucket"],
+                "Resource": "arn:\(partition):s3:::\(store.bucket)",
+                "Condition": ["StringLike": ["s3:prefix": "\(store.prefix)*"]],
             ]],
         ]
         return String(decoding: try JSONSerialization.data(withJSONObject: policy,
@@ -52,11 +58,12 @@ struct CameraS3IAMPolicyView: View {
     var body: some View {
         Form {
             Section {
-                Text("Create a separate IAM user without console access. Attach this as its only permissions policy, then create an access key for use outside AWS and enter it on the S3 Access screen.")
-                Text("Allows object reads only within this store's prefix, including manifests and recordings. No listing, uploads, deletion, or bucket administration.")
+                Text("Create a separate IAM user without console access. Attach this as its only permissions policy, then create an access key for use outside AWS and enter it in Settings → Add Credentials or on the S3 Access screen.")
+                Text("Allows object reads and listing within this store's prefix, including manifests and recordings. Listing lets playback skip deleted recordings. No uploads, deletion, or bucket administration.")
                     .foregroundStyle(.secondary)
+                Text("Listing is optional. Existing credentials with only GetObject still play recordings; unavailable objects continue to show an error. You can omit the LocateRetainedHomeBaseRecordings statement to keep that behavior.")
                 if destination.store.prefix.isEmpty {
-                    Text("This store uses the bucket root, so the policy allows reading every object in that bucket.")
+                    Text("This store uses the bucket root, so the policy allows reading and listing every object in that bucket.")
                         .foregroundStyle(.secondary)
                 }
             }

@@ -141,6 +141,262 @@ final class CameraS3HistoryTests: XCTestCase {
         XCTAssertEqual(batch.gaps, [range]); XCTAssertEqual(batch.frameCount, 0)
         let calls = await objects.requests; XCTAssertEqual(calls.count, 1)
     }
+
+    func indexedFiles(_ entries: [CameraS3ManifestShard]) throws -> [String: Data] {
+        let encoder = JSONEncoder(), root = CameraS3ManifestLayout.root(prefix: store.prefix, cameraID: camera)
+        let groups = Dictionary(grouping: entries, by: { CameraS3ManifestLayout.day($0.range.start) })
+        let days = groups.keys.sorted().map { day in
+            CameraS3Catalog.Day(day: day, start: groups[day]!.map(\.range.start).min()!, end: groups[day]!.map(\.range.end).max()!)
+        }
+        var files = [root + "catalog.json": try encoder.encode(CameraS3Catalog(format: "hbnvr-s3-playback",
+            schemaVersion: 1, storeID: store.id, cameraID: camera, generatedAt: now, days: days))]
+        for day in groups.keys {
+            files[root + "days/" + day + ".json"] = try encoder.encode(CameraS3Manifest(format: "hbnvr-s3-playback",
+                schemaVersion: 1, storeID: store.id, cameraID: camera, generatedAt: now, period: day, shards: groups[day]!))
+        }
+        for (month, shards) in Dictionary(grouping: entries, by: { CameraS3ManifestLayout.month($0.range.start) }) {
+            files[root + "months/" + month + ".json"] = try encoder.encode(CameraS3Manifest(format: "hbnvr-s3-playback",
+                schemaVersion: 1, storeID: store.id, cameraID: camera, generatedAt: now, period: month, shards: shards))
+        }
+        return files
+    }
+
+    private func reader(_ objects: ListingS3ObjectStub) -> CameraS3HistoryReader {
+        let frozenNow = now
+        return CameraS3HistoryReader(store: store, cameraID: camera, password: nil, objects: objects,
+            now: { frozenNow }, decode: { _, shard, requested in
+                guard let range = shard.range.intersection(requested) else { return [] }
+                return [await self.piece(range)]
+            })
+    }
+
+    func testDeletedVideoBecomesGapAndAvailabilityUsesSameInventory() async throws {
+        let (entry, original) = try fixture(start: now - 60)
+        var files = original; files[entry.key] = nil
+        let objects = ListingS3ObjectStub(files: files), reader = reader(objects)
+        for operation in ["frames", "availability"] {
+            let result = try await reader.fetch(request(entry.range, operation: operation))
+            XCTAssertEqual(result.gaps, [entry.range]); XCTAssertTrue(result.pieces.isEmpty)
+        }
+        let calls = await objects.requests, listings = await objects.listings
+        XCTAssertFalse(calls.contains(entry.key), "Do not try downloading known deleted footage")
+        XCTAssertEqual(listings.filter { $0.0 == "test/camera/" }.count, 1, "Cache successful inventory")
+        await reader.close()
+    }
+
+    func testNeighborsSkipManyExpiredEntriesWithoutMediaReads() async throws {
+        let old = try (1...120).map { try fixture(start: now - Double($0) * 86400).0 }
+        let (retained, media) = try fixture(start: now - 60)
+        var files = try indexedFiles(old + [retained]); files[retained.key] = media[retained.key]
+        let objects = ListingS3ObjectStub(files: files), reader = reader(objects)
+        let cursor = now - 121 * 86400
+        let result = try await reader.fetch(request(.init(start: cursor, end: cursor + 0.00001), operation: "neighbors"))
+        XCTAssertNil(result.neighbors?.previous); XCTAssertEqual(result.neighbors?.next, retained.range)
+        let calls = await objects.requests, listings = await objects.listings
+        XCTAssertFalse(calls.contains { $0.hasSuffix(".mp4") })
+        XCTAssertEqual(listings.filter { $0.0 == "test/camera/" }.count, 1)
+        await reader.close()
+    }
+
+    func testDeletedPeriodManifestIsSkippedWithListingButStillErrorsWithoutIt() async throws {
+        let (old, _) = try fixture(start: now - 90 * 86400)
+        let (retained, media) = try fixture(start: now - 60)
+        var files = try indexedFiles([old, retained]); files[retained.key] = media[retained.key]
+        let oldKey = CameraS3ManifestLayout.root(prefix: store.prefix, cameraID: camera)
+            + "months/" + CameraS3ManifestLayout.month(old.range.start) + ".json"
+        files[oldKey] = nil
+        let objects = ListingS3ObjectStub(files: files), reader = reader(objects)
+        let result = try await reader.fetch(request(old.range))
+        XCTAssertEqual(result.gaps, [old.range])
+        let nearby = try await reader.fetch(request(old.range, operation: "neighbors"))
+        XCTAssertNil(nearby.neighbors?.previous); XCTAssertEqual(nearby.neighbors?.next, retained.range)
+        let calls = await objects.requests; XCTAssertFalse(calls.contains(oldKey))
+        let legacy = self.reader(ListingS3ObjectStub(files: files, listError: .accessDenied))
+        do { _ = try await legacy.fetch(request(old.range)); XCTFail("GET-only manifest error must remain") }
+        catch { XCTAssertEqual(error as? CameraS3ReadError, .accessDenied) }
+        await reader.close(); await legacy.close()
+    }
+
+    func testDeniedListingPreservesPlaybackAndMissingObjectErrorsForWholeSession() async throws {
+        for failure in [CameraS3ReadError.missing, .accessDenied] {
+            let (entry, files) = try fixture(start: now - 60)
+            let objects = ListingS3ObjectStub(files: files, listError: .accessDenied)
+            let reader = reader(objects)
+            let available = try await reader.fetch(request(entry.range, operation: "availability"))
+            XCTAssertTrue(available.gaps.isEmpty)
+            let result = try await reader.fetch(request(entry.range))
+            XCTAssertEqual(result.frameCount, 1)
+            await objects.remove(entry.key, error: failure)
+            // A fresh reader has no decoded media cache, as when reopening History.
+            let reopened = self.reader(objects)
+            do { _ = try await reopened.fetch(request(entry.range)); XCTFail("Legacy read failure must remain") }
+            catch { XCTAssertEqual(error as? CameraS3ReadError, failure) }
+            let listings = await objects.listings
+            XCTAssertEqual(listings.count, 2, "One denied attempt per reader/session")
+            await reader.close(); await reopened.close()
+        }
+    }
+
+    func testTransientOrIncompleteListingDoesNotInventAbsenceOrBlockGet() async throws {
+        for mode in [ListingS3ObjectStub.Mode.transient, .partialFailure, .repeatedToken, .pageLimit] {
+            let (entry, files) = try fixture(start: now - 60)
+            let objects = ListingS3ObjectStub(files: files, mode: mode), reader = reader(objects)
+            let result = try await reader.fetch(request(entry.range))
+            XCTAssertEqual(result.frameCount, 1); XCTAssertTrue(result.gaps.isEmpty)
+            await objects.remove(entry.key, error: .accessDenied)
+            let missing = self.reader(objects)
+            do { _ = try await missing.fetch(request(entry.range)); XCTFail("Incomplete listing must preserve GET error") }
+            catch { XCTAssertEqual(error as? CameraS3ReadError, .accessDenied) }
+            await reader.close()
+            await missing.close()
+        }
+    }
+
+    func testPaginationFindsVideoOnLaterPageBeforeDeclaringGap() async throws {
+        let (entry, files) = try fixture(start: now - 60)
+        let objects = ListingS3ObjectStub(files: files, mode: .paginate), reader = reader(objects)
+        let result = try await reader.fetch(request(entry.range))
+        XCTAssertEqual(result.frameCount, 1); XCTAssertTrue(result.gaps.isEmpty)
+        let listings = await objects.listings
+        XCTAssertTrue(listings.contains { $0.1 == "second" })
+        await reader.close()
+    }
+
+    func testDeletionAfterListingRefreshesOnceAndRemovesStaleNeighbor() async throws {
+        let (entry, files) = try fixture(start: now - 60)
+        let objects = ListingS3ObjectStub(files: files, mode: .deleteDuringRead), reader = reader(objects)
+        let before = try await reader.fetch(request(.init(start: now - 120, end: now - 119), operation: "neighbors"))
+        XCTAssertEqual(before.neighbors?.next, entry.range)
+        let result = try await reader.fetch(request(entry.range))
+        XCTAssertEqual(result.gaps, [entry.range])
+        let after = try await reader.fetch(request(.init(start: now - 120, end: now - 119), operation: "neighbors"))
+        XCTAssertNil(after.neighbors?.next)
+        let calls = await objects.requests
+        XCTAssertEqual(calls.filter { $0 == entry.key }.count, 1)
+        await reader.close()
+    }
+
+    func testListedObjectWithReadAccessDeniedStaysAnError() async throws {
+        let (entry, files) = try fixture(start: now - 60)
+        let objects = ListingS3ObjectStub(files: files, mode: .readDenied), reader = reader(objects)
+        do { _ = try await reader.fetch(request(entry.range)); XCTFail("Existing inaccessible object is not a gap") }
+        catch { XCTAssertEqual(error as? CameraS3ReadError, .accessDenied) }
+        await reader.close()
+    }
+
+    func testStandardMediaPrefixesUseObjectDateWhilePlaybackUsesCanonicalTiming() async throws {
+        let (entry, media) = try fixture(start: now - 180)
+        let captureDay = CameraS3ManifestLayout.day(now - 10 * 86400)
+        let directory = "test/Renamed camera--" + camera.lowercased() + "/"
+        let key = directory + captureDay + "T10-00-00.000Z_" + entry.id.lowercased() + ".mp4"
+        let renamed = CameraS3ManifestShard(id: entry.id, key: key, size: entry.size, sha256: entry.sha256,
+            encryption: entry.encryption, timing: entry.timing, endTicks: entry.endTicks)
+        var files = try indexedFiles([renamed]); files[key] = media[entry.key]
+        let objects = ListingS3ObjectStub(files: files), reader = reader(objects)
+        let frames = try await reader.fetch(request(renamed.range))
+        XCTAssertEqual(frames.pieces.first?.segment.range, renamed.range)
+        let neighbors = try await reader.fetch(request(.init(start: now - 300, end: now - 299), operation: "neighbors"))
+        XCTAssertEqual(neighbors.neighbors?.next, renamed.range)
+        let listings = await objects.listings
+        XCTAssertTrue(listings.contains { $0.0 == directory + captureDay })
+        XCTAssertTrue(listings.contains { $0.0 == directory + captureDay.prefix(7) })
+        XCTAssertFalse(listings.contains { $0.0 == store.prefix }, "Do not enumerate the whole store")
+        await reader.close()
+    }
+
+    func testRecentEmptyInventoryExpiresAndDiscoversLateUpload() async throws {
+        let (entry, original) = try fixture(start: now - 60)
+        let day = CameraS3ManifestLayout.day(now)
+        let key = "test/camera/" + day + "T10-00-00.000Z_" + entry.id.lowercased() + ".mp4"
+        let renamed = CameraS3ManifestShard(id: entry.id, key: key, size: entry.size, sha256: entry.sha256,
+            encryption: entry.encryption, timing: entry.timing, endTicks: entry.endTicks)
+        let objects = ListingS3ObjectStub(files: try indexedFiles([renamed]))
+        let clock = S3InventoryTestClock(now)
+        let picture = piece(renamed.range)
+        let reader = CameraS3HistoryReader(store: store, cameraID: camera, password: nil, objects: objects,
+            now: { clock.read() }, decode: { _, _, _ in [picture] })
+        let first = try await reader.fetch(request(renamed.range))
+        XCTAssertEqual(first.gaps, [renamed.range])
+        await objects.add(key, data: original[entry.key]!)
+        let cached = try await reader.fetch(request(renamed.range))
+        XCTAssertEqual(cached.gaps, [renamed.range])
+        clock.advance(6)
+        let refreshed = try await reader.fetch(request(renamed.range))
+        XCTAssertEqual(refreshed.frameCount, 1); XCTAssertTrue(refreshed.gaps.isEmpty)
+        await reader.close()
+    }
+
+    func testExpiredFootageEntersExistingGapNavigationAndPausedForwardJump() async throws {
+        let (old, _) = try fixture(start: now - 3600)
+        let (retained, media) = try fixture(start: now - 60)
+        var files = try indexedFiles([old, retained]); files[retained.key] = media[retained.key]
+        let objects = ListingS3ObjectStub(files: files)
+        let history = CameraHistoryPlayback(clock: { 0 })
+        defer { history.close() }
+        history.configure(cameraID: camera, transport: CameraHistoryFallback(local: S3HistoryStub(error: .unavailable), remote: reader(objects)))
+        history.enter(canonicalTime: old.range.start + 1, localHead: 0, paused: true)
+        for _ in 0..<200 {
+            if !history.fetching, case .ready = history.navigation { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(history.state, .gap)
+        XCTAssertNil(history.adjacentRecording(previous: true))
+        let next = try XCTUnwrap(history.adjacentRecording(previous: false))
+        XCTAssertEqual(next.timeIntervalSince1970, retained.range.start)
+        history.enter(canonicalTime: next.timeIntervalSince1970, localHead: 0, paused: true)
+        for _ in 0..<200 {
+            if !history.fetching, history.state == .ready { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(history.state, .ready); XCTAssertTrue(history.isPaused)
+        XCTAssertEqual(history.position, retained.range.start)
+    }
+}
+
+private actor ListingS3ObjectStub: CameraS3ObjectReading {
+    enum Mode: Sendable { case normal, transient, partialFailure, repeatedToken, pageLimit, paginate, deleteDuringRead, readDenied }
+    private var files: [String: Data]
+    private let listError: CameraS3ReadError?
+    private let mode: Mode
+    private var missingError = CameraS3ReadError.accessDenied
+    private(set) var requests: [String] = []
+    private(set) var listings: [(String, String?)] = []
+    init(files: [String: Data], listError: CameraS3ReadError? = nil, mode: Mode = .normal) {
+        self.files = files; self.listError = listError; self.mode = mode
+    }
+    func read(key: String, maximumBytes: Int) throws -> Data {
+        requests.append(key)
+        if key.hasSuffix(".mp4") {
+            if mode == .readDenied { throw CameraS3ReadError.accessDenied }
+            if mode == .deleteDuringRead { files[key] = nil }
+        }
+        guard let data = files[key] else { throw missingError }
+        return data
+    }
+    func list(prefix: String, continuationToken: String?) throws -> CameraS3ObjectPage? {
+        listings.append((prefix, continuationToken))
+        if let listError { throw listError }
+        if mode == .transient { throw CameraS3ReadError.timeout }
+        if mode == .partialFailure {
+            if continuationToken == nil { return .init(keys: [], next: "second") }
+            throw CameraS3ReadError.network
+        }
+        if mode == .repeatedToken { return .init(keys: [], next: "repeated") }
+        if mode == .pageLimit { return .init(keys: [], next: String(listings.count)) }
+        if mode == .paginate, continuationToken == nil { return .init(keys: [], next: "second") }
+        return .init(keys: files.keys.filter { $0.hasPrefix(prefix) }.sorted(), next: nil)
+    }
+    func remove(_ key: String, error: CameraS3ReadError) { files[key] = nil; missingError = error }
+    func add(_ key: String, data: Data) { files[key] = data }
+    func close() {}
+}
+
+private nonisolated final class S3InventoryTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seconds: Double
+    init(_ seconds: Double) { self.seconds = seconds }
+    func read() -> Double { lock.lock(); defer { lock.unlock() }; return seconds }
+    func advance(_ delta: Double) { lock.lock(); defer { lock.unlock() }; seconds += delta }
 }
 
 private actor S3ObjectStub: CameraS3ObjectReading {

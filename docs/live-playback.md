@@ -13,15 +13,18 @@ Buffering begins immediately when the full-screen player receives its first
 keyframe. It continues in Live, paused, and buffered-playback modes, retaining up
 to the most recent five minutes. It fills progressively; footage from before
 opening the player is generally not available in RAM, apart from the arbiter's
-small keyframe-led warm-join cache. Grid previews do not retain a playback buffer.
+small keyframe-led warm-join cache. Camera-grid previews prefer a current HBNVR
+JPEG thumbnail and refresh each camera every ten seconds over one serial media
+connection. Cameras without thumbnail support or current recording coverage
+fall back to their lowest advertised live quality. Thumbnail and live fallback
+are mutually exclusive, and grid previews do not retain a playback buffer.
 
-Opening the full-screen player suspends all camera-grid preview streams (and
+Opening the full-screen player suspends all camera-grid preview work (and
 the inline preview when opening from device details). Presentation state explicitly
-releases those previews' stream subscriptions even if SwiftUI keeps the covered
-views mounted. All live views on the same HomeBase client share a per-camera
-stream arbiter. The selected camera's full-screen player reuses its preview feed;
-on dismissal, that preview can immediately join the still-running feed. Cameras
-with no viewers close after **two seconds**. Backgrounded previews remain suspended.
+releases thumbnail polling and any fallback stream subscriptions even if SwiftUI
+keeps the covered views mounted. All live views on the same HomeBase client share
+a per-camera stream arbiter. Fallback cameras with no viewers close after **two
+seconds**. Backgrounded previews remain suspended.
 
 ### Shared live connections and quality handoff
 
@@ -59,15 +62,112 @@ its playing state and retained buffer is preserved, then joins a warm preview.
 Use `TEST_RUNNER_HB_LIVE_PLAYBACK_SMOKE_URL` with the existing smoke procedure
 below. It neither changes camera controls nor saves media.
 
+### Bounded live-camera synchronization
+
+Multiple live panes use camera wall-clock sampling times, not NVR canonical
+time or phone packet-arrival time. For comparable cameras, leading panes retain
+compressed frames and present the most tardy camera's current source time. This
+remains **Live**; there is no fixed 2.5-second buffer and no history request.
+The existing RAM/decoder bounds still apply. The external display follows the
+same presented samples; independent single-camera PiP stays at its live edge.
+
+The maximum alignment window is **2.5 seconds**, inclusive. Decisions use the
+newest *received* camera timestamps, never the held display positions. A stalled
+camera briefly holds its peers, then drops out once the received heads separate
+by more than 2.5 seconds or its last frame is more than 2.5 seconds old. Other
+panes catch up without waiting for reconnect. Missing clocks and clock outliers
+play independently. With three/four cameras, the largest mutually compatible
+group synchronizes; ties prefer the existing group, then the fresher group.
+Returning cameras rejoin when eligible, but displayed cursors never rewind.
+
+The app requests optional `cameraTime: true` live media. HomeBase attaches only
+camera-derived RTCP UTC: the NVR's existing validated camera mapping for shared
+feeds, or standard matching-SSRC RTCP sender reports for direct RTSP. No receipt
+or canonical-clock fallback is substituted. Camera clocks still need to agree
+in practice; the window bounds disagreement but cannot prove clock accuracy.
+An updated app works with older HomeBase/NVR builds, falling back to independent
+playback when timestamps are absent. Deploy the updated HomeBase and NVR as well
+as the app to enable synchronization for NVR-shared feeds. No service install or
+restart is performed by this GUI change.
+
+`CameraLiveSynchronizationTests` cover alignment, clock outliers, stalled-feed
+release/rejoin, freshness, and no-rewind behavior. Renderer tests exercise delayed
+live presentation and external-display replication with synthetic H.264. Physical
+camera checks should compare a common moving subject, stall one feed, and confirm
+the other panes release within the bounded window and the Live button stays Live.
+
+### Network interruptions and live recovery
+
+A transient control or media connection failure keeps the live consumers and
+their existing camera authorizations. It displays **Reconnecting to camera…**
+and retries with shared per-camera backoff (1, 2, 4, 8, 16, then 30 seconds).
+Every attempt checks/resumes the main HomeBase connection, opening a fresh
+session if its resume state has expired, then obtains a new `camera.live.open`
+ticket and media socket. Tickets are never reused. A successful keyframe resets
+backoff and switches the existing player to the new stream generation.
+
+`NWPathMonitor` changes are debounced by 500 ms and wake pending retries. They
+also trigger a bounded main-connection check, without interrupting healthy media
+merely because an interface changed. Path status never gates connection attempts:
+a VPN can change without changing general Internet reachability. A ready media
+socket receiving no frames or status messages is replaced after **15–30 seconds**;
+initial warm-up remains bounded to 20 seconds. Shared connection checks time out
+after 8 seconds, session open/resume after 15, and other control requests after
+30. Concurrent cameras share a single main-connection recovery. Control writes
+are not automatically replayed after a timeout.
+
+Network recovery does not unlock cameras, read Keychain, reopen dismissed views,
+or restart PiP automatically. Already-authorized active PiP/external-display
+consumers can recover while retained in the background, subject to iOS execution
+and networking availability. Dismissal, explicit disconnect, and access
+revocation cancel recovery; malformed media and non-retryable server failures
+remain terminal. Old-connection callbacks cannot retire a newer stream.
+Diagnostics use the `CameraRecovery` and `Connection` log categories without
+including tickets, credentials, or camera URLs.
+
+Deterministic `CameraStreamArbiterTests` and `HomeBaseConnectionRecoveryTests`
+cover dropped/silent sockets, bounded retries, concurrent recovery, fresh
+sessions/tickets, stale callbacks, and revocation/cancellation. Device testing
+should reproduce VPN loss during lock/unlock with PiP or an external camera
+display, then confirm all selected cameras resume without leaving the viewer.
+Also disconnect output or dismiss/revoke access during recovery and confirm
+that playback does not restart.
+
 Backgrounding, biometric locking, leaving the camera section, and HomeBase
 disconnect bypass the warm-join grace. Authorization revocation also rejects
 late acquisitions, clears the arbiter's compressed-media cache, and closes
 pending replacement streams. Inactive system dialogs only conceal the existing
 camera UI; they retain the existing camera-section lifecycle policy.
 
-Backgrounding releases live video and history connections. Non-live playback
+An explicitly active iOS Picture in Picture session or connected external camera display (see below) retains the
+camera access session and already-unlocked S3 credentials in memory, including
+across device lock and background/foreground transitions. Ordinary foreground stream leases are still
+revoked in the background. Stream authorization is per consumer, so PiP's
+one-camera lease can share encoded media without retaining ordinary streams.
+Revoking either lease never revokes the other; an idle handoff
+stream still closes immediately when its own authorization is revoked.
+
+Without a connected external camera display, backgrounding releases the viewer's live video and history connections. Non-live playback
 (the live buffer or NVR history) pauses at its current position, including the
 shared timeline in Multiple mode, and stays paused when the screen resumes.
+
+Each selected `CameraGroupSession` owns its live stream, control monitor,
+playback/history controller, gestures, and recording controller. Camera pane
+views are presentation-only: appearing, disappearing, resizing, or moving
+between safe-area layouts cannot start or stop camera resources. The stable
+full-screen owner alone applies authorization, background, camera-selection,
+and dismissal lifecycle changes. Those transitions are serialized so teardown
+from an older generation cannot stop a newly resumed stream or control monitor.
+Immediate background/access shutdown reaches the active stream before its task
+is cancelled, so it bypasses the ordinary arbiter handoff grace even when an
+acquisition is still finishing. Run ownership remains tracked until cleanup is
+complete, so a later immediate stop also strengthens a superseded acquisition
+or an ordinary release already crossing into the arbiter. The same per-run epoch
+owns playback and Photos-recorder callbacks, so work returning from an await
+cannot republish a stopped stream. Credential arrival refreshes optional history
+access only while resources are active and cannot reactivate a backgrounded
+camera. A control subscription that ends in failure is retried by its persistent
+camera session; relayout is never used as a recovery mechanism.
 Foregrounding reconnects live collection and history access; it does not press
 Play. Live mode instead remains Live and reconnects to the current feed. Other
 live-lease unloads/interruption paths use the same pause rule, and an interrupted
@@ -97,54 +197,26 @@ screen still ends its session and releases its buffers.
   guarantee of coverage for any requested time range.
 - Neither seeking nor playback can pass the newest received frame. Reaching that
   frame during ordinary playback does not automatically exit buffered mode.
-- The leading native toolbar contains Close, the Back 30 / Play-Pause /
-  Forward 30 group, and Live. The three shuttles share one system glass capsule;
-  Close uses iOS 26's native close button role; a standard toolbar spacer separates
-  it from playback. The toolbar owns
+- On iOS, the navigation position contains Close and the primary-action position contains
+  camera selection. The bottom toolbar contains the Back 30 / Play-Pause /
+  Forward 30 group, Live, optional playback speed, Record, and the available
+  quality/day-night/privacy controls. The three shuttles share one system glass
+  capsule. A flexible toolbar spacer separates playback from camera controls and
+  expands in wider layouts. In compact width, Back 30, Forward 30, quality, and
+  day/night move to the system's secondary-action overflow; Pause, icon-only Live,
+  Record, and privacy remain directly visible in the bottom toolbar. Fixed spacers
+  retain the grouping within each side.
+  Close uses iOS 26's native close button role. The toolbar owns
   button sizing and glass, with no fixed button frame, custom backing, or padded
   button content. These are standard SwiftUI toolbar items/groups, with system
-  adaptation on narrow screens, not a custom toolbar. Live/Record retain only
-  their state-dependent native prominence and tint.
-  In **compact horizontal size class**, Back 30, Forward 30, Video quality,
-  Day and night mode, and Privacy mode use `.secondaryAction` to intentionally
-  appear in the system overflow menu. Close, Play-Pause, and Live stay leading.
-  Camera selection stays trailing, alongside Record while live or playback speed
-  while buffered/in history. In compact width, speed moves from leading to
-  trailing and replaces Record rather than going into overflow.
-  Compact width makes Live icon-only and omits the extra spacers between the
-  playback actions and trailing actions; Close retains its own separation.
-  Regular width keeps the full toolbar. This uses size classes, not orientation
-  or screen-width thresholds. It is an iOS 26 compatibility policy; when adopting
-  iOS 27, use its explicit toolbar overflow and visibility-priority APIs while
-  retaining this fallback for iOS 26. Native adaptation still applies if even
-  the reduced primary controls cannot fit. Camera capability, recording, and
-  live/history availability rules are unchanged. The all-playback ControlGroup
-  experiment and temporary removal of the trailing controls have been reverted.
-- History lives in a floating bottom-trailing capsule alongside PTZ, not in the
-  navigation bar. One selection controls three states: Off, History, and PTZ.
-  Off shows History first, then PTZ when available, with neither panel open. Selecting either
-  hides the alternate button and tints only the selected icon with the system
-  accent color; tapping it again returns Off. The capsule uses Apple's
-  `GlassEffectContainer`, shared glass union, and stable effect IDs to morph as
-  buttons appear/disappear. There is no red/prominent History state.
-  History uses `clock.arrow.trianglehead.counterclockwise.rotate.90` and is
-  disabled without advertised NVR history. The capsule keeps its horizontal
-  safe-area anchor. With History open, its center aligns vertically with the
-  actual timeline bounds, whether the timeline uses the safe area or extends to
-  the screen edge; closing History returns it to 12 points inside the bottom
-  safe area. This vertical move shares the snappy panel/button
-  animation (no animation with Reduce Motion). PTZ sliders always retain their
-  safe-area layout. No calendar button is shown.
-- PTZ uses the existing four-arrow icon and opens every supported axis together.
-  There is no separate zoom toggle. Zoom is at the leading edge, extended down
-  to the button baseline and up to the top of the tilt slider; pan remains below
-  tilt, to the left of the capsule. Zoom-only cameras also support this panel.
-  The PTZ button is shown only for a supported camera in single-camera Live mode.
-  It is absent during buffered/history playback and when two or more cameras are
-  selected. One selected camera retains PTZ even with Multiple enabled in the picker.
-  Returning to Live restores the button, not the sliders.
-  Leaving Live, adding a second camera, or losing the capability closes an open PTZ
-  panel. Opening either panel never writes camera settings or changes playback.
+  adaptation, not a custom toolbar. Compact width keeps Live icon-only.
+  Camera capability, recording, and live/history availability rules are unchanged.
+  macOS retains its native window-toolbar arrangement because SwiftUI does not
+  provide the `.bottomBar` item placement there.
+- History and PTZ still share one panel state internally, but their custom
+  floating picker is temporarily not presented. Both panels therefore remain
+  closed until a replacement entry point is introduced. Their implementation
+  remains in place so the controls can be restored without rebuilding either panel.
 - Live is always alongside Play-Pause. It shows only its icon in compact width,
   and its icon and “Live” label in regular width (and on macOS).
   It uses native toolbar styling: prominent with red tint in Live mode,
@@ -153,15 +225,10 @@ screen still ends its session and releases its buffers.
   fixed button/icon dimensions, or foreground colors are applied. Its label is
   always “Live” for accessibility: `dot.radiowaves.left.and.right` while live, or
   `chevron.forward.dotted.chevron.forward` during buffered/history playback.
-  It never uses the History icon. A composed icon/title label
-  currently keeps the text visible: in the tested iOS 26.1 toolbar,
-  `.labelStyle(.titleAndIcon)` is ignored. Prefer replacing the composed label
-  with that native modifier when it works in this context. This compatibility
-  layout does not customize button styling. Tapping Live resumes live playback
+  It never uses the History icon. Tapping Live resumes live playback
   without hiding shuttles or releasing the buffer. While already live, it is a
   no-op. Neither action changes timeline visibility.
-- A native speed menu (trailing in compact width, after Live on the leading side
-  in regular width) shows the current
+- A native speed menu in the bottom toolbar shows the current
   **1×, 2×, or 4×** rate. It is hidden, not disabled, in Live mode; pause or
   rewind first to reveal it. Changing speed preserves pause, cursor, and timeline
   visibility. Multiple mode
@@ -174,17 +241,44 @@ screen still ends its session and releases its buffers.
   history/cache boundary only buffers; it does not reset the selected speed.
   The existing explicit Forward-30 behavior is unchanged, and skips still mean
   30 seconds of footage at every speed.
-- Record to Photos is available only in Live mode. Shuttle/Live controls stay
-  visible but disabled while requesting Photos authorization, starting/saving a
-  recording, or recording. The status/timer is shown beneath the navigation bar.
-  In regular width, Record remains in the trailing toolbar during buffered/history
-  playback, disabled rather than removed. In compact width it is hidden while
-  playback speed occupies that trailing space. Quality, day/night, and privacy are absent when
+- Record is available in Live mode. In History, **Export history** occupies the
+  same toolbar slot (including compact-height layouts). It opens a range popover
+  initialized to the exact playhead at the button tap; a buffered playhead is
+  resolved against the NVR clock without advancing the snapshot. Choose an
+  editable start and either an end date/time or hours/minutes duration. The
+  default duration is one minute, with a 24-hour limit per export. Times use the
+  NVR's advertised time zone. No seek, NVR recording change, or Photos write is
+  caused by opening or dismissing the popover.
+  Export reads existing NVR footage through independent, bounded 10-second
+  requests, with the same unlocked S3 fallback as playback. It does not wait for
+  future footage or rely on the live connection. Visible cameras export together;
+  focusing a pane exports only that camera. Cameras without recorded history
+  are reported. Each movie begins at a preceding available keyframe, potentially
+  earlier than the requested start, and ends at the requested end. Repeated GOP
+  preroll is deduplicated across requests when the shared encoded frame is
+  identified (allowing a source tick of timestamp rounding). Compatible chunks
+  concatenate end-to-end on a movie-local clock, retaining timing inside each
+  chunk. Recording gaps, one-frame timing mismatches and clock-epoch changes do
+  not split files or insert wall-clock pauses; the exported running time may be
+  shorter than the requested interval. Only incompatible decoder formats create
+  separate clips. Unidentified decoder prefixes retain their keyframe rather
+  than discarding dependent frames to trim an apparent clock overlap. Missing
+  coverage is still reported in the save popover. No transcoding or
+  audio synthesis occurs. Unknown coverage/network failures fail the export
+  rather than silently saving a truncated success.
+  Completion uses the same **Save to Photos / Save to Files / Share / Delete**
+  popover as live recording. Export progress is cancellable; closing/minimizing
+  the viewer, backgrounding, or revoking camera access cancels in-flight exports
+  and removes their temporary files. Keep the viewer open until completion.
+  Playback/camera-switch controls are hidden while choosing/exporting/saving a
+  clip; the playback reader and its cursor are not repurposed for export.
+  Quality, day/night, and privacy are absent when
   unavailable, including outside Live; invalid/disconnected day/night and privacy
   controls are hidden, and quality is hidden while Photos recording locks stream
   configuration. Pending day/night or privacy writes retain their brief disabled
   state to prevent duplicate actions without making the button disappear mid-use.
-  Capability-based omissions still apply, including no Photos recording with two or more cameras selected.
+  Capability-based omissions still apply; history export requires an advertised
+  history source for at least one visible camera.
   Camera switching remains available in history. PTZ sliders and their button are hidden outside
   Live; pan, pinch, and recenter gestures are disabled there,
   including the recenter accessibility action, and pending writes are cancelled.
@@ -209,7 +303,7 @@ screen still ends its session and releases its buffers.
 
 ## Switching cameras
 
-The far-right camera-selection button uses the filled-grid `rectangle.grid.3x3.fill`
+The camera-selection button uses the filled-video `video.fill`
 symbol and stays in its own toolbar group in both Live and History.
 Its popover lists the server's viewable cameras by display name, with a checkmark
 on the current camera. Selecting that camera is a no-op. The picker is disabled
@@ -257,17 +351,54 @@ toolbar control remains available in Multiple mode. A quality change applies to
 all selected cameras; cameras added later open directly at the selected quality.
 The menu offers qualities supported by every selected camera. Adding a camera
 that cannot use the selected quality reports that incompatibility instead of
-silently changing the existing cameras. Two or more selected cameras hide Photos recording
-controls. In compact width with non-compact height, two, three, or four cameras
-form a single centered vertical column, in selection order. The 16:9 panes touch
-edge to edge. They use the full width when the whole column fits; otherwise the
-column scales down uniformly to fit the full height, leaving black bars on both
-sides. There is no scrolling, cropping, or offscreen top/bottom overflow.
-Other size-class combinations retain two panes side by side or a 2×2 grid for
-three/four, leaving the fourth cell black for three. Single-camera presentation
-is unchanged. Trait changes only relayout the existing panes; they do not replace
-camera sessions, stream connections, buffers, or playback state. The grid ignores safe
-areas, while video is aspect-fit inside each cell, never cropped or oversized.
+silently changing the existing cameras. Recording and history export save a
+separate movie for each visible camera. For two through four cameras, layout compares the existing vertical
+column and grid candidates at the available canvas size, using each selected
+camera's current picture aspect ratio (16:9 only until configuration arrives),
+and chooses whichever gives the group the larger total rendered picture area.
+Two cameras therefore appear side by side on sufficiently wide canvases and top
+to bottom when that makes each picture larger. Three and four cameras make the
+same area-based choice between a column and the 2×2 grid; a three-camera grid
+leaves the fourth cell black. Ties prefer the grid. The centered column's 16:9
+panes touch edge to edge, use the full width when they fit, and otherwise scale
+uniformly to fit the available height. There is no scrolling, cropping, or
+offscreen overflow. Single-camera presentation is unchanged.
+
+Safe-area policy is independent of that layout choice. The media canvas ignores
+container safe-area insets with compact height, while controls are hidden, or
+with compact width on a device that reports a hinge. An active fold division
+also uses the full canvas. Other combinations lay the canvas out inside the safe area. Size-class
+changes can therefore alter the available canvas but never directly select a row,
+column, or grid. Relayout does not replace camera sessions, stream connections,
+buffers, or playback state. Video remains aspect-fit inside each cell, never
+cropped or oversized.
+The canvas keeps one structural SwiftUI hierarchy across every size-class
+combination; safe-area behavior changes through modifier values rather than an
+`if` that replaces its camera-pane subtree.
+On iOS 27.1 and later, compact-width camera layouts additionally query active
+`.occlusion` reserved regions. Even when ignoring safe areas, the camera canvas
+uses the largest single axis-aligned rectangle that avoids every returned
+region. If a visible occlusion lies wholly within the top 25% of the canvas,
+the rectangle must also be vertically centered: top and bottom reserve equal
+space, as though the cutout were mirrored at the bottom. Other real occlusions
+are still avoided; a larger bottom obstruction increases both insets. Cutouts
+below that threshold and side-only landscape cutouts keep the previous policy.
+The reported frames already contain the system's avoidance margins;
+they are not expanded again. This changes camera layout, not native toolbar or
+timeline placement. Regular-width layouts and systems returning no occlusions
+are unchanged. A closed Duo is explicitly exempt: the existing `onHingeChange`
+capability check now also tracks `.closed`, without device-name guesses. An open
+Duo still follows the compact-width rule and reserves its fold independently.
+Safe label bounds and the fold are translated into the resized canvas's local
+coordinates. Changes retain the same mounted camera views and playback resources.
+Before iOS 27.1, compact-width, regular-height iPhone canvases that ignore safe
+areas reserve a fixed **64 layout points at both top and bottom** instead.
+Compact-height landscape is excluded even when it still reports compact width.
+This is a conservative cutout approximation, not a physical-pixel measurement or model-specific island
+frame. Layouts already inside the native safe area aren't inset again. iPad,
+Mac, and other platforms don't receive this phone fallback. On iOS 27.1 and later
+the actual reserved regions remain authoritative, including an empty result;
+the fallback never overrides them or the closed-Duo exemption.
 Camera labels stay inside the screen's safe area without moving or shrinking
 the video panes; interior grid edges do not gain extra safe-area padding. In
 side-by-side two-up they touch the bottom of the actual video rectangle from immediately
@@ -329,7 +460,7 @@ changing quality/generation, or a backwards source timestamp does not discard
 retained footage. Each new stream epoch keeps its own decoder configuration and
 starts collecting at a keyframe; monotonic receipt time places the new epoch
 after the previous one, including a connection gap. The existing app lifecycle
-still stops network reception in the background; it resumes on returning to the
+stops ordinary network reception in the background (except active PiP/external output); it resumes on returning to the
 screen. Pausing for longer than the retention window can leave the cursor before
 available footage. Without NVR history,
 resuming Play starts at the oldest remaining decodable frame; with NVR history,
@@ -344,7 +475,7 @@ replaces the ordinary control connection. The screen keeps it prepared while Liv
 paused, or playing. A negotiated `supportsKeepalive` heartbeat every 20 seconds
 keeps idle IPC alive without reading files or fetching video. Older servers get an
 idle reconnect every 40 seconds, before their 60-second timeout. Screen close
-releases the connection and caches; backgrounding suspends networking and
+releases the connection and caches; without external output, backgrounding suspends networking and
 foregrounding prepares it again. Canceling an obsolete in-flight seek closes only
 this media connection, then prepares a replacement.
 
@@ -404,7 +535,7 @@ vertically on the timeline while keeping its horizontal safe-area anchor;
 horizontal scrolling still scrubs time. The timeline and PTZ panel cannot both
 be open. Hiding the timeline closes its thumbnail
 connection and stops follow/fetch work. It also hides with all player chrome,
-preserving its chosen visibility when chrome returns. A fixed center marker is the
+preserving its chosen visibility when chrome returns. A normally centered marker is the
 playback position. With a **compact vertical size class**, the timeline itself
 extends through the side and bottom safe areas to the screen edges; regular
 height keeps its safe-area layout. Compact width alone does not mean portrait.
@@ -412,6 +543,16 @@ The playhead reaches the bottom edge, with no bottom container padding;
 the numeric label row leaves just two physical pixels below its text baseline.
 The playhead and timeline labels are yellow, with semibold monospaced digits
 for the current playback timestamp and thumbnail interval times.
+Interval labels appear on both sides of the playhead. A label is hidden in full
+only when it touches the marker or overlaps the current timestamp (including a
+six-point breathing gap). The exclusion uses the timestamp's rendered width,
+so it grows when older footage adds the date and shrinks again for time alone.
+With an active vertical fold division, the strip remains full-width across the
+top of both panels. The playhead sits immediately beyond the division's trailing
+reserved margin, with its timestamp alongside it. Asymmetric scroll padding
+keeps that instant under the marker; folding/unfolding is not a seek. A horizontal
+division or no active division leaves the playhead centered. Thumbnail prefetch
+covers the longer visible side while retaining the same bounded cache.
 The toolbar and camera-label safe areas are unchanged. The
 past is left, future is right. Each thumbnail cell
 represents 20 minutes, but scrolling seeks continuously, not in 20-minute steps.
@@ -431,17 +572,18 @@ snap, haptic, and visible-thumbnail calculations use the resulting cell width.
 Images proportionally fill the frame,
 cropping overflow from other aspect ratios instead of letterboxing or stretching.
 
-Player layout uses size classes for adaptive policy, not orientation, screen-model
-tables, or screen bounds. The camera preview grid uses horizontal size class;
-the timeline uses vertical size class. Video aspect-fit, per-pane gesture coordinates,
-safe-area label placement, and bounded PTZ slider lengths remain geometric
-calculations, not orientation guesses. Camera count and the combined width/height
-size classes choose the column or two/four-up grid; this does not change the
-timeline's hypothetical two-up sizing reference within Multiple mode. Native toolbars/popovers retain system adaptation (with
+Player layout uses size classes for the safe-area and occlusion policies above,
+not to choose a multi-camera arrangement.
+The camera preview grid uses horizontal size class; the timeline uses vertical
+size class. Multi-camera arrangement, video aspect-fit, per-pane gesture
+coordinates, safe-area label placement, and bounded PTZ slider lengths remain
+geometric calculations, not orientation or device-model guesses. The selected
+column or two/four-up grid does not change the timeline's hypothetical two-up
+sizing reference within Multiple mode. Native toolbars/popovers retain system adaptation (with
 the explicitly requested popover behavior in compact layouts).
 
 Each interval label is left-aligned to its interval's start, but is hidden in
-full if it touches or crosses the playhead or lies to its right. The current
+full if it touches or crosses the playhead or conflicts with the current timestamp. The current
 playback timestamp owns the bottom label row just to the right of the playhead,
 on the same baseline as the remaining interval labels. It stays visible during
 scrubbing, with no fade mask. It shows `HH:mm:ss` within the last 24 elapsed hours
@@ -464,6 +606,20 @@ uses canonical time; labels use Homebase's time zone, with the existing local-zo
 fallback. VoiceOver's adjustable action moves twenty minutes in either direction.
 Multi-camera uses the first selected camera for previews and moves every selected
 camera together on the shared timeline.
+
+A circular glass **calendar** button overlays the trailing side of the scrubber,
+vertically centered on the strip. It is not a toolbar item and does not reserve
+space or change the timeline's scrolling geometry. It stays twelve points inside
+the trailing safe edge, including when the compact-height strip itself runs
+full-width under the safe-area insets. The button opens a date/time popover in
+the camera's time zone, initialized to the current playhead and bounded by the
+NVR-derived live edge. **Play** seeks the camera/group to the chosen instant and
+resumes playback, even if it was paused before opening. Opening, editing, or
+tapping outside to dismiss does not pause or seek. The popover shows only the
+native date/time controls and Play, without a heading, visible label, or Cancel button.
+The button waits for timeline clock resolution and respects the same playback
+interaction locks as the scrubber. Backgrounding or disabling playback dismisses
+the popover without committing its draft.
 
 Only the visible cells plus a small margin are requested, nearest first, as
 320×180-bounded JPEGs over a separate media WebSocket. This does not compete with
@@ -492,12 +648,230 @@ Unauthorized chips do nothing when tapped and do not create preview streams.
 The S3 setup padlock on missing footage is a separate action and is unchanged. The same
 gate covers camera video opened from device details; fullscreen players cannot
 bypass it. One session spans the camera list, fullscreen player, and camera
-switches. Leaving the section or backgrounding locks the session and releases
-its credential references. Inactive transitions conceal imagery for system
-snapshots, but do not cancel the authentication prompt itself. History stays
-paused at its existing position after backgrounding, behind the lock.
+switches. Unless explicit PiP or a connected external camera display is active, leaving the section or backgrounding
+locks the session and releases its credential references. Inactive transitions conceal imagery for system
+snapshots, but do not cancel the authentication prompt itself. Without external output, history stays
+paused at its existing position after backgrounding.
 
-Authentication follows the system on every entry, without a saved consent flag:
+### Full Screen camera focus
+
+With multiple cameras open, a pane's long-press menu starts with **Full Screen**,
+including artificial cameras and systems where PiP is unavailable. This is a
+presentation override: the chosen pane animates to the existing single-camera
+layout while the other panes fade out, stop accepting gestures, and leave the
+accessibility tree. Their views, sessions, live streams, renderers, buffers, and
+shared playback clock remain intact. Reduce Motion disables the zoom/fade.
+The existing safe-area, occlusion, and fold rules still apply.
+
+The native Close button becomes **Back to cameras**, returning to the original
+order and layout. No camera selection or playback state changes on focus/back.
+The camera label disappears, and configuration, quality, history thumbnails,
+and new recordings target the focused camera. Transport continues to use the
+group's synchronized clock, so returning to the grid never exposes a split
+timeline. Already-running recordings remain stoppable/exportable even after a
+focus change. Reapplying a group quality updates every camera, including a pane
+whose quality was changed while focused. The camera picker still retains the
+complete open selection; removing the focused camera clears the override.
+Native PiP restoration reveals the grid if the restored camera was hidden by a
+different focused pane.
+
+### External camera display (iOS)
+
+While the camera viewer is open, an AirPlay or wired external display
+automatically receives its own camera matrix. The phone keeps its existing
+video, controls, timeline, and gestures. No per-camera menu action is required.
+The external view uses the same `CameraGroupVideo` layout rules and camera
+selection order, calculated independently for the external display's dimensions.
+Phone orientation and single-camera focus do not change the external matrix.
+Camera names and playback status are included; interactive controls stay on
+the phone. The shared playback session also keeps history and pause in sync.
+
+While a connected external output is actually showing camera video, the phone
+adds a down-chevron **Minimize Video** button beside Close in the same native
+toolbar group. Minimizing leaves the entire viewer mounted in an app-level
+presentation layer, including its camera sessions, focus, quality, panels,
+playback clock, and external-scene registration. It only hides the phone layer
+and disables its interactions; it does not dismiss/recreate the viewer or open
+another set of streams. From Cameras it reveals Home, and selecting Cameras
+again immediately restores the same viewer. Device-detail and PiP-restored
+viewers use the same presentation owner. Close still tears down the viewer.
+
+Only while minimized, the system Cameras-tab badge shows the number of cameras
+currently displaying video on the active external output. It follows playback
+availability, clears on output loss/authorization revocation, and is absent
+while the phone viewer is visible. Other full-screen phone presentations do not
+tear down a retained output. Disconnecting the last output while minimized
+suspends its resources and releases its access grant, but preserves the viewer
+selection for an authorized return to Cameras. Server changes close it entirely.
+
+Each external pane has a separate sample-buffer display layer. A bounded relay
+feeds it the main player's already-scheduled live or history samples, without
+another camera subscription or playback clock. It retains at most one GOP,
+bounded to 8 MiB and 240 samples per camera, to prime a display connected while
+paused. If that bound is exceeded, a newly connected output waits for the next
+keyframe. External decoder recovery never resets the phone's decoder. Teardown
+flushes only the external output; normal playback reset/access revocation clears
+both outputs and the relay's cached imagery. PiP remains independently live-only.
+
+iOS 27 uses a noninteractive external-display scene accessory registered by the
+camera viewer. iOS 26 uses the corresponding scene role and a viewer registry.
+An output can first retain media only while its viewer is authorized and the
+phone is foregrounded. A registration without a connected window retains nothing.
+An already-connected output follows the same continuation policy as active PiP:
+locking/backgrounding the phone does not blank it, flush loaded credentials,
+pause its playback clock, or restart its streams. Each selected camera has a
+scoped consumer authorization; only those consumers survive phone suspension.
+Ordinary previews, phone controls, local recording, and new authentication/Keychain requests remain
+disabled, and phone imagery remains concealed while inactive. The interactive
+window's scene phase drives this policy, not the app's aggregate scene phase.
+
+Unlocking resumes phone controls without a new biometric prompt, Keychain read,
+or media restart. The last external-window disconnect or viewer dismissal
+releases retention; explicit access revocation/server changes always stop output
+and clear secrets. If PiP still owns access, its independent lease survives.
+This is the application's policy, not a guarantee against iOS suspending the
+process or disconnecting AirPlay while locked; physical-device checks are required.
+
+Device checks: connect before and after opening the viewer; use one through
+four cameras; change selection, quality, and live/history position; rotate and
+focus the phone while confirming the external matrix keeps its own layout;
+disconnect and reconnect while paused; confirm phone gestures remain available;
+lock/unlock while confirming the phone conceals its imagery but the external
+matrix continues. Check that disconnect/dismissal/revocation releases output and
+that merely registering a viewer without a connected display grants no exception.
+Exercise both a wired display and AirPlay, including an iOS 26 device and an
+iOS 27 device, and confirm PiP still uses its own live stream.
+Also minimize with multiple cameras, use Home/Scenes/Triggers and their panels,
+confirm the native Cameras badge, then return to Cameras without a stream or
+layout reset. Check that disconnecting while minimized removes the badge and
+that Close ends output. `CameraViewerPresentationTests` exercise retained view
+and task identity, actual camera session/renderer identity, native tab badges,
+covered-phone presentations, disconnect, restore, and final teardown.
+The full-view native UI test currently runs on iOS 27: this compiler's iOS 26
+XCTest runtime aborts in isolated-deinit while releasing the existing
+`CameraScreenSelection` during SwiftUI teardown. The state and retained-host
+tests still run on iOS 26; physical display checks on that OS remain necessary.
+
+### Picture in Picture (iOS)
+
+Long-press a real camera pane in the viewer to choose **Picture in Picture**.
+In history the action is named **Start Live Picture in Picture**: PiP has an
+independent live-only renderer, not the group's history cursor, replay buffer,
+recording controller, or S3 credentials. Starting it from History leaves History
+visible in the main pane and opens the current live feed in the PiP window.
+Artificial color-only cameras are not offered because they do not supply encoded
+media. While PiP is active, another
+camera's menu says **Swap Picture in Picture** with the `arrow.triangle.swap`
+symbol. Its live-only replacement stream prepares in the foreground while the
+current camera keeps playing. Once the new source is attached and its sample
+buffer layer reports `isReadyForDisplay`, the same native controller switches
+`contentSource` without stopping/restarting PiP or its audio/authorization session.
+AVKit owns the transition; no camera snapshots or custom window animations are
+used. Now Playing and full-screen restoration then refer to the new camera, and
+the old camera's PiP lease is revoked. A swap starts the new camera playing even
+if the previous one was paused. Failure/timeout keeps the previous camera; going
+to the background, closing the target viewer, or restoring full screen cancels
+an unfinished swap. Stopping PiP tears down both sources. Further starts/swaps
+are disabled while a start, swap, stop, or full-screen restoration is pending.
+New PiP actions are unavailable while recording locks stream configuration.
+
+An app-owned `AVPictureInPictureController` uses the camera's native
+`AVSampleBufferDisplayLayer`. Its inline source view stays mounted throughout
+PiP's transition and active phase. While the main pane is Live, that source stays
+in front so AVKit's own “playing in Picture in Picture” placeholder is visible;
+the app does not cover it with a custom message. Entering History moves the
+live-only PiP source behind the main pane without detaching it, so PiP keeps
+playing Live while the main pane shows independent History video. Returning the
+main pane to Live reveals AVKit's placeholder again. `requiresLinearPlayback`
+suppresses seeking; Pause freezes the displayed live frame while decoding
+continues, and Play jumps to the current live picture. The app declares the
+`audio` background mode required for media PiP. Its `.playback`/`.moviePlayback` audio session
+mixes with other apps for silent video. `CameraPiPAudioPolicy` isolates that
+choice so future audible cameras can take audio focus without changing the
+authorization/restoration design. Now Playing contains **only the camera name**
+and supports play/pause: no artwork, thumbnails, URLs, or other camera metadata.
+
+PiP can start only from the explicit foreground menu action while camera access
+is unlocked. `canStartPictureInPictureAutomaticallyFromInline` is always false.
+Backgrounding cancels a pending start; only an already active PiP stream can
+continue. Active PiP preserves the existing camera authorization and any S3
+credentials already loaded in memory; returning does not repeat Face ID or
+read Keychain again. It does not unlock credentials that were locked before PiP.
+Ordinary camera imagery is still concealed while inactive; ordinary streams,
+controls, and history remain suspended in the background. The independent,
+exact-camera stream authorization is revoked on
+PiP stop/failure, audio interruption, explicit access revocation, or server
+change. Ending PiP while backgrounded (or with no camera UI open) also clears
+the retained camera session and credentials unless an external display still owns them.
+Device lock/protected-data unavailability retains already-active output and keys
+already in memory; it cancels pending starts/swaps and permits no new Keychain
+request. Explicit revocation and server changes always clear them.
+There is no persisted background authorization or
+automatic PiP restart.
+
+Transient network loss retains the active PiP window while the shared live
+connection recovers. If the stream ends with a terminal failure, the window closes silently using the normal stop/cleanup
+path. No stream-ended alert is retained for the next time the viewer opens.
+Failures of an explicit start or swap still provide immediate feedback.
+
+Foreground stream readiness is published separately from retained authentication.
+The viewer, camera-grid previews, and device-detail previews wait for that gate
+before restarting. A background -> inactive transition alone cannot restart a
+stream; when the access lifecycle resumes it, the observed readiness change
+automatically restarts media even if the view already saw the active scene phase.
+Transient inactivity from an already-active scene still only conceals the UI.
+
+Only the system's return-to-app/full-screen action restores the viewer.
+If the originating viewer still contains the camera, its existing group and
+pane order remain untouched. If it was closed (or the camera was removed), a
+new viewer opens with just that camera, reusing the retained camera session.
+A bounded restoration hold bridges native PiP stopping, scene activation, and
+the reopened viewer taking ownership, regardless of callback order. Failed or
+timed-out restoration releases that hold; normal locking resumes afterward.
+Close explicitly unregisters the viewer; SwiftUI retaining a dismissed screen's
+model must not make restoration target that invisible screen. Weak ownership
+also removes screens discarded by other presentation changes.
+Merely foregrounding the app leaves PiP alone. Closing the viewer while PiP
+is active does not stop its selected stream; closing the system PiP does.
+Explicitly opening that camera in a new viewer stops PiP and resumes inline
+playback, including when SwiftUI reuses a previously closed viewer's ID. Adding
+the PiP camera back to a viewer also resumes it inline. Opening another camera,
+returning to the still-open original viewer, or dismissing a covering sheet does
+not stop PiP. Native full-screen restoration keeps its own stop/completion path.
+The same bounded authorization handoff protects explicit reopening regardless
+of whether viewer registration or its access scope appears first; it does not
+re-prompt for Face ID or reload already-retained S3 credentials.
+
+Focused tests cover the scoped lease, independent foreground/PiP revocation,
+late acquisition and idle-handoff teardown, minimal metadata, native controller
+flags, restoration selection, background-start policy, retained credentials,
+foreground-stream revocation, and restoration-handoff ordering. On a device, also
+check native start/stop and pause/resume, starting live PiP while History remains
+visible, switching Live → History → Live while PiP continues live and the native
+placeholder returns, background playback, return with the viewer open and closed,
+switching PiP cameras, locked-device continuation, and that backgrounding without an
+explicit PiP action never opens the system window.
+
+Verified on Parkaboy through iPhone Mirroring (2026-09-25): native start/stop,
+pause/resume to the current live frame, continuing playback on the Home Screen,
+return to the original two-camera order, and reopening a dismissed viewer with
+one camera. Repeated starts and backgrounding without automatic PiP also passed.
+The dismissed-viewer check caught retained SwiftUI state; explicit Close now
+unregisters it, covered by a regression test and a successful device retest.
+
+For iPhone Mirroring tests, launch a **Debug** build with
+`HOMEBASE_CAMERA_PIP_TEST_FIXTURE=1`. This launch-only fixture uses a camera-only
+authentication substitute and a credential store that always reports missing
+and rejects every read/write. It never creates a real Keychain store or reads,
+changes, or deletes the phone's S3 credentials. S3 history is unavailable.
+Normal launches are unchanged; Release builds ignore the variable and exclude
+the fixture's authentication/credential implementations. Do not enable this
+variable in a shared scheme. Relaunch without it after testing.
+
+### Authentication and credentials
+
+Authentication follows the system on each new camera session, without a saved
+consent flag. Active PiP keeps the existing session alive as described above:
 
 - Camera-page access and S3-credential access are independent. One successful
   biometric prompt satisfies the UI lock and is reused for a protected Keychain
@@ -539,14 +913,32 @@ confirmation. Credentials bind to store ID and exact destination, not camera
 names, daemon process IDs, or encryption toggles. Password text is preserved
 verbatim. Neither an app preference nor credential metadata contains the secrets.
 
+Home's top-right **Settings** gear offers a small S3 access page, including when
+no server is selected. It inspects Keychain attributes without loading secrets
+or unlocking cameras. The selected server's advertised stores are deduplicated
+across cameras; each has **Show Policy** and **Add Credentials** actions. Policy
+viewing works with no saved credentials. This page adds only when the device has
+no saved set: delete the current set first to change credentials or stores. Adding
+requires biometrics; deleting requires confirmation and removes only the local
+Keychain item, never AWS keys or recordings. Both actions invalidate credentials
+already held by camera readers without interrupting authorized live streams.
+Credentials are shared across servers on this device, but work only for the
+exact advertised store they were saved for. The existing camera setup remains
+available. Neither settings nor its policy view makes an S3 request.
+
 The form links to a suggested IAM identity policy with selectable JSON, Copy JSON,
-and Share JSON actions. It grants only `s3:GetObject` on the advertised bucket and
-exact prefix (including future predictable manifest objects). It does not grant
-bucket listing, writes, deletes, lifecycle changes, or KMS access; the supported
+and Share JSON actions. It grants `s3:GetObject` on the advertised bucket and
+exact prefix (including future predictable manifest objects), plus optional
+`s3:ListBucket` conditioned on that prefix and its subprefixes. The optional
+`LocateRetainedHomeBaseRecordings` statement lets History identify expired or
+manually deleted footage and offer the existing gap arrows. Existing GetObject-only
+credentials remain supported without modification; omitting or denying listing
+preserves the original playback and retrieval-error behavior. It grants no
+writes, deletes, lifecycle changes, or KMS access; the supported
 recorder uses SSE-S3 and optional app-side encryption. Use a dedicated IAM user
 without console access and no other policies. JSON generation rejects IAM
 wildcards/variables in advertised destinations instead of broadening access.
-An explicitly empty prefix grants reads throughout that bucket and is labeled so.
+An explicitly empty prefix grants reads and listing throughout that bucket and is labeled so.
 
 The reader does not interpret every HTTP 403 as invalid credentials:
 without `s3:ListBucket`, a missing object also returns 403, not 404. Predictable
@@ -606,8 +998,8 @@ journal. Cloud publication is serialized, coalesced, retryable and independent
 of video upload success. Shards crossing UTC midnight appear in both relevant
 days and are deduplicated by identity. Indexes are encrypted with the same
 HBNVR-PBE format when client encryption is enabled. Losing the recorder's journal
-loses its previous searchable cloud history; neither app nor recorder lists the
-bucket or reconstructs old indexes. **Already uploaded, unindexed recordings are
+loses its previous searchable cloud history; optional app listings check membership
+only and never reconstruct indexes or infer timing. **Already uploaded, unindexed recordings are
 not automatically backfilled.** Old spool entries without timing remain safely
 uploadable but cannot enter this new index.
 
@@ -615,7 +1007,8 @@ The app verifies each object's frozen size and SHA-256, authenticates the entire
 AES-GCM envelope (PBKDF2-HMAC-SHA256, exactly 600,000 iterations), then demuxes
 compressed H.264/H.265 samples in RAM. Embedded timing/identity must match the
 index. There are no temporary MP4s, decrypted disk caches, AWS environment
-credentials, reads through Homebase, or additional IAM permissions. The AWS SDK
+credentials or reads through Homebase. GetObject is required; prefix-scoped listing
+is optional. The AWS SDK
 for Swift is pinned to 1.7.78. Requests have a 45-second deadline, bounded bodies,
 no automatic retries or redirects, and sanitized diagnostics.
 
@@ -628,12 +1021,23 @@ refills; closing or authorization loss cancels readers and clears keys, object
 caches and media buffers. Backgrounding preserves the paused cursor, not cloud
 credentials. Transient system UI concealment does not restart authentication.
 
-An AWS error is not evidence of a recording gap. Missing/expired objects, a
-missing initial catalog, bad credentials, wrong passwords and corrupt objects
-report retrieval errors. Successfully read local intervals remain usable while
+An AWS error alone is not evidence of a recording gap. Complete successful listings
+filter missing video and period manifests from availability and previous/next
+navigation. Queries cover the camera's manifest directories and manifest-derived
+media prefixes (daily for frames, monthly for neighbors in the standard layout).
+Lists are paginated and cached for 5 seconds for recent periods, 60 seconds otherwise;
+each inventory is bounded to 100 pages, 100,000 keys and 8 MiB of key bytes, with at
+most eight inventories and 16 MiB of cached keys per session. Partial, oversized,
+invalid or failed lists never prove absence and fall back to manifest/GET playback.
+Denied listing is disabled for that reader session; transient failures have a
+5-second cooldown. An object-read failure after a listing refreshes its inventory
+once; only confirmed absence becomes a gap, and stale neighbor inventories are
+invalidated. Listing does not prove read access. A missing initial catalog, bad
+credentials, wrong passwords and corrupt objects remain retrieval errors.
+Successfully read local intervals remain usable while
 failed cloud intervals remain unknown and retryable. S3 Access remains reachable
-from an error state for credential repair. Only successful index reads can
-establish that no indexed footage covers a requested time. Indexes may refer to
+from an error state for credential repair. Successful index reads and optional
+complete inventories establish indexed availability. Indexes may refer to
 objects already expired by bucket lifecycle; the recorder does not delete cloud
 objects or claim authoritative expiration knowledge.
 
@@ -659,8 +1063,12 @@ On-device authentication smoke checks:
 
 - With no saved S3 credentials, enter Cameras: chips stay black until the system
   authentication decision. Cancel should leave them locked; Unlock retries.
-- Background and return, and leave/re-enter Cameras. Each starts a fresh lock
-  session. Opening fullscreen and switching cameras should not ask again.
+- Without PiP or a connected external display, background and return, and leave/re-enter Cameras. Each starts a
+  fresh lock session. Opening fullscreen and switching cameras should not ask again.
+- With active PiP, background and return (including the system full-screen
+  action after closing the viewer). No additional Face ID prompt should appear,
+  and previously unlocked S3 history should remain available without another
+  Keychain read. Closing PiP while backgrounded must restore normal locking.
 - With HBNVR 0.15.1 advertising S3, seek to missing local video. Check the leading
   padlock and credential sheet. Cancel must save nothing. Saving a test reader
   key requires biometrics and reports only a Keychain save, not AWS validation.
@@ -691,12 +1099,21 @@ speed-aware bounded history refills versus ordinary cache exhaustion.
 It needs no server, camera, or saved footage. Run the full `HomeBase-GUI` scheme's
 tests on macOS and an iOS simulator.
 `CameraLivePlaybackPresentationTests` also checks History and Live symbols,
-Live's no-op action while live and its size-class-dependent label, native shuttle
-grouping and separation, and Close sizing against an unmodified system button.
-It verifies UIKit's secondary item groups and captures compact- and regular-width
-toolbar adaptation in both Live and History, including wide windows with compact
-traits to avoid orientation-based assumptions, and checks
-the native camera gesture recognizers' availability on iOS.
+Live's no-op action while live, size-class-specific icon/title sizing,
+Close sizing against an unmodified system button, and the native camera gesture
+recognizers' availability on iOS. The full-screen camera itself owns the only
+camera-toolbar composition and the only compact/regular toolbar branch.
+It also flips portrait and landscape traits around a mounted camera canvas and
+proves its content appears once, never disappears, and retains the same owned
+state. `CameraGroupTests` verifies rapid suspend/resume transitions serialize
+with the final stream/control start occurring after every older teardown, that
+immediate shutdown policy reaches the live stream, and that non-16:9 camera
+ratios participate in the layout decision. `CameraLiveVideoTests` covers the
+unfinished-run ownership window and recorder-configuration invalidation, and
+`CameraStreamArbiterTests` verifies that an ordinary idle handoff can be upgraded
+to immediate shutdown without disturbing another active consumer. A group test
+also proves that a late history-credential refresh leaves suspended camera
+resources suspended.
 `CameraHistoryTests` adds cache/refill, paused seeks, stale responses, stable time
 anchoring, protocol bounds, H.264/HEVC decoding, metadata ordering, WebSocket reuse,
 timeouts and cancellation tests with injected transports.
@@ -725,20 +1142,15 @@ The history smoke suite requires HBNVR 0.14.0 and the corresponding Homebase rel
 It also checks both archive boundaries and a paused jump from an empty date to the
 first retained recording, including actual frame rendering at the returned target.
 
-Manual phone check: open a camera. Close, Play-Pause, and Live are present
-immediately; speed, the timeline, and PTZ sliders are absent. In regular width,
-the two 30-second shuttles share the Play-Pause capsule and Live has its title.
-In compact width, the shuttles and camera settings are in the system overflow,
-Live is icon-only, and Record and camera selection remain trailing. At bottom
-right, History precedes PTZ in one neutral glass capsule. Tap PTZ: only its tinted
-icon remains, supported sliders appear together, and no camera setting changes.
-Tap again: both icons return. Tap History: only its tinted icon remains and the
-timeline appears underneath the capsule, which animates to the timeline's vertical
-center without changing its horizontal anchor. Tap History again to hide it and
-animate the capsule back to its bottom safe-area anchor in the same panel transition.
-There is no separate handle or vertical show/hide gesture. Top-bar camera
-controls and gestures remain usable while Live. Horizontal timeline scrubbing
-still seeks. Verify full-size thumbnails with one camera, whether Multiple is on
+Manual phone check: open a camera. Close is in the navigation position, camera
+selection is the primary action, and Play-Pause and Live are present in the
+bottom toolbar; speed, the timeline, and PTZ sliders are absent. In regular width,
+  the two 30-second shuttles share the Play-Pause capsule and Live has its title.
+In compact width, Live is icon-only; Back 30, Forward 30, quality, and day/night
+appear in the secondary-action overflow while Pause, Record, and privacy remain
+grouped in the bottom toolbar. The temporary
+History/PTZ picker is absent, so neither panel can be opened. Camera controls and
+gestures remain usable while Live. Verify full-size thumbnails with one camera, whether Multiple is on
 or off, and compact sizing with two or more cameras. Open the picker: Multiple
 starts selected at the trailing edge without changing the one-camera controls
 or adding a label. Add a second camera, then remove either one: the survivor's
@@ -748,8 +1160,8 @@ playing, confirming no playback state changes. In portrait, allow the system's
 native navigation-bar adaptation; there is no bespoke row layout.
 Seek to an empty time and use the gap arrows to find the preceding/following
 recording; missing directions are absent and paused jumps remain paused.
-Pause: in compact width, speed replaces Record on the trailing side. In regular
-width, speed appears beside Live and Record stays visible but disabled. Quality,
+Pause: speed appears in the bottom toolbar and Record becomes Export history in
+the same slot. Quality,
 day/night, privacy, and PTZ controls disappear. Camera gestures do not move the camera. Camera
 switching remains usable. After five seconds, Forward 30 should show the newest
 frame but remain paused as new frames arrive. Play, then Forward 30: this resumes
@@ -764,8 +1176,25 @@ minute boundary, pause and seek both ways, then return Live. Camera controls and
 gestures must remain unavailable throughout historical playback.
 Open the camera list in Live and History; confirm its independent toolbar group
 and current-camera checkmark. Switch while Live, paused in the live buffer, and
-playing History. The screen and timeline visibility should stay put; historical time
+playing History through a programmatic or restored state. The screen and timeline visibility should stay put; historical time
 and pause state should carry across. With no destination NVR, expect Live instead.
 Start a Photos recording and confirm the list button stays visible but disabled
 until the recording finishes saving. The shuttles stay visible but disabled too,
 and the recording timer/save status appears beneath the navigation bar.
+
+History export checks: pause or seek to a recognizable frame, open Export history,
+and confirm the start remains that playhead even while playback continues. Try
+both duration and end date/time (including a date boundary), cancel, and confirm
+the video position and NVR recording state are untouched. Export across a shard
+boundary and check that the movie starts at the previous keyframe without a
+repeated GOP. Check a recording gap, an unavailable camera in a matrix, a focused
+single pane, and a network interruption. Save with Photos, Files, and Share;
+cancel the system picker and verify the export options return. Rotate while the
+range form is open: its content should scroll in short landscape height. Cancel,
+close, background, and revoke access during a long export; it must stop without
+presenting a late save dialog. `CameraHistoryExportTests` cover the frozen cursor,
+range validation, real H.264/HEVC MOV decoding and endpoint clipping, chunk
+deduplication, shard rebasing, concatenation across gaps/epochs/rounding and
+one-frame discontinuities, a three-hour/1,080-chunk single-file export, genuine
+codec-change splits, failure/cancellation cleanup, native
+range layouts, and deferred Photos access.

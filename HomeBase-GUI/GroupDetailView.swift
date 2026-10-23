@@ -10,12 +10,74 @@ struct GroupDetailView: View {
     let group: HBTopologyGroupDescriptor
     let topology: HBTopologyListResult
     let client: HomeBaseWebSocketClient
+    let selection: Binding<TopologyDetailDestination?>
 
     var body: some View {
         TopologyDetailView(
             group: group,
             topology: topology,
+            client: client,
+            selection: selection
+        )
+    }
+}
+
+struct GroupControlsDetailView: View {
+    @Environment(\.returnToGroup) private var returnToGroup
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.homeSplitViewLayout) private var splitLayout
+    let group: HBTopologyGroupDescriptor
+    let client: HomeBaseWebSocketClient
+    @StateObject private var model: LiveDeviceControlsModel
+    @State private var monitoring = LiveMonitoringSession()
+
+    init(
+        group: HBTopologyGroupDescriptor,
+        client: HomeBaseWebSocketClient
+    ) {
+        self.group = group
+        self.client = client
+        _model = StateObject(wrappedValue: LiveDeviceControlsModel(
+            device: group.controlDeviceDescriptor,
             client: client
+        ))
+    }
+
+    var body: some View {
+        List {
+            LiveDeviceControlSections(model: model, subjectKind: "group")
+            Section {
+                NavigationLink {
+                    DeviceAdvancedView(device: group.controlDeviceDescriptor, client: client)
+                } label: {
+                    Label("Advanced", systemImage: "slider.horizontal.3")
+                }
+            }
+        }
+        .navigationTitle(group.displayName)
+        .connectionStatusOverlay(model.state.connectionStatusPresentation) {
+            monitoring.restart()
+        }
+        .task(id: splitLayout) {
+            if splitLayout == .collapsed {
+                returnToGroup()
+            }
+        }
+        .onChange(of: scenePhase == .active && splitLayout == .expanded, initial: true) { _, active in
+            monitoring.setActive(active) { [model] in
+                await model.run(reactivating: true)
+            }
+        }
+    }
+}
+
+extension HBTopologyGroupDescriptor {
+    var controlDeviceDescriptor: HBTopologyDeviceDescriptor {
+        HBTopologyDeviceDescriptor(
+            identifier: controlDeviceIdentifier,
+            addressableName: controlDeviceIdentifier,
+            displayName: displayName,
+            metadata: metadata
         )
     }
 }

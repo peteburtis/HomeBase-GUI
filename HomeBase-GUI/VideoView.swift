@@ -8,18 +8,48 @@ import SwiftUI
 
 struct VideoView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.scenePhase) private var scenePhase
+#if os(iOS)
+    @Environment(\.cameraViewerPresentation) private var viewer
+    @Environment(\.cameraViewerIsPresented) private var viewerIsPresented
+#elseif os(macOS)
+    @Environment(\.openWindow) private var openWindow
+#endif
 
     let cameras: [CameraVideoDevice]
     let client: HomeBaseWebSocketClient
+    let server: PairedServer?
     var onPresentationChanged: (Bool) -> Void = { _ in }
+    @StateObject private var previews: CameraGridPreviewModel
     @State private var selectedCamera: CameraVideoDevice?
+
+    init(
+        cameras: [CameraVideoDevice],
+        client: HomeBaseWebSocketClient,
+        server: PairedServer? = nil,
+        onPresentationChanged: @escaping (Bool) -> Void = { _ in }
+    ) {
+        self.cameras = cameras
+        self.client = client
+        self.server = server
+        self.onPresentationChanged = onPresentationChanged
+        _previews = StateObject(wrappedValue: CameraGridPreviewModel(client: client))
+    }
 
     var body: some View {
         CameraAccessGate { access in
+            let previewsActive = access.canStream
+                && scenePhase == .active
+                && selectedCamera == nil
+                && !hasRetainedViewer
             ScrollView {
                 LazyVGrid(columns: columns, spacing: gridSpacing) {
                     ForEach(cameras) { camera in
-                        cameraButton(camera, access: access)
+                        cameraButton(
+                            camera,
+                            access: access,
+                            previewsActive: previewsActive
+                        )
                     }
                 }
                 .padding(gridSpacing)
@@ -29,13 +59,13 @@ struct VideoView: View {
                         .padding()
                 }
             }
+            .task(id: previewTaskIdentity(isActive: previewsActive)) {
+                guard previewsActive else { return }
+                await previews.run(cameras: cameras)
+            }
         }
 #if os(iOS)
         .fullScreenCover(item: $selectedCamera) { camera in
-            fullScreenVideo(for: camera)
-        }
-#else
-        .sheet(item: $selectedCamera) { camera in
             fullScreenVideo(for: camera)
         }
 #endif
@@ -65,26 +95,33 @@ struct VideoView: View {
 
     private func cameraButton(
         _ camera: CameraVideoDevice,
-        access: CameraAccessPresentation
+        access: CameraAccessPresentation,
+        previewsActive: Bool
     ) -> some View {
         Button {
             guard access.isUnlocked, access.session?.isUnlocked != false else { return }
+#if os(macOS)
+            guard let server else { return }
+            openWindow(value: CameraWindowRequest(server: server, camera: camera))
+#else
             // Retain the camera-section lease before presentation can obscure
             // its parent; don't depend on onChange/onDisappear callback order.
             onPresentationChanged(true)
+            if let viewer {
+                viewer.open(device: camera.device, quality: camera.capability.fullScreenQuality, client: client)
+                return
+            }
             selectedCamera = camera
+#endif
         } label: {
             VStack(alignment: .leading, spacing: 0) {
                 CameraProtectedPreview(access: access) {
-                    CameraLiveVideoPlayer(
-                        deviceIdentifier: camera.device.addressableName,
-                        quality: camera.capability.previewQuality,
+                    CameraGridPreview(
+                        camera: camera,
+                        preview: previews.preview(for: camera.id),
                         client: client,
-                        allowsRetry: false,
-                        isStreamEnabled: selectedCamera == nil
+                        isActive: previewsActive
                     )
-                    .frame(maxWidth: .infinity)
-                    .background(Color.black)
                 }
 
                 Text(camera.device.displayName)
@@ -111,8 +148,21 @@ struct VideoView: View {
         .accessibilityAddTraits(access.isUnlocked ? .isButton : .isStaticText)
         .accessibilityLabel(camera.device.displayName)
         .accessibilityHint(access.isUnlocked
-            ? "Opens camera controls and full-screen video"
+            ? cameraAccessibilityHint
             : (access.showsUnlockRecovery ? "Locked. Use Unlock to authenticate." : "Camera preview hidden during authentication."))
+    }
+
+    private func previewTaskIdentity(
+        isActive: Bool
+    ) -> CameraGridPreviewTaskIdentity {
+        CameraGridPreviewTaskIdentity(
+            cameras: cameras.map { camera in
+                let playbackCameraID = CameraPlaybackHistoryAvailability
+                    .metadata(in: camera.device.metadata)?.cameraID ?? ""
+                return "\(camera.id):\(playbackCameraID)"
+            },
+            isActive: isActive
+        )
     }
 
     private func fullScreenVideo(
@@ -124,4 +174,25 @@ struct VideoView: View {
             client: client
         )
     }
+
+    private var hasRetainedViewer: Bool {
+#if os(iOS)
+        viewerIsPresented || viewer?.request != nil
+#else
+        false
+#endif
+    }
+
+    private var cameraAccessibilityHint: String {
+#if os(macOS)
+        "Opens camera controls and video in a dedicated window"
+#else
+        "Opens camera controls and full-screen video"
+#endif
+    }
+}
+
+private struct CameraGridPreviewTaskIdentity: Hashable {
+    let cameras: [String]
+    let isActive: Bool
 }

@@ -58,6 +58,18 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertEqual(capability?.fullScreenQuality, .high)
     }
 
+    func testCapabilityUsesDefaultOnlyWhenServerAdvertisesStreamPolicy() {
+        let capability = CameraLiveVideoCapability(metadata: [
+            CameraLiveVideoCapability.availableMetadataKey: .bool(true),
+            CameraLiveVideoCapability.streamPolicyMetadataKey: .object([
+                "version": .integer(1),
+            ]),
+        ])
+
+        XCTAssertTrue(capability?.supportsDefaultQuality == true)
+        XCTAssertEqual(capability?.fullScreenQuality, .automatic)
+    }
+
     func testVideoCatalogIncludesOnlyLiveH264CamerasInTopologyOrder() {
         let devices = [
             HBTopologyDeviceDescriptor(
@@ -110,10 +122,45 @@ final class CameraLiveVideoTests: XCTestCase {
         )
     }
 
-    func testQualityMenuShowsOnlyAvailableTiersFromHighestToLowest() {
+    func testVideoCatalogAppendsFourArtificialCamerasAfterRealCameras() {
+        let real = HBTopologyDeviceDescriptor(
+            identifier: "camera-real",
+            addressableName: "RealCamera",
+            displayName: "Real Camera",
+            metadata: [CameraLiveVideoCapability.availableMetadataKey: true]
+        )
+
+        let cameras = CameraVideoCatalog.cameras(
+            in: [real],
+            includesArtificial: true
+        )
+
+        XCTAssertEqual(cameras.first?.id, real.identifier)
         XCTAssertEqual(
-            CameraLiveQualityPresentation.options(in: [.low, .high]),
+            cameras.dropFirst().compactMap(\.artificialFeed),
+            CameraArtificialFeed.allCases
+        )
+        XCTAssertEqual(cameras.count, 5)
+    }
+
+    func testQualityMenuShowsDefaultBeforeAvailableTiersFromHighestToLowest() {
+        XCTAssertEqual(
+            CameraLiveQualityPresentation.options(
+                in: [.low, .high],
+                includesDefault: true
+            ),
+            [.automatic, .high, .low]
+        )
+        XCTAssertEqual(
+            CameraLiveQualityPresentation.options(
+                in: [.low, .high],
+                includesDefault: false
+            ),
             [.high, .low]
+        )
+        XCTAssertEqual(
+            CameraLiveQualityPresentation.title(for: .automatic),
+            "Default"
         )
         XCTAssertEqual(
             CameraLiveQualityPresentation.title(for: .low),
@@ -127,6 +174,13 @@ final class CameraLiveVideoTests: XCTestCase {
             CameraLiveQualityPresentation.title(for: .high),
             "High"
         )
+    }
+
+    func testDefaultQualityOmitsConcreteProtocolQuality() {
+        XCTAssertNil(CameraLiveQualitySelection.automatic.requestedQuality)
+        XCTAssertEqual(CameraLiveQualitySelection.low.requestedQuality, .low)
+        XCTAssertEqual(CameraLiveQualitySelection.medium.requestedQuality, .medium)
+        XCTAssertEqual(CameraLiveQualitySelection.high.requestedQuality, .high)
     }
 
     func testAVCCValidationAcceptsRepeatedLengthPrefixedNALUnits() {
@@ -324,7 +378,7 @@ final class CameraLiveVideoTests: XCTestCase {
         )
     }
 
-    func testRecordingArmsAfterDestinationPreparation() async throws {
+    func testRecordingArmsWithoutRequestingPhotosAccess() async throws {
         let destination = CameraRecordingDestinationStub()
         let controller = CameraLocalRecordingController(
             destination: destination
@@ -342,34 +396,34 @@ final class CameraLiveVideoTests: XCTestCase {
         )
         await controller.start()
 
-        XCTAssertEqual(destination.prepareCount, 1)
+        XCTAssertEqual(destination.prepareCount, 0)
         XCTAssertEqual(controller.state, .waitingForKeyFrame)
         XCTAssertTrue(controller.isRecording)
         XCTAssertTrue(controller.locksStreamConfiguration)
 
-        await controller.stopAndSave()
+        await controller.stop()
         XCTAssertEqual(controller.state, .idle)
         XCTAssertFalse(controller.isRecording)
         XCTAssertEqual(destination.savedURLs.count, 0)
     }
 
-    func testRecordingPreparationFailureIsPresented() async throws {
+    func testPhotosPreparationFailureIsPresentedWhenExportIsRequested() async {
         let destination = CameraRecordingDestinationStub(
             preparationError: CameraRecordingDestinationError.permissionDenied
         )
+        let pendingRecording = CameraLocalRecording(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("HomeBase-recording-test.mov"),
+            creationDate: Date()
+        )
         let controller = CameraLocalRecordingController(
-            destination: destination
-        )
-        let ownerID = UUID()
-        let formatDescription = try makeH264FormatDescription()
-        await controller.configure(
-            ownerID: ownerID,
-            generation: 1,
-            formatDescription: formatDescription
+            destination: destination,
+            pendingRecording: pendingRecording
         )
 
-        await controller.start()
+        let saved = await controller.savePendingRecordingToPhotos()
 
+        XCTAssertFalse(saved)
         XCTAssertEqual(destination.prepareCount, 1)
         XCTAssertEqual(
             controller.errorMessage,
@@ -377,9 +431,103 @@ final class CameraLiveVideoTests: XCTestCase {
                 .localizedDescription
         )
         XCTAssertFalse(controller.isRecording)
+        XCTAssertEqual(controller.pendingRecording, pendingRecording)
 
         controller.dismissError()
         XCTAssertEqual(controller.state, .idle)
+    }
+
+    func testSuccessfulPhotosExportReleasesPendingRecording() async {
+        let destination = CameraRecordingDestinationStub()
+        let pendingRecording = CameraLocalRecording(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("HomeBase-recording-export-test.mov"),
+            creationDate: Date()
+        )
+        let controller = CameraLocalRecordingController(
+            destination: destination,
+            pendingRecording: pendingRecording
+        )
+
+        let saved = await controller.savePendingRecordingToPhotos()
+
+        XCTAssertTrue(saved)
+        XCTAssertEqual(destination.prepareCount, 1)
+        XCTAssertEqual(destination.savedURLs, [pendingRecording.fileURL])
+        XCTAssertNil(controller.pendingRecording)
+        XCTAssertEqual(controller.successfulExportCount, 1)
+        XCTAssertEqual(controller.state, .idle)
+    }
+
+    func testEveryRecordingExportBatchGetsNewPresentationIdentity() {
+        let recording = CameraLocalRecording(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("HomeBase-recording-presentation.mov"),
+            creationDate: Date()
+        )
+
+        let first = CameraRecordingExportPresentation(
+            recordings: [recording]
+        )
+        let second = CameraRecordingExportPresentation(
+            recordings: [recording]
+        )
+
+        XCTAssertEqual(first.recordings, second.recordings)
+        XCTAssertNotEqual(first.id, second.id)
+    }
+
+    func testCompletedExportAllowsRecordingControllerToRearm() async throws {
+        let pendingRecording = CameraLocalRecording(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("HomeBase-recording-rearm.mov"),
+            creationDate: Date()
+        )
+        let controller = CameraLocalRecordingController(
+            destination: CameraRecordingDestinationStub(),
+            pendingRecording: pendingRecording
+        )
+        controller.completePendingExport()
+        await controller.configure(
+            ownerID: UUID(),
+            generation: 1,
+            formatDescription: try makeH264FormatDescription()
+        )
+
+        await controller.start()
+        XCTAssertEqual(controller.state, .waitingForKeyFrame)
+        await controller.stop()
+        XCTAssertEqual(controller.state, .idle)
+        await controller.start()
+        XCTAssertEqual(controller.state, .waitingForKeyFrame)
+    }
+
+    func testCancelDiscardsPendingRecordingWithoutCountingAnExport() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "HomeBase-Camera-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let fileURL = directory.appendingPathComponent("Recording.mov")
+        try Data().write(to: fileURL)
+        let controller = CameraLocalRecordingController(
+            destination: CameraRecordingDestinationStub(),
+            pendingRecording: CameraLocalRecording(
+                fileURL: fileURL,
+                creationDate: Date()
+            )
+        )
+
+        controller.discardPendingRecording()
+
+        XCTAssertNil(controller.pendingRecording)
+        XCTAssertEqual(controller.successfulExportCount, 0)
+        XCTAssertEqual(controller.state, .idle)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
     }
 
     func testRecordingIgnoresEndFromSupersededPlayer() async throws {
@@ -404,6 +552,33 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertTrue(controller.isStreamAvailable)
 
         await controller.streamDidEnd(ownerID: currentOwnerID)
+        XCTAssertFalse(controller.isStreamAvailable)
+    }
+
+    func testRecordingConfigurationCannotReappearAfterItsRunEnds() async throws {
+        let barrier = CameraRecordingConfigurationBarrier()
+        let controller = CameraLocalRecordingController(
+            destination: CameraRecordingDestinationStub(),
+            configurationInstallationBarrier: {
+                await barrier.suspend()
+            }
+        )
+        let ownerID = UUID()
+        let formatDescription = try makeH264FormatDescription()
+        let configuration = Task { @MainActor in
+            await controller.configure(
+                ownerID: ownerID,
+                generation: 1,
+                formatDescription: formatDescription
+            )
+        }
+
+        await barrier.waitUntilEntered()
+        await controller.streamDidEnd(ownerID: ownerID)
+        barrier.release()
+
+        let configurationInstalled = await configuration.value
+        XCTAssertFalse(configurationInstalled)
         XCTAssertFalse(controller.isStreamAvailable)
     }
 
@@ -453,6 +628,33 @@ final class CameraLiveVideoTests: XCTestCase {
         ))
         // Full-screen players opt in independently of their covered previews.
         XCTAssertFalse(CameraLiveVideoLifecycle.isSuspended(in: .active))
+    }
+
+    func testImmediateStopStrengthensSupersededAndReleasingRuns() {
+        var ownership = CameraLiveVideoRunOwnership()
+        let acquiring = ownership.begin()
+
+        // An ordinary transition can clear the logical current run while its
+        // subscription acquisition still owns cleanup work.
+        ownership.stop(immediately: false)
+        XCTAssertFalse(ownership.shouldReleaseImmediately(acquiring))
+        ownership.stop(immediately: true)
+        XCTAssertTrue(ownership.shouldReleaseImmediately(acquiring))
+        let acquiredCompletion = ownership.finish(acquiring)
+        XCTAssertFalse(acquiredCompletion.wasCurrent)
+        XCTAssertTrue(acquiredCompletion.immediateStopRequested)
+
+        // If the immediate request lands after cleanup sampled its release
+        // policy, completion still reports that the ordinary release must be
+        // upgraded once it returns from the arbiter.
+        let releasing = ownership.begin()
+        let sampledImmediatePolicy = ownership.shouldReleaseImmediately(
+            releasing
+        )
+        XCTAssertFalse(sampledImmediatePolicy)
+        ownership.stop(immediately: true)
+        let releasingCompletion = ownership.finish(releasing)
+        XCTAssertTrue(releasingCompletion.immediateStopRequested)
     }
 
     func testVideoIsDisplayedOnlyWhileActivelyPlaying() {
@@ -810,5 +1012,34 @@ private final class CameraRecordingDestinationStub:
 
     func saveVideo(at fileURL: URL, creationDate: Date) async throws {
         savedURLs.append(fileURL)
+    }
+}
+
+@MainActor
+private final class CameraRecordingConfigurationBarrier {
+    private var entered = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { continuation in
+            entryWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }
