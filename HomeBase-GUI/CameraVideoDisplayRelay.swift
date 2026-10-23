@@ -1,10 +1,12 @@
 import AVFoundation
+import QuartzCore
 
 /// Additional displays consume the main player's samples without owning its
 /// stream, clock, decoder state, or authorization.
 @MainActor
 protocol CameraVideoDisplayOutput: AnyObject {
     var needsRecovery: Bool { get }
+    func setVeiled(_ veiled: Bool)
     func enqueue(_ sample: CMSampleBuffer)
     func flush(removingDisplayedImage: Bool)
 }
@@ -12,6 +14,8 @@ protocol CameraVideoDisplayOutput: AnyObject {
 @MainActor
 final class CameraVideoDisplayReplica: CameraVideoDisplayOutput {
     let layer = AVSampleBufferDisplayLayer()
+    private var isVeiled = false
+    private var pendingImageRemovals = 0
 
     // The surface explicitly detaches/flushes before releasing this object.
     nonisolated deinit {}
@@ -30,9 +34,37 @@ final class CameraVideoDisplayReplica: CameraVideoDisplayOutput {
         layer.sampleBufferRenderer.enqueue(sample)
     }
 
+    func setVeiled(_ veiled: Bool) {
+        guard isVeiled != veiled else { return }
+        isVeiled = veiled
+        updateVisibility()
+    }
+
+    private func updateVisibility() {
+        let hidden = isVeiled || pendingImageRemovals > 0
+        guard layer.isHidden != hidden else { return }
+        // Cover synchronously at the native surface, before SwiftUI commits its
+        // overlay. Never animate the old picture through the black background.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.isHidden = hidden
+        CATransaction.commit()
+    }
+
     func flush(removingDisplayedImage: Bool) {
+        if removingDisplayedImage {
+            pendingImageRemovals += 1
+            updateVisibility()
+        }
         layer.sampleBufferRenderer.flush(removingDisplayedImage: removingDisplayedImage,
-            completionHandler: nil)
+            completionHandler: { [weak self] in
+                guard removingDisplayedImage else { return }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.pendingImageRemovals -= 1
+                    self.updateVisibility()
+                }
+            })
     }
 }
 
@@ -49,6 +81,7 @@ final class CameraVideoDisplayRelay {
     private var waitingForKeyframe = true
     private let maximumBytes: Int
     private let maximumSamples: Int
+    private var isVeiled = false
 
     // No actor-bound teardown: destinations are weak and samples are values.
     nonisolated deinit {}
@@ -64,6 +97,7 @@ final class CameraVideoDisplayRelay {
         prune()
         let id = ObjectIdentifier(output)
         guard destinations[id] == nil else { return }
+        output.setVeiled(isVeiled)
         let displayedIndex = samples.lastIndex { sample in
             let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
                 as? [[String: Any]]
@@ -88,6 +122,15 @@ final class CameraVideoDisplayRelay {
     func detach(_ output: any CameraVideoDisplayOutput) {
         destinations.removeValue(forKey: ObjectIdentifier(output))
         output.flush(removingDisplayedImage: true)
+    }
+
+    func setVeiled(_ veiled: Bool) {
+        guard isVeiled != veiled else { return }
+        isVeiled = veiled
+        prune()
+        for destination in destinations.values {
+            destination.output?.setVeiled(veiled)
+        }
     }
 
     func enqueue(_ sample: CMSampleBuffer, keyFrame: Bool) {

@@ -788,10 +788,15 @@ private struct CameraGroupPane: View {
                     }
                 }
             if playback.isVeiled {
-                CameraVeilCover()
+                CameraVeilCover(showsLabel: !session.historyAvailable)
             }
             if group.resolvingTime {
                 status("Loading history…", loading: true)
+            } else if playback.isVeiled, session.historyAvailable {
+                CameraHistoryStatus(playback: playback, timeZone: timeZone, showsControls: !isExternalDisplay) { previous in
+                    if group.active { group.jump(from: session, previous: previous) }
+                    else { playback.seekToAdjacentRecording(previous: previous) }
+                }
             } else if !isLive {
                 if let error = playback.errorMessage {
                     VStack(spacing: 12) {
@@ -886,6 +891,17 @@ struct CameraHistoryStatus: View {
     let jump: (Bool) -> Void
 
     @ViewBuilder var body: some View {
+        if playback.isVeiled {
+            VStack(spacing: 16) {
+                Label("Hidden", systemImage: "eye.slash").font(.headline)
+                if showsControls { navigation }
+            }.foregroundStyle(.white).padding()
+        } else {
+            historyStatus
+        }
+    }
+
+    @ViewBuilder private var historyStatus: some View {
         switch playback.historyState {
         case .idle, .ready: EmptyView()
         case .loading:
@@ -916,11 +932,17 @@ struct CameraHistoryStatus: View {
         switch playback.historyNavigation {
         case .idle, .loading:
             HStack(spacing: 10) { ProgressView().tint(.white); Text("Finding available video…").font(.callout) }
-        case .ready(let neighbors): CameraHistoryNavigationControls(neighbors: neighbors, jump: jump)
+        case .ready(let neighbors):
+            CameraHistoryNavigationControls(neighbors: neighbors, excludesHidden: !playback.showsHiddenVideo, jump: jump)
+        case .partial(let neighbors, _):
+            CameraHistoryNavigationControls(neighbors: neighbors, searchIsComplete: false,
+                excludesHidden: !playback.showsHiddenVideo, jump: jump)
         case .failed:
             Button("Find available video", systemImage: "arrow.clockwise") { playback.retryHistory() }.buttonStyle(.bordered)
         case .unsupported:
             Text("Update HBNVR and Homebase to find adjacent recordings.").font(.callout).multilineTextAlignment(.center)
+        case .hiddenUnsupported:
+            Text("Update HBNVR and Homebase to find unveiled recordings.").font(.callout).multilineTextAlignment(.center)
         }
     }
 }

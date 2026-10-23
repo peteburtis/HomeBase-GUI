@@ -1117,6 +1117,11 @@ resources suspended.
 `CameraHistoryTests` adds cache/refill, paused seeks, stale responses, stable time
 anchoring, protocol bounds, H.264/HEVC decoding, metadata ordering, WebSocket reuse,
 timeouts and cancellation tests with injected transports.
+Playback-position snapshots used by SwiftUI (including history export button
+availability) never advance the clock, decode, or publish. Ticks and explicit
+actions own those changes. Regression tests cover snapshot reads while loading,
+in ready/gap history, and in the live buffer, plus Veil notifications only when
+the hidden flag changes rather than on every frame or empty history tick.
 `CameraTimelineTests` covers scroll/time mapping, future clamping, NVR anchoring,
 bounded visible-only preview loading, cancellation, compatibility, strict JPEG
 message framing, native centered layout, and an opt-in simultaneous real thumbnail
@@ -1201,10 +1206,12 @@ range layouts, and deferred Photos access.
 
 ## Veil
 
-A frame with `homebase.hidden` is covered by black, `eye.slash`, and **Private
-Video**. Presence counts regardless of the string value. Legacy footage without
+A frame with `homebase.hidden` is covered by black, `eye.slash`, and **Hidden**.
+Presence counts regardless of the string value. Legacy footage without
 a known hidden tag remains visible. The eye button beside the S3 padlock reveals
 hidden footage for the current viewer, its camera panes, and timeline previews.
+The eye button appears only while a visible pane's current frame is tagged Hidden,
+whether that footage is covered or revealed. Focusing a public pane hides it.
 It changes to `eye`; tapping again covers hidden footage. Reveal resets on
 dismissal, backgrounding, or loss of camera authorization. Seeking and Live/history
 switching retain it. Grid/detail previews never inherit reveal. Polling grid thumbnails retain a hidden marker instead of decoding or caching a visible private image.
@@ -1218,7 +1225,12 @@ permission. Available Touch ID can be used directly. Existing camera/S3 access
 authentication is unchanged.
 
 Hidden samples still feed decoder references but use `DoNotDisplay`, allowing
-normal hidden/public boundaries without waiting for another keyframe. Explicit
+normal hidden/public boundaries without waiting for another keyframe. The native
+video layers are also hidden synchronously before publishing the veil state,
+including external displays and their cached bootstrap frames. Their black
+background remains visible while SwiftUI draws the cover. Removing a displayed
+image keeps its layer hidden until the asynchronous flush completes, so a
+previously revealed picture cannot flash through a later transition. Explicit
 re-covering clears the old revealed image; Live may briefly wait for a keyframe
 after that action. Photos recording is disabled while covered and stops if
 covered footage arrives. The current recording finalizes through the normal export choices.
@@ -1240,6 +1252,40 @@ creation tags, including removals. Local thumbnails use their selected keyframe'
 tags; S3 thumbnails consult the manifest, using the caption only for legacy
 missing metadata. Cached metadata remains a snapshot; tag-change subscriptions
 are deferred.
+
+Veiled footage offers the same previous/next navigation as missing video. While
+hidden footage is covered, both states request `neighbors` with
+`excludeHidden: true`, after negotiating `supportsHiddenNeighbors`. The server
+finds unveiled stretches within recordings and treats adjacent hidden footage
+and recording gaps as one unavailable region. A cached result stays valid as the
+cursor crosses that region. Revealing footage invalidates that search; ordinary
+recording navigation applies while reveal is active. A delayed filtered reply
+cannot restore old destinations after reveal, seek, or dismissal.
+
+Live and buffered veiled frames use a metadata-only neighbor probe without
+switching into history. Tapping a destination seeks the viewer (and any shared
+camera clock) into history with its pause and speed settings preserved. Secondary
+displays show the veil without interactive navigation. Unsupported servers show
+an update message; failed or incomplete searches never imply an empty archive.
+
+Hidden-aware navigation also searches direct S3 manifests, decrypting authoritative
+tag metadata when necessary. Recorder tick boundaries provide approximate visible
+stretches within each file, including historical edits and explicit removal. The
+search reads metadata and inventories without downloading video. Once a selected
+file loads, actual frame numbers and timestamps still determine the veil exactly;
+an early seek can briefly play covered frames before the visible stretch begins.
+Already loaded samples can refine that destination without starting paused
+playback. Searches exclude the whole current hidden frame so small timing
+differences do not repeatedly advertise it. No sub-second error bound is assumed
+for irregular footage.
+
+Both sources are compared even when local history has destinations on both sides.
+Cloud destinations are restricted to local recording gaps so a cloud public copy
+cannot bypass hidden local footage that playback would prefer. Failed or incomplete
+source searches retain known destinations with a warning and never establish an
+empty archive. Relative searches still require a server-resolved clock. Navigation
+scans have request, metadata-count, cancellation, and deadline bounds; exceeding
+them remains a search failure. Ordinary navigation while revealed is unchanged.
 
 Deploy the GUI with its HomeBase relay changes and HBNVR 0.23.0. Normal NVR frames
 have exact snapshots; direct RTSP fallback uses the last observed camera tags,

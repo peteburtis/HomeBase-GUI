@@ -7,6 +7,54 @@ import XCTest
 
 @MainActor
 final class CameraViewerPresentationTests: XCTestCase {
+    func testMountedViewerCanEnterHistoryWithoutToolbarPublishingBackIntoPlayback() async throws {
+        let (client, camera) = try fixture()
+        let viewer = CameraViewerPresentation()
+        let access = try XCTUnwrap(CameraPiPTestFixture.makeAccessSession(
+            environment: [CameraPiPTestFixture.environmentVariable: "1"]))
+        let lifecycle = CameraAccessLifecycle(session: access)
+        viewer.open(device: camera.device, quality: .high, client: client)
+        let host = UIHostingController(rootView: AnyView(RetainedViewerTestTabs()
+            .modifier(CameraViewerHost(presentation: viewer))
+            .cameraAccessLifecycle(lifecycle)
+            .environment(\.scenePhase, .active)))
+        let window = try makeWindow(host)
+        defer { window.isHidden = true; window.rootViewController = nil; lifecycle.reset() }
+        try await Task.sleep(for: .milliseconds(350))
+        func externalController(in controller: UIViewController) -> CameraExternalDisplayViewController? {
+            if let result = controller as? CameraExternalDisplayViewController { return result }
+            return controller.children.compactMap { externalController(in: $0) }.first
+        }
+        let output = try XCTUnwrap(externalController(in: host)).presentation
+        let group = try XCTUnwrap(output.group)
+        let playback = try XCTUnwrap(group.sessions.first).playback
+        defer { viewer.close(); output.clear(); group.deactivate() }
+        XCTAssertFalse(group.active, "Exercise the single-camera toolbar's playback snapshot")
+        playback.setNVRHistoryAvailable(true)
+        playback.seek(to: Date(timeIntervalSince1970: 940), paused: true)
+        var publications = 0
+        let observation = playback.objectWillChange.sink {
+            publications += 1
+            // Bound the original redraw loop so a regression fails this test
+            // instead of starving XCTest's main run loop indefinitely.
+            if publications == 20 { playback.suspend() }
+        }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(publications, 0, "Drawing the history toolbar must not publish playback changes")
+        observation.cancel()
+        XCTAssertTrue(playback.isPaused)
+        XCTAssertTrue(playback.isUsingHistory)
+        playback.goLive()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(playback.isLive)
+        viewer.close()
+        host.rootView = AnyView(Color.clear)
+        group.deactivate()
+        try await Task.sleep(for: .milliseconds(100))
+        withExtendedLifetime(group) {}
+    }
+
     func testOnlyTheCurrentViewerWithActiveExternalVideoCanMinimize() async throws {
         let viewer = CameraViewerPresentation()
         let id = UUID()

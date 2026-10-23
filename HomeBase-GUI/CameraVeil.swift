@@ -85,16 +85,20 @@ extension EnvironmentValues {
 }
 
 struct CameraVeilCover: View {
+    var showsLabel = true
     var body: some View {
         ZStack {
             Color.black
-            VStack(spacing: 12) {
-                Image(systemName: "eye.slash").font(.largeTitle)
-                Text("Private Video").font(.headline)
-            }.foregroundStyle(.white)
+            if showsLabel {
+                VStack(spacing: 12) {
+                    Image(systemName: "eye.slash").font(.largeTitle)
+                    Text("Hidden").font(.headline)
+                }.foregroundStyle(.white)
+            }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Private Video")
+        .accessibilityLabel("Hidden")
+        .accessibilityHidden(!showsLabel)
         .allowsHitTesting(false)
     }
 }
@@ -112,8 +116,8 @@ struct CameraVeilButton: View {
         }
         .buttonStyle(.plain)
         .cameraGlassBacker(in: Circle(), interactive: true)
-        .accessibilityLabel(veil.showsHidden ? "Hide private video" : "Show hidden footage")
+        .accessibilityLabel(veil.showsHidden ? "Hide hidden video" : "Show hidden video")
         .accessibilityHint(veil.authenticationFailed ? "Authentication did not succeed. Tap to try again." : "Applies to this viewer until it closes or enters the background.")
-        .help(veil.showsHidden ? "Hide private video" : "Show hidden footage")
+        .help(veil.showsHidden ? "Hide hidden video" : "Show hidden video")
     }
 }

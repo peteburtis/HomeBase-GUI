@@ -72,6 +72,21 @@ nonisolated struct CameraHistoryBuffer {
         }
         return candidates.first
     }
+
+    /// Refine a slightly early manifest destination using media already in RAM.
+    /// Stop at unknown coverage; navigation never downloads frames to refine it.
+    func visiblePosition(near start: Double, before end: Double) -> Double? {
+        var position = start
+        for _ in 0..<32 {
+            guard position < end, let location = location(at: position) else { return nil }
+            let sample = location.piece.samples[location.index]
+            if !sample.isHidden { return position }
+            let next = sample.end(in: location.piece.segment)
+            guard next > position else { return nil }
+            position = next
+        }
+        return nil
+    }
 }
 
 nonisolated enum CameraHistoryPolicy {

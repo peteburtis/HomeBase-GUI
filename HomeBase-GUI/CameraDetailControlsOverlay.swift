@@ -76,7 +76,11 @@ struct CameraDetailControlSet {
         switch role {
         case .shutter:
             if metadata["cameraShutter"]?.boolValue == true { return 100 }
-            return semanticNames.contains("shutter.closed") ? 50 : 0
+            // Existing engines expose this hardware control as privacy mode.
+            // The presentation rename must keep discovering their controls.
+            if metadata["cameraPrivacy"]?.boolValue == true { return 90 }
+            return semanticNames.contains("shutter.closed")
+                || semanticNames.contains("privacy.enabled") ? 50 : 0
         case .pan:
             if canonicalComponent == "pantilt[0]" { return 100 }
             return semanticNames.contains("ptz.pan.position") ? 50 : 0

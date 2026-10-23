@@ -115,7 +115,8 @@ nonisolated struct CameraHistoryNeighbors: Codable, Equatable, Sendable {
 }
 
 nonisolated enum CameraHistoryNavigationState: Equatable {
-    case idle, loading, ready(CameraHistoryNeighbors), failed(String), unsupported
+    case idle, loading, ready(CameraHistoryNeighbors), partial(CameraHistoryNeighbors, String)
+    case failed(String), unsupported, hiddenUnsupported
 }
 
 nonisolated enum CameraHistoryError: LocalizedError, Equatable {
@@ -123,6 +124,7 @@ nonisolated enum CameraHistoryError: LocalizedError, Equatable {
     case tooLarge
     case unavailable
     case neighborsUnsupported
+    case hiddenNeighborsUnsupported
     case remote(Int?, String)
     var errorDescription: String? {
         switch self {
@@ -130,6 +132,7 @@ nonisolated enum CameraHistoryError: LocalizedError, Equatable {
         case .tooLarge: "This history request exceeds the playback memory limit."
         case .unavailable: "NVR history is currently unavailable."
         case .neighborsUnsupported: "Update HBNVR and Homebase to find adjacent recordings."
+        case .hiddenNeighborsUnsupported: "Update HBNVR and Homebase to find unveiled recordings."
         case .remote(_, let message): message
         }
     }

@@ -81,10 +81,12 @@ final class CameraS3HistoryTests: XCTestCase {
         XCTAssertTrue(localCalls.isEmpty); XCTAssertTrue(cloudCalls.isEmpty)
     }
 
-    func fixture(start: Double, tags: CameraStoredVideoTags? = nil) throws -> (CameraS3ManifestShard, [String: Data]) {
-        let bytes = Data("test MP4 substitute".utf8), id = UUID().uuidString
+    func fixture(start: Double, tags: CameraStoredVideoTags? = nil, encrypted: Bool = false) throws -> (CameraS3ManifestShard, [String: Data]) {
+        let plaintext = Data("test MP4 substitute".utf8)
+        let bytes = try encrypted ? CameraS3ThumbnailTests().encrypted(plaintext) : plaintext
+        let id = UUID().uuidString
         let entry = CameraS3ManifestShard(id: id, key: store.prefix + "camera/" + id + ".mp4", size: Int64(bytes.count),
-            sha256: SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined(), encryption: nil,
+            sha256: SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined(), encryption: encrypted ? "hbnvr-pbe-v1" : nil,
             timing: .init(format: "com.graygoolabs.hbnvr.timing", schemaVersion: 1, storeID: store.id,
                 cameraID: camera, shardID: id, time: .init(canonicalUTC: start, receivedUTC: start, cameraUTC: nil,
                     canonicalSource: "received", epochID: UUID().uuidString), firstFrameReceivedUTC: start,
@@ -116,6 +118,160 @@ final class CameraS3HistoryTests: XCTestCase {
             XCTAssertFalse(paths.contains { $0.contains("list") })
             await reader.close()
         }
+    }
+
+    private func navigationFiles(_ fixtures: [(CameraS3ManifestShard, [String: Data])]) throws -> [String: Data] {
+        var files = fixtures.reduce(into: [String: Data]()) { $0.merge($1.1) { _, new in new } }
+        let entries = fixtures.map(\.0), encoder = JSONEncoder()
+        let root = CameraS3ManifestLayout.root(prefix: store.prefix, cameraID: camera)
+        let days = Dictionary(grouping: entries) { CameraS3ManifestLayout.day($0.range.start) }
+        let catalog = CameraS3Catalog(format: "hbnvr-s3-playback", schemaVersion: 1, storeID: store.id, cameraID: camera,
+            generatedAt: now, days: days.map { day, shards in
+                .init(day: day, start: shards.map(\.range.start).min()!, end: shards.map(\.range.end).max()!)
+            })
+        files[root + "catalog.json"] = try encoder.encode(catalog)
+        for (day, shards) in days {
+            files[root + "days/" + day + ".json"] = try encoder.encode(CameraS3Manifest(format: "hbnvr-s3-playback",
+                schemaVersion: 1, storeID: store.id, cameraID: camera, generatedAt: now, period: day, shards: shards))
+        }
+        for (month, shards) in Dictionary(grouping: entries, by: { String(CameraS3ManifestLayout.day($0.range.start).prefix(7)) }) {
+            files[root + "months/" + month + ".json"] = try encoder.encode(CameraS3Manifest(format: "hbnvr-s3-playback",
+                schemaVersion: 1, storeID: store.id, cameraID: camera, generatedAt: now, period: month, shards: shards))
+        }
+        return files
+    }
+
+    func testHiddenNeighborsMergeFilesAndMissingIntervalsWithoutReadingVideo() async throws {
+        let base = now - 300
+        let first = try fixture(start: base, tags: .init(timeline: .init(version: 1, changes: [
+            .init(ticks: 0, frame: 0, tags: [:]), .init(ticks: 10_000, frame: 1, tags: ["homebase.hidden": "false"])
+        ]), encrypted: nil))
+        let middle = try fixture(start: base + 60, tags: .init(timeline: .init(version: 1,
+            changes: [.init(ticks: 0, frame: 0, tags: ["homebase.hidden": ""])]), encrypted: nil))
+        let last = try fixture(start: base + 180, tags: .init(timeline: .init(version: 1, changes: [
+            .init(ticks: 0, frame: 0, tags: ["homebase.hidden": "true"]), .init(ticks: 20_000, frame: 1, tags: [:])
+        ]), encrypted: nil))
+        let objects = S3ObjectStub(files: try navigationFiles([first, middle, last])), frozenNow = now
+        let reader = CameraS3HistoryReader(store: store, cameraID: camera, password: nil, objects: objects, now: { frozenNow })
+        defer { Task { await reader.close() } }
+        for offset in [40.0, 80, 150, 185] {
+            let result = try await reader.neighbors(request(.init(start: base + offset, end: base + offset + 0.001), operation: "neighbors"), excludingHidden: true)
+            XCTAssertEqual(result.neighbors, .init(previous: .init(start: base, end: base + 10), next: .init(start: base + 200, end: base + 240)))
+        }
+        let paths = await objects.requests
+        XCTAssertTrue(paths.allSatisfy { $0.hasSuffix(".json") }, "Neighbor searches never download candidate videos")
+    }
+
+    func testHiddenNeighborsDecryptAuthoritativeEditsAndDetectTransitionsWithinAFile() async throws {
+        let tags = CameraVideoTagTimeline(version: 2, changes: [.init(ticks: 0, frame: 0, tags: ["homebase.hidden": "true"])],
+            overrides: [.init(start: 10_000, end: 20_000, key: "homebase.hidden", value: nil),
+                        .init(start: 40_000, end: 50_000, key: "homebase.hidden", value: nil)])
+        for encrypted in [false, true] {
+            let stored = try encrypted
+                ? CameraStoredVideoTags(timeline: nil, encrypted: CameraS3ThumbnailTests().encrypted(JSONEncoder().encode(tags)))
+                : CameraStoredVideoTags(timeline: tags, encrypted: nil)
+            let (entry, original) = try fixture(start: now - 60, tags: stored, encrypted: encrypted), frozenNow = now
+            var files = original
+            if encrypted {
+                for (key, value) in original where key.hasSuffix(".json") {
+                    files[key] = try CameraS3ThumbnailTests().encrypted(value)
+                }
+            }
+            let objects = S3ObjectStub(files: files)
+            let reader = CameraS3HistoryReader(store: store, cameraID: camera, password: "test password", objects: objects, now: { frozenNow })
+            let result = try await reader.neighbors(request(.init(start: entry.range.start + 30, end: entry.range.start + 30.001), operation: "neighbors"), excludingHidden: true)
+            XCTAssertEqual(result.neighbors, .init(previous: .init(start: entry.range.start + 10, end: entry.range.start + 20),
+                next: .init(start: entry.range.start + 40, end: entry.range.start + 50)))
+            let paths = await objects.requests
+            XCTAssertTrue(paths.allSatisfy { $0.hasSuffix(".json") })
+            await reader.close()
+        }
+    }
+
+    func testApproximateDestinationKeepsActualLeadingHiddenFramesCovered() async throws {
+        let timeline = CameraVideoTagTimeline(version: 1, changes: [
+            .init(ticks: 0, frame: 0, tags: ["homebase.hidden": "true"]), .init(ticks: 30_001, frame: 1, tags: [:])
+        ])
+        let (entry, files) = try fixture(start: now - 60, tags: .init(timeline: timeline, encrypted: nil)), frozenNow = now
+        var decoded = piece(entry.range)
+        decoded.samples = [
+            .init(frame: .init(segment: 0, presentationTicks: 30_000, decodeTicks: nil, durationTicks: 80,
+                keyFrame: true, preroll: true, byteCount: 5), data: Data([0, 0, 0, 1, 5]), sourceFrame: 0),
+            .init(frame: .init(segment: 0, presentationTicks: 30_080, decodeTicks: nil, durationTicks: 80,
+                keyFrame: false, preroll: false, byteCount: 5), data: Data([0, 0, 0, 1, 5]), sourceFrame: 1),
+        ]
+        let samples = decoded, objects = S3ObjectStub(files: files)
+        let reader = CameraS3HistoryReader(store: store, cameraID: camera, password: nil, objects: objects,
+            now: { frozenNow }, decode: { _, _, _ in [samples] })
+        let query = request(.init(start: entry.range.start + 20, end: entry.range.start + 20.001), operation: "neighbors")
+        let neighbors = try await reader.neighbors(query, excludingHidden: true)
+        let target = try XCTUnwrap(neighbors.neighbors?.next?.start)
+        XCTAssertEqual(target, entry.range.start + 30.001, accuracy: 0.000_001)
+        let batch = try await reader.fetch(request(.init(start: target, end: target + 1)))
+        XCTAssertEqual(batch.pieces.first?.samples.map(\.isHidden), [true, false], "Only exact sample tags control the veil after seeking")
+        let history = CameraHistoryPlayback(clock: { 0 })
+        history.configure(cameraID: camera, transport: reader)
+        history.enter(canonicalTime: entry.range.start + 20, localHead: 0, paused: true)
+        for _ in 0..<200 {
+            if !history.fetching { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(try XCTUnwrap(history.adjacentRecording(previous: false)).timeIntervalSince1970,
+            entry.range.start + 30.080, accuracy: 0.000_001, "Already loaded samples refine an early destination without resuming paused playback")
+        XCTAssertTrue(history.isPaused)
+        history.enter(canonicalTime: target, localHead: 0, paused: true)
+        for _ in 0..<200 {
+            if !history.fetching { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        guard case .ready(let refinedNeighbors) = history.navigation else { return XCTFail("Navigation did not resolve the loaded hidden frame") }
+        XCTAssertNil(refinedNeighbors.previous)
+        XCTAssertEqual(try XCTUnwrap(refinedNeighbors.next).start, entry.range.start + 30.080, accuracy: 0.000_001)
+        XCTAssertEqual(refinedNeighbors.next?.end, entry.range.end)
+        history.close()
+        await reader.close()
+    }
+
+    func testHiddenNeighborsHonorOverlappingShardPlaybackPrecedence() async throws {
+        let first = try fixture(start: now - 100, tags: .init(timeline: .init(version: 1,
+            changes: [.init(ticks: 0, frame: 0, tags: ["homebase.hidden": "true"])]), encrypted: nil))
+        let second = try fixture(start: now - 90)
+        let objects = S3ObjectStub(files: try navigationFiles([first, second])), frozenNow = now
+        let reader = CameraS3HistoryReader(store: store, cameraID: camera, password: nil, objects: objects, now: { frozenNow })
+        let result = try await reader.neighbors(request(.init(start: now - 80, end: now - 79.999), operation: "neighbors"), excludingHidden: true)
+        XCTAssertNil(result.neighbors?.previous)
+        XCTAssertEqual(result.neighbors?.next, .init(start: now - 40, end: now - 30))
+        await reader.close()
+    }
+
+    func testHiddenNeighborMetadataFailureIsNotAnEmptyArchive() async throws {
+        let tags = CameraVideoTagTimeline(version: 1, changes: [.init(ticks: 0, frame: 0, tags: [:])])
+        let encrypted = try CameraS3ThumbnailTests().encrypted(JSONEncoder().encode(tags))
+        let (entry, files) = try fixture(start: now - 60, tags: .init(timeline: nil, encrypted: encrypted)), frozenNow = now
+        let reader = CameraS3HistoryReader(store: store, cameraID: camera, password: "wrong password",
+            objects: S3ObjectStub(files: files), now: { frozenNow })
+        do {
+            _ = try await reader.neighbors(request(.init(start: entry.range.start + 20, end: entry.range.start + 21), operation: "neighbors"), excludingHidden: true)
+            XCTFail("Unreadable tag metadata cannot establish an empty or public archive")
+        } catch { XCTAssertEqual(error as? CameraS3Decryption.Failure, .authenticationFailed) }
+        await reader.close()
+    }
+
+    func testHiddenNeighborSearchDoesNotDecryptDistantFilesAfterFindingCloserDestinations() async throws {
+        let base = now - 1000
+        let before = try fixture(start: base - 60), after = try fixture(start: base + 60)
+        let tags = CameraVideoTagTimeline(version: 1, changes: [.init(ticks: 0, frame: 0, tags: [:])])
+        let encrypted = try CameraS3ThumbnailTests().encrypted(JSONEncoder().encode(tags))
+        let distant = try fixture(start: base + 600, tags: .init(timeline: nil, encrypted: encrypted), encrypted: true)
+        let objects = S3ObjectStub(files: try navigationFiles([before, after, distant])), frozenNow = now
+        // The distant file needs a password. A nearest-neighbor search must
+        // finish from the closer files without opening that tag envelope.
+        let reader = CameraS3HistoryReader(store: store, cameraID: camera, password: nil, objects: objects, now: { frozenNow })
+        let result = try await reader.neighbors(request(.init(start: base + 20, end: base + 20.001), operation: "neighbors"), excludingHidden: true)
+        XCTAssertEqual(result.neighbors, .init(previous: before.0.range, next: after.0.range))
+        let paths = await objects.requests
+        XCTAssertTrue(paths.allSatisfy { $0.hasSuffix(".json") })
+        await reader.close()
     }
     func testPlainAndEncryptedManifestTagsOverrideDecodedOriginalMetadata() async throws {
         for encrypted in [false, true] {
