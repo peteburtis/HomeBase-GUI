@@ -255,7 +255,10 @@ private struct UnconfiguredServerTabView: View {
             NavigationStack {
                 unavailableView
                     .navigationTitle("Home")
-                    .toolbar { serverToolbar }
+                    .toolbar {
+                        serverToolbar
+                        ToolbarItem(placement: .primaryAction) { HomeSettingsButton() }
+                    }
             }
             .tabItem {
                 Label("Home", systemImage: "house")

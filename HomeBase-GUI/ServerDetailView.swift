@@ -60,6 +60,12 @@ struct ServerDetailView: View {
                                     showServers()
                                 }
                             }
+                            ToolbarItem(placement: .primaryAction) {
+                                HomeSettingsButton(
+                                    destinations: S3CredentialSettingsModel.destinations(in: connection.topology.devices),
+                                    serverName: server.endpoint.host
+                                )
+                            }
                         }
                 }
             } detail: {

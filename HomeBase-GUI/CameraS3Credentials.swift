@@ -25,8 +25,10 @@ nonisolated enum CameraS3CredentialPresence: Equatable, Sendable {
 /// authentication rather than presenting a second prompt.
 nonisolated final class CameraAuthenticationAttempt: @unchecked Sendable {
     let context = LAContext()
+    let reason: String
 
-    init() {
+    init(reason: String = "Unlock cameras and saved recording access.") {
+        self.reason = reason
         context.interactionNotAllowed = false
         context.localizedFallbackTitle = ""
         context.touchIDAuthenticationAllowableReuseDuration = 0
@@ -40,6 +42,15 @@ protocol CameraS3CredentialStoring {
     func inspect() async throws -> CameraS3CredentialPresence
     func load(using attempt: CameraAuthenticationAttempt) async throws -> CameraS3Credentials
     func save(_ credentials: CameraS3Credentials, using attempt: CameraAuthenticationAttempt) async throws
+    func add(_ credentials: CameraS3Credentials, using attempt: CameraAuthenticationAttempt) async throws
+    func delete() async throws
+}
+
+extension CameraS3CredentialStoring {
+    func add(_ credentials: CameraS3Credentials, using attempt: CameraAuthenticationAttempt) async throws {
+        throw CameraAccessError.credentialManagementUnavailable
+    }
+    func delete() async throws { throw CameraAccessError.credentialManagementUnavailable }
 }
 
 /// Exactly one client-wide credential item, on this device only. No AWS SDK
@@ -113,9 +124,27 @@ final class CameraKeychainCredentialStore: CameraS3CredentialStoring {
     }
 
     func save(_ credentials: CameraS3Credentials, using attempt: CameraAuthenticationAttempt) async throws {
+        try await save(credentials, using: attempt, replacingExisting: true)
+    }
+
+    func add(_ credentials: CameraS3Credentials, using attempt: CameraAuthenticationAttempt) async throws {
+        try await save(credentials, using: attempt, replacingExisting: false)
+    }
+
+    func delete() async throws {
+        try await Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            let status = SecItemDelete(self.baseQuery as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else { throw CameraAccessError.keychain(status) }
+        }.value
+    }
+
+    private func save(_ credentials: CameraS3Credentials, using attempt: CameraAuthenticationAttempt,
+                      replacingExisting: Bool) async throws {
         guard !credentials.destinationID.isEmpty, !credentials.accessKeyID.isEmpty,
               !credentials.secretAccessKey.isEmpty else { throw CameraAccessError.invalidCredentials }
         try await Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
             var error: Unmanaged<CFError>?
             guard let control = SecAccessControlCreateWithFlags(
                 nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, .biometryAny, &error
@@ -136,6 +165,7 @@ final class CameraKeychainCredentialStore: CameraS3CredentialStoring {
             addition[kSecAttrSynchronizable as String] = false
             let status = SecItemAdd(addition as CFDictionary, nil)
             if status == errSecDuplicateItem {
+                guard replacingExisting else { throw CameraAccessError.credentialsAlreadySaved }
                 // Updating in place preserves the old credential if the update
                 // fails. Never delete it first to work around a Keychain error.
                 var metadataQuery = query

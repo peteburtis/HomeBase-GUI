@@ -913,6 +913,19 @@ confirmation. Credentials bind to store ID and exact destination, not camera
 names, daemon process IDs, or encryption toggles. Password text is preserved
 verbatim. Neither an app preference nor credential metadata contains the secrets.
 
+Home's top-right **Settings** gear offers a small S3 access page, including when
+no server is selected. It inspects Keychain attributes without loading secrets
+or unlocking cameras. The selected server's advertised stores are deduplicated
+across cameras; each has **Show Policy** and **Add Credentials** actions. Policy
+viewing works with no saved credentials. This page adds only when the device has
+no saved set: delete the current set first to change credentials or stores. Adding
+requires biometrics; deleting requires confirmation and removes only the local
+Keychain item, never AWS keys or recordings. Both actions invalidate credentials
+already held by camera readers without interrupting authorized live streams.
+Credentials are shared across servers on this device, but work only for the
+exact advertised store they were saved for. The existing camera setup remains
+available. Neither settings nor its policy view makes an S3 request.
+
 The form links to a suggested IAM identity policy with selectable JSON, Copy JSON,
 and Share JSON actions. It grants only `s3:GetObject` on the advertised bucket and
 exact prefix (including future predictable manifest objects). It does not grant

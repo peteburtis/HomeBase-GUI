@@ -52,7 +52,7 @@ struct CameraS3IAMPolicyView: View {
     var body: some View {
         Form {
             Section {
-                Text("Create a separate IAM user without console access. Attach this as its only permissions policy, then create an access key for use outside AWS and enter it on the S3 Access screen.")
+                Text("Create a separate IAM user without console access. Attach this as its only permissions policy, then create an access key for use outside AWS and enter it in Settings → Add Credentials or on the S3 Access screen.")
                 Text("Allows object reads only within this store's prefix, including manifests and recordings. No listing, uploads, deletion, or bucket administration.")
                     .foregroundStyle(.secondary)
                 if destination.store.prefix.isEmpty {

@@ -15,6 +15,8 @@ nonisolated enum CameraAccessError: Error, LocalizedError, Equatable, Sendable {
     case cannotProtectCredentials
     case sessionClosed
     case authenticationInProgress
+    case credentialsAlreadySaved
+    case credentialManagementUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -30,6 +32,8 @@ nonisolated enum CameraAccessError: Error, LocalizedError, Equatable, Sendable {
         case .cannotProtectCredentials: "Biometric protection could not be created for these credentials."
         case .sessionClosed: "The camera session was closed. Unlock cameras to continue."
         case .authenticationInProgress: "Authentication is already in progress."
+        case .credentialsAlreadySaved: "S3 credentials are already saved on this device. Delete them before adding another set."
+        case .credentialManagementUnavailable: "S3 credential management is unavailable."
         }
     }
 
@@ -60,7 +64,7 @@ final class CameraSystemBiometricAuthenticator: CameraBiometricAuthenticating {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             attempt.context.evaluatePolicy(
                 .deviceOwnerAuthenticationWithBiometrics,
-                localizedReason: "Unlock cameras and saved recording access."
+                localizedReason: attempt.reason
             ) { success, error in
                 if success { continuation.resume() }
                 else { continuation.resume(throwing: CameraAccessError.authentication(error)) }
@@ -240,6 +244,21 @@ final class CameraAccessSession: ObservableObject {
         credentialPresence = nil
         credentialErrorMessage = nil
         errorMessage = nil
+    }
+
+    /// Settings changes invalidate old cloud access without interrupting live
+    /// camera leases. Existing viewers observe the nil credential and rebuild
+    /// their history/thumbnail sources. Settings never authorizes camera viewing.
+    func credentialsDidChange(presence: CameraS3CredentialPresence) {
+        let interruptedEntry = isAuthenticating && !isUnlocked
+        generation &+= 1
+        task?.cancel(); task = nil
+        attempt?.invalidate(); attempt = nil
+        isAuthenticating = false
+        unlockedCredentials = nil
+        credentialPresence = presence
+        credentialErrorMessage = nil
+        if interruptedEntry { errorMessage = CameraAccessError.sessionClosed.errorDescription }
     }
 
     /// Explicit S3-padlock retry. Camera access is already authorized and must

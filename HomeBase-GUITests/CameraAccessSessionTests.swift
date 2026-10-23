@@ -5,6 +5,37 @@ import LocalAuthentication
 
 @MainActor
 final class CameraAccessSessionTests: XCTestCase {
+    func testSettingsCredentialChangeClearsCloudAccessAndPreservesLiveAuthorization() async throws {
+        let fixture = Fixture(presence: .biometricProtected)
+        fixture.session.enter()
+        await waitUntil { !fixture.session.isAuthenticating }
+        let arbiter = CameraStreamArbiter { _, _ in throw CameraStreamError.ended }
+        let live = try fixture.session.authorizeStreams(arbiter)
+        XCTAssertNotNil(fixture.session.unlockedCredentials)
+        fixture.session.credentialsDidChange(presence: .missing)
+        XCTAssertNil(fixture.session.unlockedCredentials)
+        XCTAssertEqual(fixture.session.credentialPresence, .missing)
+        XCTAssertTrue(fixture.session.isUnlocked)
+        XCTAssertTrue(live.isValid)
+        fixture.session.lock()
+        await arbiter.shutdown()
+    }
+
+    func testSettingsDeletionRejectsPendingCredentialRead() async {
+        let fixture = Fixture(presence: .biometricProtected)
+        fixture.store.suspendsLoad = true
+        fixture.session.enter()
+        await waitUntil { !fixture.store.pendingLoads.isEmpty }
+        fixture.session.credentialsDidChange(presence: .missing)
+        fixture.store.finishLoad()
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertFalse(fixture.session.isUnlocked)
+        XCTAssertFalse(fixture.session.isAuthenticating)
+        XCTAssertNil(fixture.session.unlockedCredentials)
+        XCTAssertEqual(fixture.session.credentialPresence, .missing)
+        XCTAssertEqual(fixture.session.errorMessage, CameraAccessError.sessionClosed.errorDescription)
+    }
+
     func testExternalDisplayRetentionIsLimitedToExistingSelectedViewerStreams() async throws {
         let fixture = Fixture(presence: .biometricProtected)
         let session = fixture.session
