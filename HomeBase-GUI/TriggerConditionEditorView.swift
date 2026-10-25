@@ -88,6 +88,7 @@ struct TriggerConditionEditorView: View {
                 }
             }
         }
+        .connectionStatusClearance()
         .navigationTitle(title)
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -236,6 +237,7 @@ struct TriggerCompareConditionEditorRows: View {
                     resolvedControl = control
                     resolutionMessage = nil
                 }
+                .connectionStatusScopeDisabled()
             }
             .task(id: targetTaskID(comparison)) {
                 await resolve(comparison)

@@ -58,7 +58,7 @@ struct DeviceAdvancedView: View {
         .refreshable {
             monitoring.restart()
         }
-        .connectionStatusOverlay(model.state.connectionStatusPresentation) {
+        .connectionStatusReport(model.state.connectionStatusPresentation(isActive: scenePhase == .active)) {
             monitoring.restart()
         }
         .onChange(of: scenePhase == .active, initial: true) { _, active in
@@ -71,7 +71,7 @@ struct DeviceAdvancedView: View {
     private var emptyMessage: String {
         switch model.state {
         case .idle, .loading:
-            "Control details will appear after loading."
+            "Loading control stacks…"
         case .live:
             "This device has no controls."
         case .failed:
@@ -1176,11 +1176,10 @@ private final class DeviceAdvancedModel: ObservableObject {
 }
 
 private extension DeviceAdvancedModel.State {
-    var connectionStatusPresentation: ConnectionStatusPresentation {
-        switch self {
-        case .idle:
-            .disconnected("Not Loaded", systemImage: "pause.circle")
-        case .loading:
+    func connectionStatusPresentation(isActive: Bool) -> ConnectionStatusPresentation? {
+        guard isActive else { return nil }
+        return switch self {
+        case .idle, .loading:
             .pending("Loading control stacks…")
         case .live:
             .connected

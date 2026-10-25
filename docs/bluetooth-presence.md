@@ -108,6 +108,30 @@ command. The framing supports future independent lanes, but this implementation
 preserves request and delivery order. The UI identifies Bluetooth routing and
 explains that camera video and recordings require the network.
 
+## Connection feedback
+
+The server's tab container owns one connection indicator, centered above the
+native tab bar across the full window. `ConnectionStatusController` combines the
+actual transport state with loading and failure reports from visible screens.
+Hidden tabs and dismissed views remove their reports, so an old screen cannot
+leave a stale indicator behind. The connected state uses green radio waves for
+WebSocket and a blue Bluetooth symbol for Bluetooth. Bluetooth loading shows a
+gray Bluetooth symbol before the spinner; network loading has no transport icon.
+
+On return to the foreground, connection and monitoring failures have a fixed
+two-second grace period showing Connecting. Successful recovery is displayed
+immediately; a failure that remains when the grace period ends is shown with its
+normal retry action. New reports do not extend the deadline, and pending work
+continues to show its loading state. Background teardown errors stay concealed
+while the app is inactive. Active control screens also report loading while
+waiting for their monitoring task to start or finish cleanup from the prior run.
+
+Screens use `connectionStatusReport` to contribute status and reserve scroll-end
+room, or `connectionStatusClearance` when they only need the spacing. The clearance
+tracks the rendered indicator height, including larger text and error messages.
+Fixed footers use `ConnectionStatusSpacer` to leave the same room below their controls.
+Sheets and full-screen content disable the scope because they cover the tab host.
+
 ## Validation boundaries
 
 Unit tests use injected transport, storage, and CnC commands to check enrollment
@@ -144,7 +168,7 @@ Before relying on this for automations, test on a physical Mac and iPhone:
    mismatch is shown and no registration token is sent to that controller.
 
 Presence retains its prototype bearer-token enrollment rooted in the existing
-CnC connection. The separate control upgrade below never accepts that bearer
+CnC connection. The separate control upgrade never accepts that bearer
 as authority for ordinary CnC commands.
 
 ## Physical-device observations (2026-10-25)

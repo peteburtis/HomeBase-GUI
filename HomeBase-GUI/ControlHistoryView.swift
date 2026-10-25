@@ -47,6 +47,7 @@ struct ControlHistoryView: View {
             }
         }
         .navigationTitle("History")
+        .connectionStatusClearance()
         .task {
             await model.loadIfNeeded()
         }

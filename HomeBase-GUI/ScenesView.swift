@@ -107,7 +107,7 @@ struct ScenesView: View {
                 }
             }
         }
-        .connectionStatusOverlay(connectionStatus) {
+        .connectionStatusReport(connectionStatus) {
             Task {
                 await model.run()
             }
@@ -251,7 +251,7 @@ private struct HiddenScenesView: View {
                 }
             }
         }
-        .connectionStatusOverlay(connectionStatus) {
+        .connectionStatusReport(connectionStatus) {
             Task { await model.run() }
         }
         .task(id: scenePhase) {

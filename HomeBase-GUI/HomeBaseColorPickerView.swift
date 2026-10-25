@@ -191,13 +191,16 @@ struct HomeBaseColorPickerView: View {
             .frame(maxWidth: .infinity)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            ZStack {
-                if isSending {
-                    ProgressView()
-                        .controlSize(.small)
+            VStack(spacing: 0) {
+                ZStack {
+                    if isSending {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
                 }
+                .frame(height: 30)
+                ConnectionStatusSpacer()
             }
-            .frame(height: 30)
         }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }

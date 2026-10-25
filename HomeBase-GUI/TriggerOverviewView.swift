@@ -66,7 +66,7 @@ struct TriggerOverviewView: View {
                 .disabled(model.state != .live)
             }
         }
-        .connectionStatusOverlay(connectionStatus) {
+        .connectionStatusReport(connectionStatus) {
             Task { await model.run(reactivating: true) }
         }
         .task(id: scenePhase) {

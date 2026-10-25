@@ -137,6 +137,7 @@ struct SceneConfigurationDetailView: View {
         .sheet(item: $selectedActionPlugin, onDismiss: revealAddedAction) {
             plugin in
             plugin.makeCreationView(operations: actionCreationOperations)
+                .connectionStatusScopeDisabled()
         }
         .task {
             await model.loadIfNeeded()
@@ -475,6 +476,7 @@ private struct SceneConfigurationContents: View {
                     }
                 }
             }
+            .connectionStatusClearance()
             .onChange(of: newlyAddedActionIndex) { _, actionIndex in
                 guard let actionIndex else { return }
                 newlyAddedActionIndex = nil

@@ -59,6 +59,7 @@ struct VideoView: View {
                         .padding()
                 }
             }
+            .connectionStatusClearance()
             .task(id: previewTaskIdentity(isActive: previewsActive)) {
                 guard previewsActive else { return }
                 await previews.run(cameras: cameras)
@@ -67,6 +68,7 @@ struct VideoView: View {
 #if os(iOS)
         .fullScreenCover(item: $selectedCamera) { camera in
             fullScreenVideo(for: camera)
+                .connectionStatusScopeDisabled()
         }
 #endif
         .onChange(of: selectedCamera?.id) { _, identifier in

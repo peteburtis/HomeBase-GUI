@@ -55,7 +55,9 @@ struct GroupControlsDetailView: View {
             }
         }
         .navigationTitle(group.displayName)
-        .connectionStatusOverlay(model.state.connectionStatusPresentation) {
+        .connectionStatusReport(model.state.connectionStatusPresentation(
+            isActive: scenePhase == .active && splitLayout == .expanded
+        )) {
             monitoring.restart()
         }
         .task(id: splitLayout) {

@@ -130,6 +130,7 @@ struct HomeSettingsButton: View {
             .sheet(isPresented: $isPresented) {
                 S3CredentialSettingsView(destinations: destinations, serverName: serverName,
                     server: server, client: client, isConnected: isConnected)
+                    .connectionStatusScopeDisabled()
             }
     }
 }

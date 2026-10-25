@@ -20,6 +20,7 @@ struct ServerDetailView: View {
     let server: PairedServer
     let showServers: () -> Void
     @StateObject private var connection: ServerConnectionModel
+    @StateObject private var connectionStatusController = ConnectionStatusController()
     @State private var selectedTab: Tab = .home
     @State private var isShowingCamera = false
     @State private var homeDetailSelection: TopologyDetailDestination?
@@ -77,6 +78,7 @@ struct ServerDetailView: View {
                     client: connection.client
                 )
             }
+                .connectionStatusScope(isActive: selectedTab == .home)
                 .tabItem {
                     Label("Home", systemImage: "house")
                 }
@@ -92,6 +94,8 @@ struct ServerDetailView: View {
                             onPresentationChanged: { isShowingCamera = $0 })
                     }
                 }
+                .connectionStatusClearance()
+                .connectionStatusScope(isActive: selectedTab == .cameras)
                 .tabItem {
                     Label("Cameras", systemImage: "video")
                 }
@@ -106,6 +110,7 @@ struct ServerDetailView: View {
                     client: connection.client
                 )
             }
+                .connectionStatusScope(isActive: selectedTab == .scenes)
                 .tabItem {
                     Label("Scenes", systemImage: "sparkles")
                 }
@@ -116,6 +121,7 @@ struct ServerDetailView: View {
                     client: connection.client
                 )
             }
+                .connectionStatusScope(isActive: selectedTab == .triggers)
                 .tabItem {
                     Label("Triggers", systemImage: "bolt")
                 }
@@ -141,11 +147,14 @@ struct ServerDetailView: View {
             if tab == .cameras { cameraViewer?.restore() }
         }
 #endif
-        .safeAreaInset(edge: .top, spacing: 0) {
-            if connection.route == .bluetooth {
-                Label("Connected over Bluetooth", systemImage: "antenna.radiowaves.left.and.right")
-                    .font(.caption).frame(maxWidth: .infinity).padding(.vertical, 5).background(.bar)
-            }
+        .connectionStatusHost(connectionStatusController)
+        .onChange(of: connection.route, initial: true) { _, _ in
+            updateConnectionStatus()
+        }
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            // Publish recovery feedback before asynchronous route checks and
+            // individual screens restart their subscriptions.
+            connectionStatusController.setActive(phase == .active)
         }
         .task(id: scenePhase) {
             await connection.client.setForeground(scenePhase == .active)
@@ -153,6 +162,7 @@ struct ServerDetailView: View {
             await connection.reactivate()
         }
         .onChange(of: connection.state, initial: true) { _, state in
+            updateConnectionStatus()
             if state == .connected {
                 Task { await BluetoothPresenceService.shared.connected(serverID: server.id, client: connection.client) }
             }
@@ -290,11 +300,14 @@ struct ServerDetailView: View {
         .refreshable {
             await connection.refresh()
         }
-        .connectionStatusOverlay(connectionStatus) {
-            Task {
-                await connection.load()
-            }
-        }
+        .connectionStatusClearance()
+    }
+
+    private func updateConnectionStatus() {
+        // Retain only the model, not the view that owns the status controller.
+        let model = connection
+        connectionStatusController.updateConnection(presentation: connectionStatus,
+            route: connection.route, retry: { Task { await model.load() } })
     }
 
     private var connectionStatus: ConnectionStatusPresentation {
@@ -370,7 +383,14 @@ final class ServerConnectionModel: ObservableObject {
             for await update in await client.controlConnectionStates() {
                 guard let self else { return }
                 self.route = update.route
-                if update.recovering, self.state == .connected { self.state = .connecting }
+                if update.recovering, self.hasLoadedTopology {
+                    // A visible child can reconnect the shared client after a
+                    // failed handover. Its recovery also restores the root badge.
+                    switch self.state {
+                    case .connected, .failed: self.state = .connecting
+                    case .connecting, .disconnected: break
+                    }
+                }
                 else if update.route != nil, self.state == .connecting, self.hasLoadedTopology { self.state = .connected }
                 else if let error = update.error, self.state == .connected || self.state == .connecting { self.state = .failed(error) }
             }

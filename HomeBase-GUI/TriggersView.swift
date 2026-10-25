@@ -86,7 +86,7 @@ struct TriggersView: View {
                 .accessibilityLabel("Create Trigger")
             }
         }
-        .connectionStatusOverlay(connectionStatus) {
+        .connectionStatusReport(connectionStatus) {
             Task {
                 await model.run()
             }
@@ -223,7 +223,7 @@ private struct HiddenTriggersView: View {
             }
         }
         .navigationTitle("Hidden Triggers")
-        .connectionStatusOverlay(connectionStatus) {
+        .connectionStatusReport(connectionStatus) {
             Task { await model.run() }
         }
         .task(id: scenePhase) {

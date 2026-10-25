@@ -1358,6 +1358,7 @@ struct SceneRawControlValueEditor: View {
                     .foregroundStyle(.secondary)
             }
         }
+        .connectionStatusClearance()
         .navigationTitle(control.name)
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)

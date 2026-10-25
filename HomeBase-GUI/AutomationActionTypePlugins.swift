@@ -841,6 +841,7 @@ private struct AutomationWaitActionEditor: View {
                 Text("Actions after this one wait for the duration to elapse.")
             }
         }
+        .connectionStatusClearance()
         .navigationTitle(title)
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -1044,6 +1045,7 @@ private struct AutomationSceneInvocationActionEditor: View {
                 }
             }
         }
+        .connectionStatusClearance()
         .navigationTitle(title)
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -1283,6 +1285,7 @@ private struct AutomationActionJSONEditor: View {
                 .foregroundStyle(.secondary)
             }
         }
+        .connectionStatusClearance()
         .navigationTitle(title)
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)

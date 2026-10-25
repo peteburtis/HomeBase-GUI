@@ -44,6 +44,15 @@ struct DeviceDetailView: View {
             isActive: cameraCapability != nil,
             isPresentingCamera: isShowingFullScreenVideo
         )
+        // Read screen state here, outside the camera gate's deferred content.
+        .connectionStatusReport(model.state.connectionStatusPresentation(isActive: scenePhase == .active)) {
+            monitoring.restart()
+        }
+        .onChange(of: scenePhase == .active, initial: true) { _, active in
+            monitoring.setActive(active) { [model] in
+                await model.run(reactivating: true)
+            }
+        }
     }
 
     private func detail(access: CameraAccessPresentation) -> some View {
@@ -114,14 +123,6 @@ struct DeviceDetailView: View {
             }
         }
         .navigationTitle(device.displayName)
-        .connectionStatusOverlay(model.state.connectionStatusPresentation) {
-            monitoring.restart()
-        }
-        .onChange(of: scenePhase == .active, initial: true) { _, active in
-            monitoring.setActive(active) { [model] in
-                await model.run(reactivating: true)
-            }
-        }
         .onChange(of: shutterClosed) { previousValue, currentValue in
             guard CameraShutterStreamRecovery.shouldRequestRestart(
                 from: previousValue,
@@ -132,10 +133,12 @@ struct DeviceDetailView: View {
 #if os(iOS)
         .fullScreenCover(isPresented: $isShowingFullScreenVideo) {
             fullScreenVideo
+                .connectionStatusScopeDisabled()
         }
 #else
         .sheet(isPresented: $isShowingFullScreenVideo) {
             fullScreenVideo
+                .connectionStatusScopeDisabled()
         }
 #endif
     }
@@ -219,7 +222,7 @@ struct LiveDeviceControlSections: View {
         case .failed:
             "Controls could not be loaded."
         case .idle, .loading:
-            "Controls will appear when monitoring begins."
+            "Loading controls…"
         }
     }
 }
@@ -808,11 +811,12 @@ final class LiveDeviceControlsModel: ObservableObject {
 }
 
 extension LiveDeviceControlsModel.State {
-    var connectionStatusPresentation: ConnectionStatusPresentation {
-        switch self {
-        case .idle:
-            .disconnected("Not Monitoring", systemImage: "pause.circle")
-        case .loading:
+    func connectionStatusPresentation(isActive: Bool) -> ConnectionStatusPresentation? {
+        guard isActive else { return nil }
+        return switch self {
+        // A visible, active screen is waiting for controls even before its task
+        // starts, or while a previous monitoring run finishes cleaning up.
+        case .idle, .loading:
             .pending("Loading controls…")
         case .live:
             .connected

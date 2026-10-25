@@ -467,8 +467,16 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
     /// Fresh startup keeps the first working network session. During recovery,
     /// only readiness races: exactly one chosen transport resumes the session.
     private func preferredConnection(resuming snapshot: SessionCheckpoint?) async throws -> PreparedConnection {
-        guard canUseBluetooth else {
-            return try await prepare(try webSocketTransport(), resuming: snapshot)
+        if !canUseBluetooth {
+            do {
+                return try await prepare(try webSocketTransport(), resuming: snapshot)
+            } catch {
+                try Task.checkCancellation()
+                guard canUseBluetooth, !shouldRebuildSession(after: error) else { throw error }
+                // A child can start recovery before the parent publishes the
+                // foreground transition. If that happened during the network
+                // await, reconsider both routes with the same session checkpoint.
+            }
         }
         let delay = Task { try? await Task.sleep(for: .seconds(1)) }
         let chosen = try await withThrowingTaskGroup(of: RouteReadiness.self) { group in

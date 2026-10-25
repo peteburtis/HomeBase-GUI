@@ -130,6 +130,7 @@ struct TriggerConfigurationDetailView: View {
         .sheet(item: $selectedActionPlugin, onDismiss: revealAddedAction) {
             plugin in
             plugin.makeCreationView(operations: actionCreationOperations)
+                .connectionStatusScopeDisabled()
         }
         .sheet(item: $selectedConditionCreation) { creation in
             NavigationStack {
@@ -142,6 +143,7 @@ struct TriggerConfigurationDetailView: View {
                     try model.appendCondition(value)
                 }
             }
+            .connectionStatusScopeDisabled()
         }
         .task {
             await model.loadIfNeeded()
@@ -437,6 +439,7 @@ private struct TriggerConfigurationContents: View {
                     }
                 }
             }
+            .connectionStatusClearance()
             .onChange(of: newlyAddedActionIndex) { _, actionIndex in
                 guard let actionIndex else { return }
                 newlyAddedActionIndex = nil
@@ -674,6 +677,7 @@ struct TriggerConditionJSONEditor: View {
                 .foregroundStyle(.secondary)
             }
         }
+        .connectionStatusClearance()
         .navigationTitle(title)
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)

@@ -101,6 +101,42 @@ final class BluetoothControlRoutingTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testForegroundRecoveryIncludesBluetoothWhenChildStartsBeforeActivation() async throws {
+        let fixture = RoutingFixture()
+        await fixture.server.setNetworkAvailable(false)
+        let client = makeClient(fixture)
+        try await client.connect()
+        let originalSession = await client.currentSessionIdentifier()
+        await client.setForeground(false)
+
+        // Child screen lifecycle callbacks can run before the parent publishes
+        // foreground demand. Hold the resulting network attempt across that
+        // transition, with Bluetooth still ready and the network unavailable.
+        await fixture.server.holdNextNetworkAttempt()
+        let child = Task { try await client.reactivate() }
+        await eventually { await fixture.server.hasHeldNetworkAttempt }
+        await client.setForeground(true)
+        let parent = Task { try await client.reactivate() }
+        await fixture.server.releaseNetworkAttempt()
+
+        let childResult = await child.result
+        let parentResult = await parent.result
+        if case .failure(let error) = childResult {
+            XCTFail("Foreground activation must enable BLE for the waiting child: \(error)")
+        }
+        if case .failure(let error) = parentResult {
+            XCTFail("The parent's foreground recovery must also succeed: \(error)")
+        }
+        let route = await client.currentControlRoute()
+        let resumedSession = await client.currentSessionIdentifier()
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(route, .bluetooth)
+        XCTAssertEqual(resumedSession, originalSession)
+        XCTAssertEqual(fixture.bluetoothCount, 2, "Reopen only the suspended logical Bluetooth route")
+        XCTAssertEqual(summary.mutationExecutions, 0)
+        await client.disconnect()
+    }
+
     func testLostMutationReplyResumesSameSessionAndReplaysSameRequestOnlyOnce() async throws {
         let fixture = RoutingFixture()
         let client = makeClient(fixture)
@@ -208,6 +244,46 @@ final class BluetoothControlRoutingTests: XCTestCase {
         await fixture.server.setNetworkAvailable(false)
         fixture.closeLatestWebSocket()
         await eventually { model.route == .bluetooth && model.state == .connected }
+        await client.disconnect()
+    }
+
+    func testChildReconnectRestoresFailedRootWithPreviouslyLoadedTopology() async throws {
+        let fixture = RoutingFixture()
+        let client = makeClient(fixture, bluetoothAvailable: false)
+        let model = ServerConnectionModel(client: client)
+        await model.load()
+        XCTAssertEqual(model.state, .connected)
+
+        await fixture.server.setNetworkAvailable(false)
+        fixture.closeLatestWebSocket()
+        await eventually { if case .failed = model.state { return true }; return false }
+        XCTAssertNil(model.route)
+
+        await fixture.server.setNetworkAvailable(true)
+        await fixture.server.setOpenDelay(.milliseconds(100))
+        // A child screen reactivates the shared client without calling model.load.
+        let childRetry = Task { try await client.reactivate() }
+        await eventually { model.state == .connecting }
+        try await childRetry.value
+        await eventually { model.state == .connected && model.route == .webSocket }
+        XCTAssertTrue(model.topology.devices.isEmpty, "A valid empty cached topology also recovers")
+        await client.disconnect()
+    }
+
+    func testChildReconnectDoesNotClaimTopologyLoadedAfterInitialFailure() async throws {
+        let fixture = RoutingFixture()
+        await fixture.server.setNetworkAvailable(false)
+        let client = makeClient(fixture, bluetoothAvailable: false)
+        let model = ServerConnectionModel(client: client)
+        await model.load()
+        guard case .failed = model.state else { return XCTFail("Initial loading must fail while offline") }
+
+        await fixture.server.setNetworkAvailable(true)
+        try await client.reactivate()
+        await eventually { model.route == .webSocket }
+        guard case .failed = model.state else { return XCTFail("A route alone does not load the home's topology") }
+        await model.load()
+        XCTAssertEqual(model.state, .connected)
         await client.disconnect()
     }
 
@@ -434,6 +510,14 @@ private actor RoutingServer {
     private let instance = UUID()
     private var networkAvailable = true
     private var openDelay: Duration = .zero
+    private var holdNetworkAttempt = false
+    private var heldNetworkAttempt: CheckedContinuation<Void, Never>?
+    var hasHeldNetworkAttempt: Bool { heldNetworkAttempt != nil }
+    func holdNextNetworkAttempt() { holdNetworkAttempt = true }
+    func releaseNetworkAttempt() {
+        heldNetworkAttempt?.resume()
+        heldNetworkAttempt = nil
+    }
     private var loseMutation = false
     private var ignoreMutationReplay = false
     private var rejectResumes = false
@@ -467,6 +551,10 @@ private actor RoutingServer {
     }
     func summary() -> Summary { .init(mutationIDs: mutationIDs, mutationExecutions: receipts.count, resumes: resumes, subscriptions: subscriptions) }
     func reply(to request: HBProtocolEnvelope, route: HomeBaseControlRoute) async throws -> HBProtocolEnvelope? {
+        if route == .webSocket, holdNetworkAttempt {
+            holdNetworkAttempt = false
+            await withCheckedContinuation { heldNetworkAttempt = $0 }
+        }
         if route == .webSocket, !networkAvailable { throw URLError(.notConnectedToInternet) }
         lastClientID = request.clientID
         var responseSession = request.sessionID

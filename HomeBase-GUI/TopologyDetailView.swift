@@ -73,11 +73,9 @@ struct TopologyDetailView: View {
     var body: some View {
         List(selection: selection) { sections }
         .navigationTitle(title)
-        .connectionStatusOverlay(
-            showsInlineGroupControls
-                ? controlModel.state.connectionStatusPresentation
-                : nil
-        ) {
+        .connectionStatusReport(controlModel.state.connectionStatusPresentation(
+            isActive: showsInlineGroupControls && scenePhase == .active
+        )) {
             monitoring.restart()
         }
         .onNavigationAppearanceCompleted {
@@ -273,6 +271,7 @@ struct HiddenTopologyItemsView: View {
     var body: some View {
         List(selection: selection) { sections }
         .navigationTitle("Hidden")
+        .connectionStatusClearance()
 #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
 #endif

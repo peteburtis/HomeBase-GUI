@@ -8,6 +8,17 @@ import XCTest
 @testable import HomeBase_GUI
 
 final class LiveDeviceControlsModelTests: XCTestCase {
+    func testActiveControlScreenReportsLoadingBeforeMonitoringStarts() {
+        XCTAssertEqual(LiveDeviceControlsModel.State.idle.connectionStatusPresentation(isActive: true),
+                       .pending("Loading controls…"))
+        XCTAssertEqual(LiveDeviceControlsModel.State.loading.connectionStatusPresentation(isActive: true),
+                       .pending("Loading controls…"))
+        XCTAssertEqual(LiveDeviceControlsModel.State.live.connectionStatusPresentation(isActive: true), .connected)
+        XCTAssertNil(LiveDeviceControlsModel.State.idle.connectionStatusPresentation(isActive: false),
+                     "An inactive control screen must not keep the shared badge loading.")
+        XCTAssertNil(LiveDeviceControlsModel.State.loading.connectionStatusPresentation(isActive: false))
+    }
+
     func testEmptyDescriptorsHaveNoPotentiallyReadableStandardControl() {
         XCTAssertFalse(
             LiveDeviceControlsModel.hasPotentiallyReadableStandardControl(
