@@ -118,6 +118,9 @@ final class S3CredentialSettingsModel: ObservableObject {
 struct HomeSettingsButton: View {
     var destinations: [CameraS3Destination] = []
     var serverName: String? = nil
+    var server: PairedServer? = nil
+    var client: HomeBaseWebSocketClient? = nil
+    var isConnected = false
     @State private var isPresented = false
 
     var body: some View {
@@ -125,7 +128,8 @@ struct HomeSettingsButton: View {
             .labelStyle(.iconOnly)
             .accessibilityIdentifier("home.settings")
             .sheet(isPresented: $isPresented) {
-                S3CredentialSettingsView(destinations: destinations, serverName: serverName)
+                S3CredentialSettingsView(destinations: destinations, serverName: serverName,
+                    server: server, client: client, isConnected: isConnected)
             }
     }
 }
@@ -133,6 +137,9 @@ struct HomeSettingsButton: View {
 struct S3CredentialSettingsView: View {
     let destinations: [CameraS3Destination]
     let serverName: String?
+    var server: PairedServer?
+    var client: HomeBaseWebSocketClient?
+    var isConnected: Bool
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.cameraAccessSession) private var access
@@ -141,15 +148,22 @@ struct S3CredentialSettingsView: View {
     @State private var confirmingDeletion = false
     @State private var deletionTask: Task<Void, Never>?
 
-    init(destinations: [CameraS3Destination], serverName: String?, model: S3CredentialSettingsModel? = nil) {
+    init(destinations: [CameraS3Destination], serverName: String?, model: S3CredentialSettingsModel? = nil,
+         server: PairedServer? = nil, client: HomeBaseWebSocketClient? = nil, isConnected: Bool = false) {
         self.destinations = destinations
         self.serverName = serverName
+        self.server = server
+        self.client = client
+        self.isConnected = isConnected
         _model = StateObject(wrappedValue: model ?? S3CredentialSettingsModel())
     }
 
     var body: some View {
         NavigationStack {
             Form {
+                if let server, let client {
+                    BluetoothPresenceSettingsSection(server: server, client: client, isConnected: isConnected)
+                }
                 Section {
                     if model.presence == .missing {
                         Label("No saved S3 credentials", systemImage: "key")

@@ -15,6 +15,7 @@ final class PairedServerStore: ObservableObject {
     private let defaults: UserDefaults
     private let storageKey: String
     private let selectionStorageKey: String
+    private let didRemoveServer: (UUID) -> Void
 
     private struct Snapshot: Codable {
         let version: Int
@@ -24,11 +25,13 @@ final class PairedServerStore: ObservableObject {
     init(
         defaults: UserDefaults = .standard,
         storageKey: String = "pairedServers",
-        selectionStorageKey: String = "selectedPairedServerID"
+        selectionStorageKey: String = "selectedPairedServerID",
+        didRemoveServer: ((UUID) -> Void)? = nil
     ) {
         self.defaults = defaults
         self.storageKey = storageKey
         self.selectionStorageKey = selectionStorageKey
+        self.didRemoveServer = didRemoveServer ?? { BluetoothPresenceService.shared.remove(serverID: $0) }
 
         guard let data = defaults.data(forKey: storageKey) else {
             servers = []
@@ -95,6 +98,7 @@ final class PairedServerStore: ObservableObject {
 
     func remove(at offsets: IndexSet) {
         for index in offsets.sorted(by: >) {
+            didRemoveServer(servers[index].id)
             servers.remove(at: index)
         }
         if !servers.contains(where: { $0.id == selectedServerID }) {

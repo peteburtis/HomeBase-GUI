@@ -216,6 +216,13 @@ final class CameraExternalDisplaySceneDelegate: NSObject, UIWindowSceneDelegate 
 @MainActor
 final class CameraExternalDisplayAppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // Initialize restoration before any Settings or server view is opened.
+        BluetoothPresenceService.shared.start()
+        return true
+    }
+
+    func application(_ application: UIApplication,
                      configurationForConnecting connectingSceneSession: UISceneSession,
                      options: UIScene.ConnectionOptions) -> UISceneConfiguration {
         // Return a fresh configuration: returning the primary session's

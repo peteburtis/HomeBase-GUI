@@ -7,7 +7,7 @@ import Foundation
 import HomeBaseProtocol
 import OSLog
 
-actor HomeBaseWebSocketClient {
+actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
     struct DeviceMetadataSubscription: Sendable {
         let details: HBDeviceDescriptor
         let metadata: [String: HBJSONValue]
@@ -818,6 +818,49 @@ actor HomeBaseWebSocketClient {
             )
         }
         return result
+    }
+
+    func bluetoothStatus() async throws -> HBBluetoothControlStatus {
+        try await bluetoothCommand(path: ["status"], as: HBBluetoothControlStatus.self)
+    }
+
+    func beginBluetoothPairing(registrationID: UUID, name: String) async throws -> HBBluetoothPairingOffer {
+        try await bluetoothCommand(path: ["pairing", "begin"], arguments: [
+            "registrationID": .string(registrationID.uuidString), "name": .string(name)
+        ], as: HBBluetoothPairingOffer.self)
+    }
+
+    func cancelBluetoothPairing(registrationID: UUID) async throws {
+        _ = try await bluetoothModuleCommand(path: ["pairing", "cancel"], arguments: [
+            "registrationID": .string(registrationID.uuidString)
+        ])
+    }
+
+    func removeBluetoothController(registrationID: UUID) async throws {
+        _ = try await bluetoothModuleCommand(path: ["controllers", "remove"], arguments: [
+            "registrationID": .string(registrationID.uuidString)
+        ])
+    }
+
+    func renameBluetoothController(registrationID: UUID, name: String) async throws {
+        _ = try await bluetoothModuleCommand(path: ["controllers", "rename"], arguments: [
+            "registrationID": .string(registrationID.uuidString), "name": .string(name)
+        ])
+    }
+
+    private func bluetoothCommand<Result: Decodable>(path: [String], arguments: [String: HBJSONValue] = [:],
+                                                       as type: Result.Type) async throws -> Result {
+        let result = try await bluetoothModuleCommand(path: path, arguments: arguments)
+        guard let value = result.value else { throw ClientError.invalidMessage("missing Bluetooth command result") }
+        return try value.decoded(type)
+    }
+
+    private func bluetoothModuleCommand(path: [String], arguments: [String: HBJSONValue]) async throws -> HBModuleCommandResult {
+        let request = try sessionRequest(operation: HBProtocolOperations.executeModuleCommand,
+            payload: HBModuleCommandRequest(moduleName: HBBluetoothProtocol.moduleName, path: path, arguments: arguments))
+        let response = try await sendRequest(request)
+        let body = try response.decodedPayload(as: HBProtocolResponse.self)
+        return try body.decodedResult(as: HBModuleCommandResult.self)
     }
 
     func reloadTrigger(named name: String) async throws -> HBTriggerReloadResult {

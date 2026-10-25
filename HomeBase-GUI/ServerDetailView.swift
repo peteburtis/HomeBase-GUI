@@ -63,7 +63,9 @@ struct ServerDetailView: View {
                             ToolbarItem(placement: .primaryAction) {
                                 HomeSettingsButton(
                                     destinations: S3CredentialSettingsModel.destinations(in: connection.topology.devices),
-                                    serverName: server.endpoint.host
+                                    serverName: server.endpoint.host,
+                                    server: server, client: connection.client,
+                                    isConnected: connection.state == .connected
                                 )
                             }
                         }
@@ -139,6 +141,17 @@ struct ServerDetailView: View {
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             await connection.reactivate()
+        }
+        .onChange(of: connection.state, initial: true) { _, state in
+            if state == .connected {
+                Task { await BluetoothPresenceService.shared.connected(serverID: server.id, client: connection.client) }
+            }
+        }
+        .onReceive(BluetoothPresenceService.shared.$registrations) { registrations in
+            if connection.state == .connected,
+               registrations.contains(where: { $0.serverID == server.id && $0.phase == .removing }) {
+                Task { await BluetoothPresenceService.shared.connected(serverID: server.id, client: connection.client) }
+            }
         }
     }
 

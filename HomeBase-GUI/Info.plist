@@ -5,7 +5,16 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
+		<string>bluetooth-central</string>
 	</array>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Connect to your HomeBase controller to report when this iPhone is nearby.</string>
+	<key>NSAccessorySetupKitSupports</key>
+	<array><string>Bluetooth</string></array>
+	<key>NSAccessorySetupBluetoothServices</key>
+	<array><string>A8F014D0-BC73-4B8F-A9AA-06320E5278E3</string></array>
+	<key>NSAccessorySetupBluetoothNames</key>
+	<array><string>HomeBase</string></array>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
