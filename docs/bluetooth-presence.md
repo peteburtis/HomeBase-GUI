@@ -4,8 +4,9 @@ From a connected server's Settings, choose **Bluetooth Presence → Pair This
 iPhone** and select its HomeBase accessory. The existing WebSocket CnC session
 issues an opaque enrollment credential; there is no second account or PIN.
 After enrollment, Bluetooth presence operates independently of the selected
-server, Settings screen, Wi-Fi, and VPN. The first version exposes presence
-only. It does not carry ordinary CnC operations or video.
+server, Settings screen, Wi-Fi, and VPN. The foreground app can also use an
+encrypted Bluetooth control channel when its preferred network connection is
+unavailable. Video and recordings still require a network connection.
 
 The iPhone is the BLE central. The Mac advertises the shared HomeBase service,
 a readable controller identity, and a recovery-notification characteristic.
@@ -16,8 +17,9 @@ It then subscribes to recovery, opens the current L2CAP PSM, and sends one
 bounded four-byte-length frame. The acknowledgement must match the request,
 controller, and phone registration. Future capabilities can reuse this framing.
 
-After the handshake the channel remains idle. There are no application
-heartbeats or periodic presence timers. The controller observes stream/radio
+After the presence handshake the channel remains idle unless the foreground
+app needs Bluetooth controls. There are no application presence heartbeats or
+periodic presence timers. The controller observes stream/radio
 loss and applies its departure grace period. Bluetooth-off, an empty battery,
 radio interference, and actual departure can all make a phone unreachable;
 the Boolean means reachable nearby, not proof that a person left the building.
@@ -58,6 +60,54 @@ after its CnC controller identity matches the original registration.
 On macOS the Settings section explains that enrollment is performed on iPhone;
 the GUI does not start a Bluetooth manager there.
 
+## Encrypted control fallback
+
+An existing paired phone automatically obtains an independent random 32-byte
+control credential through `bluetooth-control cnc enroll` on its working
+WebSocket session. New presence enrollment triggers the same upgrade when it
+finishes. The credential, key ID, controller ID, registration ID, and persistent
+client ID remain in the device-only Keychain. The WebSocket credential response
+is acknowledged before that logical session can resume over Bluetooth. Viewing
+Settings does not enroll a new phone or change remote configuration.
+
+The phone proves the new credential with
+`Noise_NNpsk0_25519_ChaChaPoly_SHA256`, bound to the controller, registration, and
+key IDs. The client confirmation is the first encrypted record. Only then can
+ordinary HomeBase envelopes use the channel. The presence bearer cannot open
+this control channel. A restored background presence link never creates control
+demand on its own.
+
+The WebSocket client remains the sole owner of requests, subscription state,
+and delivery checkpoints. Startup gives a responsive network connection up to
+one second of preference; an immediate network error lets ready Bluetooth
+proceed immediately. Readiness probes race, but only one selected route resumes
+the logical session. During handover, the old reader stops before the checkpoint
+is captured. Pending requests retain their IDs and order and are replayed only
+after that same session successfully resumes. A rejected/expired session fails
+uncertain work instead of repeating it in a new session. Request deadlines
+remain absolute across route changes.
+
+While the app is in the foreground on Bluetooth, a network-path change or a
+15-second retry checks WebSocket availability. Failback requires a successful
+probe session and another successful response at least one second later. The
+network-path health check has a two-second deadline. A failed probe leaves the
+working Bluetooth session intact. These are foreground control checks; none
+measure presence or wake the background app periodically.
+
+Backgrounding or changing away from a control connection detaches its logical
+Bluetooth session while retaining Noise and idle physical presence. A later
+foreground attachment starts with session.open/resume. Attachment IDs fence old
+detach events, and old queued deliveries are discarded until the matching new
+attachment response arrives. A fresh physical stream uses a fresh Noise
+handshake. Each negotiation has one finite timeout.
+
+The application uses one FIFO logical command lane, fragmented into bounded
+16 KiB encrypted records, with a 16 MiB message maximum and 32 MiB/4,096-message
+outgoing queue limits. Attachment changes cannot overtake a partially sent
+command. The framing supports future independent lanes, but this implementation
+preserves request and delivery order. The UI identifies Bluetooth routing and
+explains that camera video and recordings require the network.
+
 ## Validation boundaries
 
 Unit tests use injected transport, storage, and CnC commands to check enrollment
@@ -66,7 +116,10 @@ selected-peripheral restart recovery, fresh-process connection ownership,
 restoration-before-radio-readiness, pending connection deduplication, radio power
 cycling, healthy session preservation, stale callbacks after removal or retry,
 offline deletion, unchanged renames, controller identity rejection, and
-acknowledgement matching.
+acknowledgement matching. Control tests cover preferred-route selection,
+same-session recovery, mutation receipt replay and absolute deadlines, ordered
+pending requests, stable failback, preserved subscriptions, credential upgrade,
+attachment generations, bounded mailboxes, and encrypted queue ordering.
 Simulator/build results cannot establish radio range, battery cost, suspended
 L2CAP behavior, or AccessorySetupKit relaunch behavior.
 
@@ -90,8 +143,9 @@ Before relying on this for automations, test on a physical Mac and iPhone:
 7. Select a different nearby HomeBase controller during setup. Verify identity
    mismatch is shown and no registration token is sent to that controller.
 
-This is prototype bearer-token authentication rooted in the existing CnC
-connection, not a new cryptographic identity or encrypted transport design.
+Presence retains its prototype bearer-token enrollment rooted in the existing
+CnC connection. The separate control upgrade below never accepts that bearer
+as authority for ordinary CnC commands.
 
 ## Physical-device observations (2026-10-25)
 

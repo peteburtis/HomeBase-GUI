@@ -19,6 +19,9 @@ struct BluetoothPresenceRegistration: Codable, Equatable, Identifiable {
     var accessoryRemovalComplete = false
     // Optional for compatibility with enrollments saved before automatic cleanup.
     var cancelsPendingOfferOnly: Bool? = nil
+    // Optional fields preserve existing presence-only enrollments during upgrade.
+    var cncCredential: HBBluetoothCnCCredential? = nil
+    var cncClientID: UUID? = nil
 
     var isCancelledDiscovery: Bool { phase == .removing && cancelsPendingOfferOnly == true }
 }
@@ -103,6 +106,13 @@ protocol BluetoothPresenceTransporting: AnyObject {
     func showPicker(for registration: BluetoothPresenceRegistration) throws
     func removeAccessory(peripheralID: UUID)
     func retryConnections()
+    func controlTransport(serverID: UUID, clientID: UUID) async throws -> any HomeBaseControlTransport
+}
+
+extension BluetoothPresenceTransporting {
+    func controlTransport(serverID: UUID, clientID: UUID) async throws -> any HomeBaseControlTransport {
+        throw HomeBaseControlTransportError.unavailable
+    }
 }
 
 @MainActor
@@ -144,6 +154,39 @@ final class BluetoothPresenceService: ObservableObject {
             transport?.onEvent = { [weak self] event in self?.received(event) }
             transport?.synchronize(registrations)
         } catch { errorMessage = BluetoothPresenceError.persistence.localizedDescription }
+    }
+
+    func registrationForControlUpgrade(serverID: UUID) -> BluetoothPresenceRegistration? {
+        start()
+        guard !locallyDisabled.contains(serverID), let item = registration(for: serverID), item.phase == .paired else { return nil }
+        return item
+    }
+
+    func saveControlCredential(_ credential: HBBluetoothCnCCredential, serverID: UUID, clientID: UUID) throws {
+        try credential.validate()
+        guard var item = registrationForControlUpgrade(serverID: serverID),
+              item.registrationID == credential.registrationID,
+              item.controllerID == credential.controllerID || item.offer?.controllerID == credential.controllerID else {
+            throw BluetoothPresenceError.invalidReply
+        }
+        if item.cncCredential != credential || item.cncClientID != clientID {
+            item.cncCredential = credential
+            item.cncClientID = clientID
+            try replace(item)
+        }
+        transport?.synchronize(registrations.filter { !locallyDisabled.contains($0.serverID) })
+    }
+
+    func controlUpgradeFailed(serverID: UUID, error: Error) {
+        messages[serverID] = "Bluetooth presence remains available. Control upgrade will retry on the next network connection: \(error.localizedDescription)"
+    }
+
+    func controlTransport(serverID: UUID, clientID: UUID) async throws -> any HomeBaseControlTransport {
+        guard let item = registrationForControlUpgrade(serverID: serverID),
+              item.cncCredential != nil, item.cncClientID == clientID, let transport else {
+            throw HomeBaseControlTransportError.unavailable
+        }
+        return try await transport.controlTransport(serverID: serverID, clientID: clientID)
     }
 
     func registration(for serverID: UUID) -> BluetoothPresenceRegistration? {
@@ -237,6 +280,8 @@ final class BluetoothPresenceService: ObservableObject {
         item.phase = .removing
         item.controllerID = item.controllerID ?? item.offer?.controllerID
         item.offer = nil
+        item.cncCredential = nil
+        item.cncClientID = nil
         item.accessoryRemovalComplete = true
         item.cancelsPendingOfferOnly = true
         return item
@@ -270,6 +315,8 @@ final class BluetoothPresenceService: ObservableObject {
         item.phase = .removing
         item.controllerID = item.controllerID ?? item.offer?.controllerID
         item.offer = nil
+        item.cncCredential = nil
+        item.cncClientID = nil
         item.accessoryRemovalComplete = peripheralID == nil
         do {
             try replace(item)

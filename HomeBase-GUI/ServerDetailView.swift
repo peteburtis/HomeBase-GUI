@@ -31,7 +31,7 @@ struct ServerDetailView: View {
         self.server = server
         self.showServers = showServers
         _connection = StateObject(
-            wrappedValue: ServerConnectionModel(endpoint: server.endpoint)
+            wrappedValue: ServerConnectionModel(server: server)
         )
     }
 
@@ -65,7 +65,7 @@ struct ServerDetailView: View {
                                     destinations: S3CredentialSettingsModel.destinations(in: connection.topology.devices),
                                     serverName: server.endpoint.host,
                                     server: server, client: connection.client,
-                                    isConnected: connection.state == .connected
+                                    isConnected: connection.state == .connected && connection.route == .webSocket
                                 )
                             }
                         }
@@ -83,12 +83,15 @@ struct ServerDetailView: View {
                 .tag(Tab.home)
 
             if !cameras.isEmpty {
-                VideoView(
-                    cameras: cameras,
-                    client: connection.client,
-                    server: server,
-                    onPresentationChanged: { isShowingCamera = $0 }
-                )
+                Group {
+                    if connection.route == .bluetooth {
+                        ContentUnavailableView("Cameras need a network connection", systemImage: "wifi.slash",
+                            description: Text("Home controls are connected over Bluetooth. Video and recordings become available when the network connection returns."))
+                    } else {
+                        VideoView(cameras: cameras, client: connection.client, server: server,
+                            onPresentationChanged: { isShowingCamera = $0 })
+                    }
+                }
                 .tabItem {
                     Label("Cameras", systemImage: "video")
                 }
@@ -138,7 +141,14 @@ struct ServerDetailView: View {
             if tab == .cameras { cameraViewer?.restore() }
         }
 #endif
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if connection.route == .bluetooth {
+                Label("Connected over Bluetooth", systemImage: "antenna.radiowaves.left.and.right")
+                    .font(.caption).frame(maxWidth: .infinity).padding(.vertical, 5).background(.bar)
+            }
+        }
         .task(id: scenePhase) {
+            await connection.client.setForeground(scenePhase == .active)
             guard scenePhase == .active else { return }
             await connection.reactivate()
         }
@@ -148,6 +158,10 @@ struct ServerDetailView: View {
             }
         }
         .onReceive(BluetoothPresenceService.shared.$registrations) { registrations in
+            if connection.route == .webSocket,
+               registrations.contains(where: { $0.serverID == server.id && $0.phase == .paired && $0.cncCredential == nil }) {
+                Task { await connection.client.upgradeBluetoothIfPossible() }
+            }
             if connection.state == .connected,
                registrations.contains(where: { $0.serverID == server.id && $0.phase == .removing }) {
                 Task { await BluetoothPresenceService.shared.connected(serverID: server.id, client: connection.client) }
@@ -327,6 +341,9 @@ final class ServerConnectionModel: ObservableObject {
     }
 
     @Published private(set) var state: State = .disconnected
+    @Published private(set) var route: HomeBaseControlRoute?
+    private var routeObservation: Task<Void, Never>?
+    private var hasLoadedTopology = false
     @Published private(set) var topology = HBTopologyListResult(
         devices: [],
         rooms: [],
@@ -339,15 +356,29 @@ final class ServerConnectionModel: ObservableObject {
 
     let client: HomeBaseWebSocketClient
 
+    convenience init(server: PairedServer) {
+        self.init(client: HomeBaseWebSocketClient(endpoint: server.endpoint, clientID: server.id, bluetoothServerID: server.id))
+    }
+
     convenience init(endpoint: HomeBaseEndpoint) {
         self.init(client: HomeBaseWebSocketClient(endpoint: endpoint))
     }
 
     init(client: HomeBaseWebSocketClient) {
         self.client = client
+        routeObservation = Task { [weak self, client] in
+            for await update in await client.controlConnectionStates() {
+                guard let self else { return }
+                self.route = update.route
+                if update.recovering, self.state == .connected { self.state = .connecting }
+                else if update.route != nil, self.state == .connecting, self.hasLoadedTopology { self.state = .connected }
+                else if let error = update.error, self.state == .connected || self.state == .connecting { self.state = .failed(error) }
+            }
+        }
     }
 
     deinit {
+        routeObservation?.cancel()
         let client = client
         Task {
             await client.disconnect()
@@ -376,6 +407,7 @@ final class ServerConnectionModel: ObservableObject {
             let topology = try await client.listTopology()
             try Task.checkCancellation()
             self.topology = topology
+            hasLoadedTopology = true
             state = .connected
         } catch is CancellationError {
             state = previousState

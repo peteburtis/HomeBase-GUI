@@ -1,0 +1,546 @@
+import Foundation
+import HomeBaseProtocol
+import XCTest
+@testable import HomeBase_GUI
+
+@MainActor
+final class BluetoothControlRoutingTests: XCTestCase {
+    private func makeClient(_ fixture: RoutingFixture, timeout: Double = 2, bluetoothAvailable: Bool = true) -> HomeBaseWebSocketClient {
+        HomeBaseWebSocketClient(endpoint: HomeBaseEndpoint(host: "routing.invalid", port: 10503)!,
+            requestTimeout: timeout, makeControlSocket: { _ in fixture.webSocket() },
+            makeBluetoothTransport: {
+                guard bluetoothAvailable else { throw HomeBaseControlTransportError.unavailable }
+                return try await fixture.bluetooth()
+            })
+    }
+    private func eventually(_ condition: () async -> Bool) async {
+        for _ in 0..<500 {
+            if await condition() { return }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Route did not reach the expected state")
+    }
+
+    func testWebSocketAdapterSendsJSONTextFrames() async throws {
+        let socket = RoutingSocket(server: RoutingServer())
+        let transport = HomeBaseWebSocketTransport(socket: socket)
+        defer { transport.close() }
+        let request = HBProtocolEnvelope(messageKind: .request, clientID: UUID(), operation: HBProtocolOperations.openSession)
+        try await transport.send(JSONEncoder().encode(request))
+        let response = try JSONDecoder().decode(HBProtocolEnvelope.self, from: await transport.receive())
+        XCTAssertEqual(response.requestID, request.requestID)
+        XCTAssertEqual(response.operation, HBProtocolOperations.openSession)
+    }
+
+    func testResponsiveWebSocketWinsWithoutOpeningBluetoothControl() async throws {
+        let fixture = RoutingFixture()
+        let client = makeClient(fixture)
+        try await client.connect()
+        let route = await client.currentControlRoute()
+        XCTAssertEqual(route, .webSocket)
+        XCTAssertEqual(fixture.bluetoothCount, 0)
+        XCTAssertEqual(fixture.webSocketCount, 1, "Keep the first working network session instead of opening a second socket")
+        await client.disconnect()
+    }
+
+
+    func testUnavailableBluetoothDoesNotMaskNetworkFailure() async throws {
+        let fixture = RoutingFixture()
+        await fixture.server.setNetworkAvailable(false)
+        let client = makeClient(fixture, bluetoothAvailable: false)
+        do { try await client.connect(); XCTFail("Both routes are unavailable") }
+        catch { XCTAssertEqual((error as? URLError)?.code, .notConnectedToInternet) }
+        await client.disconnect()
+    }
+
+    func testUnavailableBluetoothDoesNotInterruptSlowWorkingWebSocket() async throws {
+        let fixture = RoutingFixture()
+        await fixture.server.setOpenDelay(.milliseconds(1_100))
+        let client = makeClient(fixture, timeout: 3, bluetoothAvailable: false)
+        try await client.connect()
+        let route = await client.currentControlRoute()
+        XCTAssertEqual(route, .webSocket)
+        XCTAssertEqual(fixture.webSocketCount, 1)
+        try await client.setControl("test.light", to: .bool(true))
+        await client.disconnect()
+    }
+
+    func testUnavailableBluetoothDoesNotMaskNetworkRecoveryFailure() async throws {
+        let fixture = RoutingFixture()
+        let client = makeClient(fixture, bluetoothAvailable: false)
+        try await client.connect()
+        await fixture.server.loseNextMutationReply()
+        do { try await client.setControl("test.light", to: .bool(true)); XCTFail("Neither route can recover") }
+        catch { XCTAssertEqual((error as? URLError)?.code, .notConnectedToInternet) }
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(summary.mutationExecutions, 1)
+        await client.disconnect()
+    }
+
+    func testFastWebSocketFailureUsesReadyBluetoothBeforePreferenceDelay() async throws {
+        let fixture = RoutingFixture()
+        await fixture.server.setNetworkAvailable(false)
+        let client = makeClient(fixture)
+        let start = ContinuousClock.now
+        try await client.connect()
+        let route = await client.currentControlRoute()
+        XCTAssertEqual(route, .bluetooth)
+        XCTAssertLessThan(start.duration(to: .now), .milliseconds(900))
+        do { _ = try await client.openCameraLiveStream(deviceIdentifier: "camera", quality: .low); XCTFail("BLE must not issue media tickets") }
+        catch { XCTAssertEqual(error.localizedDescription, HomeBaseControlTransportError.networkRequired.localizedDescription) }
+        await client.disconnect()
+    }
+
+    func testBackgroundNeverCreatesBluetoothControlDemand() async throws {
+        let fixture = RoutingFixture()
+        await fixture.server.setNetworkAvailable(false)
+        let client = makeClient(fixture)
+        await client.setForeground(false)
+        do { try await client.connect(); XCTFail("The network is unavailable") } catch { }
+        XCTAssertEqual(fixture.bluetoothCount, 0)
+        await client.disconnect()
+    }
+
+    func testLostMutationReplyResumesSameSessionAndReplaysSameRequestOnlyOnce() async throws {
+        let fixture = RoutingFixture()
+        let client = makeClient(fixture)
+        try await client.connect()
+        let session = await client.currentSessionIdentifier()
+        await fixture.server.loseNextMutationReply()
+        try await client.setControl("test.light", to: .bool(true))
+        let resumed = await client.currentSessionIdentifier()
+        let route = await client.currentControlRoute()
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(session, resumed)
+        XCTAssertEqual(route, .bluetooth)
+        XCTAssertEqual(summary.mutationExecutions, 1)
+        XCTAssertEqual(summary.mutationIDs.count, 2)
+        XCTAssertEqual(Set(summary.mutationIDs).count, 1)
+        XCTAssertEqual(summary.resumes, 1)
+        await client.disconnect()
+    }
+
+    func testPendingRequestDeadlineSurvivesSuccessfulHandover() async throws {
+        let fixture = RoutingFixture()
+        let client = makeClient(fixture, timeout: 0.4)
+        try await client.connect()
+        await fixture.server.loseNextMutationReply(ignoreReplay: true)
+        let start = ContinuousClock.now
+        do { try await client.setControl("test.light", to: .bool(true)); XCTFail("A silent replay must time out") }
+        catch { XCTAssertEqual(error.localizedDescription, HomeBaseControlTransportError.requestTimedOut.localizedDescription) }
+        XCTAssertLessThan(start.duration(to: .now), .seconds(2))
+        let route = await client.currentControlRoute()
+        XCTAssertEqual(route, .bluetooth)
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(summary.mutationExecutions, 1)
+        await client.disconnect()
+    }
+
+    func testRejectedResumeNeverMovesUncertainMutationIntoFreshSession() async throws {
+        let fixture = RoutingFixture()
+        let client = makeClient(fixture)
+        try await client.connect()
+        await fixture.server.loseNextMutationReply(rejectResume: true)
+        do { try await client.setControl("test.light", to: .bool(true)); XCTFail("Expired session must fail its pending work") }
+        catch { }
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(summary.mutationExecutions, 1)
+        XCTAssertEqual(summary.mutationIDs.count, 1)
+        await client.disconnect()
+    }
+
+    func testNearlySimultaneousReadyRoutesCommitOnlyOneResume() async throws {
+        let fixture = RoutingFixture()
+        let client = makeClient(fixture)
+        try await client.connect()
+        let originalSession = await client.currentSessionIdentifier()
+        await fixture.server.setOpenDelay(.milliseconds(1_000))
+        fixture.closeLatestWebSocket()
+        await eventually { await fixture.server.summary().resumes == 1 }
+        await eventually { await client.currentControlRoute() != nil }
+        let summary = await fixture.server.summary()
+        let session = await client.currentSessionIdentifier()
+        XCTAssertEqual(summary.resumes, 1, "Readiness probes must never resume the shared session")
+        XCTAssertEqual(session, originalSession)
+        try await client.setControl("test.light", to: .bool(false))
+        await client.disconnect()
+    }
+
+    func testSubscriptionSurvivesRouteChangeWithoutNewSubscription() async throws {
+        let fixture = RoutingFixture()
+        let client = makeClient(fixture)
+        try await client.connect()
+        let subscription = try await client.subscribe(to: .init(identifier: "test", addressableName: "test", displayName: "Test"))
+        let received = Task { () throws -> HBControlWatchStreamEvent? in
+            for try await event in subscription.events { return event }
+            return nil
+        }
+        await fixture.server.setNetworkAvailable(false)
+        fixture.closeLatestWebSocket()
+        await eventually { await client.currentControlRoute() == .bluetooth }
+        try await fixture.sendControlEvent(subscriptionID: subscription.identifier)
+        let event = try await received.value
+        XCTAssertEqual(event?.subscriptionID, subscription.identifier)
+        XCTAssertEqual(event?.value, .bool(true))
+        let count = await fixture.server.summary().subscriptions
+        XCTAssertEqual(count, 1)
+        await client.disconnect()
+    }
+
+    func testForegroundExitDetachesControlWithoutRemovingPairing() async throws {
+        let fixture = RoutingFixture()
+        await fixture.server.setNetworkAvailable(false)
+        let client = makeClient(fixture)
+        try await client.connect()
+        await client.setForeground(false)
+        let route = await client.currentControlRoute()
+        XCTAssertNil(route)
+        XCTAssertEqual(fixture.bluetoothCount, 1)
+        await client.disconnect()
+    }
+    func testEmptyHomeReturnsToConnectedAfterHandover() async throws {
+        let fixture = RoutingFixture()
+        let client = makeClient(fixture)
+        let model = ServerConnectionModel(client: client)
+        await model.load()
+        XCTAssertEqual(model.state, .connected)
+        XCTAssertTrue(model.topology.devices.isEmpty)
+        await fixture.server.setNetworkAvailable(false)
+        fixture.closeLatestWebSocket()
+        await eventually { model.route == .bluetooth && model.state == .connected }
+        await client.disconnect()
+    }
+
+    func testStableNetworkReturnResumesSameSessionAndRetainsSubscription() async throws {
+        let fixture = RoutingFixture()
+        await fixture.server.setNetworkAvailable(false)
+        let client = makeClient(fixture)
+        try await client.connect()
+        let session = await client.currentSessionIdentifier()
+        let subscription = try await client.subscribe(to: .init(identifier: "test", addressableName: "test", displayName: "Test"))
+        await fixture.server.setNetworkAvailable(true)
+        let start = ContinuousClock.now
+        await client.checkPreferredControlRoute()
+        let route = await client.currentControlRoute()
+        let resumed = await client.currentSessionIdentifier()
+        XCTAssertEqual(route, .webSocket)
+        XCTAssertEqual(session, resumed)
+        XCTAssertGreaterThanOrEqual(start.duration(to: .now), .seconds(1))
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(summary.resumes, 1)
+        XCTAssertEqual(summary.subscriptions, 1)
+        try await client.setControl("test.light", to: .bool(true))
+        await client.disconnect()
+        _ = subscription
+    }
+
+    func testFailedNetworkProbeLeavesBluetoothSessionUsable() async throws {
+        let fixture = RoutingFixture()
+        await fixture.server.setNetworkAvailable(false)
+        let client = makeClient(fixture)
+        try await client.connect()
+        let session = await client.currentSessionIdentifier()
+        await client.checkPreferredControlRoute()
+        let route = await client.currentControlRoute()
+        let retained = await client.currentSessionIdentifier()
+        XCTAssertEqual(route, .bluetooth)
+        XCTAssertEqual(retained, session)
+        try await client.setControl("test.light", to: .bool(true))
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(summary.resumes, 0)
+        await client.disconnect()
+    }
+
+    func testPendingMutationsReplayInOriginalOrder() async throws {
+        let fixture = RoutingFixture()
+        let client = makeClient(fixture)
+        try await client.connect()
+        await fixture.server.holdNetworkMutations()
+        let first = Task { try await client.setControl("test.light", to: .bool(true)) }
+        await eventually { await fixture.server.summary().mutationIDs.count == 1 }
+        let second = Task { try await client.setControl("test.light", to: .bool(false)) }
+        await eventually { await fixture.server.summary().mutationIDs.count == 2 }
+        await fixture.server.setNetworkAvailable(false)
+        fixture.closeLatestWebSocket()
+        try await first.value
+        try await second.value
+        let values = await fixture.server.completedMutationValues()
+        XCTAssertEqual(values, [.bool(true), .bool(false)])
+        await client.disconnect()
+    }
+
+    func testExistingPresencePairingAutomaticallyUpgradesAndAcknowledgesSecretOverWebSocket() async throws {
+        let serverID = UUID(), registrationID = UUID(), controllerID = UUID()
+        let credential = HBBluetoothCnCCredential(controllerID: controllerID, registrationID: registrationID,
+            keyID: UUID(), secret: Data(repeating: 7, count: 32))
+        let store = CredentialStore(items: [.init(serverID: serverID, registrationID: registrationID, name: "Phone",
+            phase: .paired, offer: .init(controllerID: controllerID, registrationID: registrationID, token: "presence-only-token",
+                controllerName: "HomeBase", expiresAt: 0), peripheralID: UUID(), controllerID: controllerID)])
+        let service = BluetoothPresenceService(store: store, transport: CredentialPresenceTransport())
+        let fixture = RoutingFixture()
+        await fixture.server.setCredential(credential)
+        let client = HomeBaseWebSocketClient(endpoint: HomeBaseEndpoint(host: "routing.invalid", port: 10503)!,
+            clientID: serverID, requestTimeout: 2, makeControlSocket: { _ in fixture.webSocket() },
+            bluetoothServerID: serverID, bluetoothService: service, makeBluetoothTransport: { try await fixture.bluetooth() })
+        try await client.connect()
+        XCTAssertEqual(store.items.first?.cncCredential, credential)
+        XCTAssertEqual(store.items.first?.cncClientID, serverID)
+        XCTAssertEqual(store.items.first?.offer?.token, "presence-only-token")
+        let summary = await fixture.server.upgradeSummary()
+        XCTAssertEqual(summary.0, 1)
+        XCTAssertEqual(summary.1, 1, "The credential delivery must be acknowledged before fallback can resume its session")
+        let restored = BluetoothPresenceService(store: store, transport: CredentialPresenceTransport())
+        restored.start()
+        XCTAssertEqual(restored.registration(for: serverID)?.cncClientID, serverID)
+        await client.disconnect()
+    }
+
+    func testFailbackUpgradeCannotDeadlockAcknowledgementQueuedDuringResumeReplay() async throws {
+        let serverID = UUID(), registrationID = UUID(), controllerID = UUID()
+        let credential = HBBluetoothCnCCredential(controllerID: controllerID, registrationID: registrationID,
+            keyID: UUID(), secret: Data(repeating: 9, count: 32))
+        let store = CredentialStore(items: [.init(serverID: serverID, registrationID: registrationID, name: "Phone",
+            phase: .paired, offer: .init(controllerID: controllerID, registrationID: registrationID, token: "presence-token",
+                controllerName: "HomeBase", expiresAt: 0), peripheralID: UUID(), controllerID: controllerID)])
+        let service = BluetoothPresenceService(store: store, transport: CredentialPresenceTransport())
+        let fixture = RoutingFixture()
+        await fixture.server.setCredential(credential)
+        let client = HomeBaseWebSocketClient(endpoint: HomeBaseEndpoint(host: "routing.invalid", port: 10503)!,
+            clientID: serverID, requestTimeout: 2, makeControlSocket: { _ in fixture.webSocket() },
+            bluetoothServerID: serverID, bluetoothService: service, makeBluetoothTransport: { try await fixture.bluetooth() })
+        try await client.connect()
+        let subscription = try await client.subscribe(to: .init(identifier: "test", addressableName: "test", displayName: "Test"))
+        await fixture.server.setNetworkAvailable(false)
+        fixture.closeLatestWebSocket()
+        await eventually { await client.currentControlRoute() == .bluetooth }
+        await fixture.server.replayEventOnNextResume(subscription.identifier)
+        await fixture.server.setNetworkAvailable(true)
+        await client.checkPreferredControlRoute()
+        await eventually {
+            let summary = await fixture.server.upgradeSummary()
+            return summary.0 == 2 && summary.1 >= 3
+        }
+        let route = await client.currentControlRoute()
+        XCTAssertEqual(route, .webSocket)
+        await client.disconnect()
+        _ = subscription
+    }
+
+    func testCredentialCannotBeSavedForAnotherControllerOrRegistration() async throws {
+        let serverID = UUID(), registrationID = UUID(), controllerID = UUID()
+        let store = CredentialStore(items: [.init(serverID: serverID, registrationID: registrationID, name: "Phone", phase: .paired,
+            offer: .init(controllerID: controllerID, registrationID: registrationID, token: "presence", controllerName: "HomeBase", expiresAt: 0),
+            peripheralID: UUID(), controllerID: controllerID)])
+        let service = BluetoothPresenceService(store: store, transport: CredentialPresenceTransport())
+        service.start()
+        let wrong = HBBluetoothCnCCredential(controllerID: UUID(), registrationID: registrationID, keyID: UUID(), secret: Data(repeating: 1, count: 32))
+        XCTAssertThrowsError(try service.saveControlCredential(wrong, serverID: serverID, clientID: serverID))
+        XCTAssertNil(store.items.first?.cncCredential)
+        do { _ = try await service.controlTransport(serverID: serverID, clientID: serverID); XCTFail("Presence bearer alone must not authorize CnC") } catch { }
+    }
+
+    func testAttachmentDiscardsOldQueuedMessagesUntilMatchingResumeResponse() async throws {
+        let clientID = UUID()
+        let request = HBProtocolEnvelope(messageKind: .request, clientID: clientID, operation: HBProtocolOperations.resumeSession)
+        var state = BluetoothCnCAttachmentState()
+        state.begin(request)
+        let oldReply = HBProtocolEnvelope(messageKind: .response, clientID: clientID, operation: HBProtocolOperations.setControl)
+        XCTAssertEqual(state.receive(oldReply), .discard)
+        let staleDetach = HBProtocolEnvelope(messageKind: .event, clientID: clientID, operation: "bluetooth.cnc.detached")
+        XCTAssertEqual(state.receive(staleDetach), .discard)
+        let response = try HBProtocolEnvelope.response(to: request, body: .successWithoutResult)
+        XCTAssertEqual(state.receive(response), .message)
+        XCTAssertEqual(state.receive(oldReply), .message, "After matching handshake the server FIFO contains this attachment's deliveries")
+        let currentDetach = HBProtocolEnvelope(messageKind: .event, requestID: request.requestID, clientID: clientID, operation: "bluetooth.cnc.detached")
+        XCTAssertEqual(state.receive(currentDetach), .detached)
+        XCTAssertEqual(state.receive(oldReply), .discard)
+    }
+
+}
+
+private nonisolated final class RoutingFixture: @unchecked Sendable {
+    let server = RoutingServer()
+    private let lock = NSLock()
+    private var sockets: [RoutingSocket] = []
+    private var bluetoothTransports: [RoutingTransport] = []
+    var bluetoothCount: Int { lock.withLock { bluetoothTransports.count } }
+    var webSocketCount: Int { lock.withLock { sockets.count } }
+    func webSocket() -> any HomeBaseControlSocket {
+        let socket = RoutingSocket(server: server)
+        lock.withLock { sockets.append(socket) }
+        return socket
+    }
+    func bluetooth() async throws -> any HomeBaseControlTransport {
+        try Task.checkCancellation()
+        let transport = RoutingTransport(route: .bluetooth, server: server)
+        lock.withLock { bluetoothTransports.append(transport) }
+        return transport
+    }
+    func closeLatestWebSocket() { lock.withLock { sockets.last }?.cancel(with: .goingAway, reason: nil) }
+    func sendControlEvent(subscriptionID: UUID) async throws {
+        guard let transport = lock.withLock({ bluetoothTransports.last }) else { throw URLError(.notConnectedToInternet) }
+        let event = try await server.event(subscriptionID: subscriptionID)
+        await transport.inbox.push(try JSONEncoder().encode(event))
+    }
+}
+
+private nonisolated final class RoutingSocket: HomeBaseControlSocket, @unchecked Sendable {
+    let transport: RoutingTransport
+    var maximumMessageSize: Int { get { 16 * 1_024 * 1_024 } set {} }
+    init(server: RoutingServer) { transport = RoutingTransport(route: .webSocket, server: server) }
+    func resume() {}
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) { transport.close() }
+    func send(_ message: URLSessionWebSocketTask.Message) async throws {
+        switch message {
+        case .data: throw URLError(.badServerResponse) // The real control server rejects binary frames.
+        case .string(let value): try await transport.send(Data(value.utf8))
+        @unknown default: throw URLError(.badServerResponse)
+        }
+    }
+    func receive() async throws -> URLSessionWebSocketTask.Message { .data(try await transport.receive()) }
+}
+
+private nonisolated final class RoutingTransport: HomeBaseControlTransport, @unchecked Sendable {
+    let route: HomeBaseControlRoute
+    let server: RoutingServer
+    let inbox = RoutingInbox()
+    init(route: HomeBaseControlRoute, server: RoutingServer) { self.route = route; self.server = server }
+    func send(_ data: Data) async throws {
+        let request = try JSONDecoder().decode(HBProtocolEnvelope.self, from: data)
+        if let reply = try await server.reply(to: request, route: route) {
+            await inbox.push(try JSONEncoder().encode(reply))
+            for extra in try await server.extraMessages(after: request) { await inbox.push(try JSONEncoder().encode(extra)) }
+        }
+    }
+    func receive() async throws -> Data { try await inbox.receive() }
+    func close() { Task { await inbox.close() } }
+}
+
+private actor RoutingInbox {
+    private var queue: [Data] = []
+    private var waiter: CheckedContinuation<Data, Error>?
+    private var closed = false
+    func push(_ data: Data) { if let waiter { self.waiter = nil; waiter.resume(returning: data) } else if !closed { queue.append(data) } }
+    func receive() async throws -> Data {
+        if closed { throw URLError(.networkConnectionLost) }
+        if !queue.isEmpty { return queue.removeFirst() }
+        return try await withCheckedThrowingContinuation { waiter = $0 }
+    }
+    func close() { closed = true; waiter?.resume(throwing: URLError(.networkConnectionLost)); waiter = nil; queue.removeAll() }
+}
+
+private actor RoutingServer {
+    struct Summary: Sendable { let mutationIDs: [UUID]; let mutationExecutions: Int; let resumes: Int; let subscriptions: Int }
+    private let instance = UUID()
+    private var networkAvailable = true
+    private var openDelay: Duration = .zero
+    private var loseMutation = false
+    private var ignoreMutationReplay = false
+    private var rejectResumes = false
+    private var mutationIDs: [UUID] = []
+    private var holdingNetworkMutations = false
+    private var completedValues: [HBJSONValue] = []
+    func holdNetworkMutations() { holdingNetworkMutations = true }
+    func completedMutationValues() -> [HBJSONValue] { completedValues }
+    private var receipts: [UUID: HBProtocolEnvelope] = [:]
+    private var resumes = 0
+    private var subscriptions = 0
+    private var lastClientID = UUID()
+    private var credential: HBBluetoothCnCCredential?
+    private var upgrades = 0
+    private var acknowledged: Int64 = 0
+    private var deliverySequence: Int64 = 0
+    private var replaySubscription: UUID?
+    func replayEventOnNextResume(_ id: UUID) { replaySubscription = id }
+    func extraMessages(after request: HBProtocolEnvelope) throws -> [HBProtocolEnvelope] {
+        guard request.operation == HBProtocolOperations.resumeSession, let replaySubscription else { return [] }
+        self.replaySubscription = nil
+        return [try event(subscriptionID: replaySubscription)]
+    }
+    func setCredential(_ value: HBBluetoothCnCCredential) { credential = value }
+    func upgradeSummary() -> (Int, Int64) { (upgrades, acknowledged) }
+    private var lastSessionID = UUID()
+    func setNetworkAvailable(_ value: Bool) { networkAvailable = value }
+    func setOpenDelay(_ value: Duration) { openDelay = value }
+    func loseNextMutationReply(ignoreReplay: Bool = false, rejectResume: Bool = false) {
+        loseMutation = true; ignoreMutationReplay = ignoreReplay; rejectResumes = rejectResume
+    }
+    func summary() -> Summary { .init(mutationIDs: mutationIDs, mutationExecutions: receipts.count, resumes: resumes, subscriptions: subscriptions) }
+    func reply(to request: HBProtocolEnvelope, route: HomeBaseControlRoute) async throws -> HBProtocolEnvelope? {
+        if route == .webSocket, !networkAvailable { throw URLError(.notConnectedToInternet) }
+        lastClientID = request.clientID
+        var responseSession = request.sessionID
+        let body: HBProtocolResponse
+        switch request.operation {
+        case HBProtocolOperations.openSession:
+            if route == .webSocket, openDelay != .zero { try await Task.sleep(for: openDelay) }
+            let id = UUID(); responseSession = id; lastSessionID = id
+            body = try .success(HBWebSocketSessionOpened(sessionID: id, resumeToken: "resume", serverInstanceID: instance,
+                authorization: .administrator, limits: .init(resumeWindowSeconds: 60, maximumReplayMessages: 100,
+                    maximumReplayBytes: 100_000, maximumRequestRecords: 100)))
+        case HBProtocolOperations.resumeSession:
+            resumes += 1
+            let resume = try request.decodedPayload(as: HBWebSocketSessionResumeRequest.self)
+            responseSession = resume.sessionID; lastSessionID = resume.sessionID
+            body = rejectResumes ? .failure(.init(code: HBProtocolErrorCodes.resyncRequired, message: "expired")) :
+                try .success(HBWebSocketSessionResumed(sessionID: resume.sessionID, serverInstanceID: instance,
+                    replayedMessageCount: 0, latestDeliverySequence: resume.acknowledgedDeliverySequence))
+        case HBProtocolOperations.setControl:
+            mutationIDs.append(request.requestID)
+            if holdingNetworkMutations, route == .webSocket { return nil }
+            if let cached = receipts[request.requestID] { return ignoreMutationReplay ? nil : cached }
+            completedValues.append(try request.decodedPayload(as: HBControlSetRequest.self).value)
+            var response = try HBProtocolEnvelope.response(to: request, body: .successWithoutResult)
+            response.sessionID = request.sessionID
+            receipts[request.requestID] = response
+            if loseMutation { loseMutation = false; networkAvailable = false; throw URLError(.networkConnectionLost) }
+            return response
+        case HBProtocolOperations.listTopology:
+            body = try .success(HBTopologyListResult(devices: [], rooms: [], groups: []))
+        case HBProtocolOperations.streamControls:
+            subscriptions += 1
+            body = try .success(HBControlWatchStreamAccepted(subscriptionID: UUID(), controls: []))
+        case HBProtocolOperations.executeModuleCommand:
+            let command = try request.decodedPayload(as: HBModuleCommandRequest.self)
+            guard command.moduleName == HBBluetoothProtocol.moduleName, command.path == ["cnc", "enroll"], let credential else {
+                throw URLError(.badServerResponse)
+            }
+            upgrades += 1
+            body = try .success(HBModuleCommandResult(value: HBJSONValue(encoding: credential)))
+        case HBProtocolOperations.acknowledgeSession:
+            let ack = try request.decodedPayload(as: HBWebSocketSessionAckRequest.self)
+            acknowledged = ack.deliverySequence
+            body = try .success(HBWebSocketSessionAckResult(acknowledgedDeliverySequence: ack.deliverySequence))
+        default: body = .successWithoutResult
+        }
+        var result = try HBProtocolEnvelope.response(to: request, body: body)
+        result.sessionID = responseSession
+        if request.operation == HBProtocolOperations.executeModuleCommand { deliverySequence += 1; result.deliverySequence = deliverySequence }
+        return result
+    }
+    func event(subscriptionID: UUID) throws -> HBProtocolEnvelope {
+        var envelope = HBProtocolEnvelope(messageKind: .event, clientID: lastClientID, operation: HBProtocolOperations.streamControls,
+            payload: try HBJSONValue(encoding: HBControlWatchStreamEvent(subscriptionID: subscriptionID, sequence: 1, kind: .change, value: .bool(true))),
+            sessionID: lastSessionID, subscriptionID: subscriptionID)
+        deliverySequence += 1
+        envelope.deliverySequence = deliverySequence
+        return envelope
+    }
+}
+
+@MainActor private final class CredentialStore: BluetoothPresenceStoring {
+    // Avoid iOS 26.1 nested isolated-deinit runtime teardown (confirmed by ASan).
+    nonisolated deinit {}
+    var items: [BluetoothPresenceRegistration]
+    init(items: [BluetoothPresenceRegistration]) { self.items = items }
+    func load() throws -> [BluetoothPresenceRegistration] { items }
+    func save(_ registrations: [BluetoothPresenceRegistration]) throws { items = registrations }
+}
+@MainActor private final class CredentialPresenceTransport: BluetoothPresenceTransporting {
+    nonisolated deinit {}
+    var onEvent: ((BluetoothPresenceTransportEvent) -> Void)?
+    func synchronize(_ registrations: [BluetoothPresenceRegistration]) {}
+    func showPicker(for registration: BluetoothPresenceRegistration) throws {}
+    func removeAccessory(peripheralID: UUID) {}
+    func retryConnections() {}
+}
