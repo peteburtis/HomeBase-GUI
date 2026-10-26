@@ -41,12 +41,38 @@ but discovery waits for the manager's powered-on callback. Restored peripheral
 delegates are reassigned and the current GATT identity/PSM is read again because
 streams are not restorable. An out-of-range connection request remains pending in iOS.
 A controller recovery notification reopens an absent stream without replacing
-a healthy stream. Immediate stream retries are bounded, with at most three
-recovery attempts per five minutes on a connected link even if a short session
-successfully opens between failures. The budget is checked only when events
-arrive, using monotonic time; it has no wakeup timer. An explicit Reconnect
-button resets this budget and permits recovery without CnC. A single setup deadline is canceled
-after acknowledgement and is not used to measure presence.
+a healthy stream. A physical disconnect after an authenticated session immediately
+submits another connection request. A disconnect during unfinished setup uses
+the failure cooldown. Transient discovery, stream, and setup failures reset the failed local
+connection and retry with 1, 2, 4, 8, 16, then at most 30 seconds of delay, without
+an attempt limit. The app enforces this cooldown before issuing a plain
+`connect` request, so immediate framework rejection cannot bypass the delay.
+Retry and setup deadlines use `ContinuousClock`, which advances across device
+sleep. Once a connection request is submitted, CoreBluetooth owns the indefinite
+out-of-range wait. A short successful session does not reset the backoff; a
+connection that lasted at least a minute does. Identity and authentication
+rejection remain terminal until an explicit Reconnect, with no token sent to an
+unexpected controller.
+
+The enrollment service observes application lifecycle once, independently of
+tabs and WebSocket routing. A true background-to-foreground transition refreshes
+the presence handshake over an owned Bluetooth connection, or repairs stale
+pending state if the peripheral is disconnected. Valid OS-owned connection
+requests and unexpired setup attempts are retained. Permission dialogs and other
+transient inactivity do not cause refreshes. Pending control callers survive the
+refresh; a previously attached Bluetooth control transport reopens normally.
+The server's departure grace covers a prompt replacement presence handshake.
+
+GATT/L2CAP/presence setup has one 25-second deadline and a finite UIKit background
+task. Success, failure, or expiration ends that task. A separate finite background
+task protects a scheduled retry cooldown. If that allowance expires, the app ends
+the assertion and retains the retry deadline for foregrounding or a later system
+wake; it does not skip the delay or repeatedly request more background time.
+These tasks cannot guarantee execution while suspended, and neither is held
+waiting for radio range. Foreground reconciliation resumes any due retry.
+Unified logs in `io.pjb.HomeBase-GUI` / `BluetoothPresence` record lifecycle,
+radio, setup, authentication, retry, and stream transitions with correlation IDs
+and framework error codes, excluding credentials and message contents.
 
 Remove Pairing disables the local transport immediately and stores a removal
 tombstone. Server deletion is retried when that saved server's CnC connection
@@ -166,6 +192,11 @@ Before relying on this for automations, test on a physical Mac and iPhone:
    ensuring no duplicate phone controls and preservation of the selected token.
 7. Select a different nearby HomeBase controller during setup. Verify identity
    mismatch is shown and no registration token is sent to that controller.
+8. With WebSocket available, leave and return while presence is disconnected,
+   then foreground the app without force-quitting. Confirm presence recovers;
+   repeat with only Bluetooth available and with several setup failures. Check
+   that retries continue after the old attempt limit and capture both devices'
+   `BluetoothPresence` logs if recovery stalls.
 
 Presence retains its prototype bearer-token enrollment rooted in the existing
 CnC connection. The separate control upgrade never accepts that bearer
@@ -176,7 +207,33 @@ as authority for ordinary CnC commands.
 The installed initial client reports Not Nearby when the phone's Bluetooth is
 turned off and Nearby after it is turned back on. Force-quitting the app drops
 presence while iOS may retain the accessory's system connection. Manually reopening
-that client did not recover presence until a Bluetooth power cycle. Source fixes
-now distinguish local connection ownership from system connectivity and defer
-restored discovery until CoreBluetooth is ready; this relaunch fix still needs
-installation and verification on the physical phone.
+that client did not recover presence until a Bluetooth power cycle. Subsequent
+fixes distinguish local connection ownership from system connectivity and defer
+restored discovery until CoreBluetooth is ready; relaunch now restores presence.
+
+A later outing exposed an earlier connection failure: the Mac logged link loss
+at 18:13:19, presence became Not Nearby at 18:13:30, the door opened on return at
+19:00:53, and relaunch restored presence at 19:08:17. Phone diagnostics were not
+available to identify the stalled branch. Foreground reconciliation, native
+connection requests with app-enforced retry cooldowns, bounded setup/retry
+activity, and lifecycle logging address the known recovery gaps. A full outing
+and return with the updated client still needs device validation.
+
+A device test of the first recovery implementation connected initially with a
+zero `CBConnectPeripheralOptionStartDelayKey` value. After the daemon restarted,
+subsequent connection requests failed immediately with `CBErrorDomain` code 1
+(`invalidParameters`), bypassing the requested native delay and producing a rapid
+retry loop. The implementation now omits that option and enforces cooldowns in
+the app. This removes the dependency on CoreBluetooth applying a delay before
+rejecting a request. With the corrected build on Parkaboy, a controller restart
+at 19:45:19 restored authenticated presence at 19:45:22 without restarting the
+phone app (about 2.5 seconds after advertising resumed). The precise reason the
+framework rejected the earlier connect options is not established.
+
+A second restart at 19:45:54, after iOS suspended the app, did not restore
+presence during the next roughly 36 seconds. Phone logs showed no intervening
+app recovery callbacks. Bringing the same process forward at 19:46:30 restored
+authenticated presence at 19:46:31, without force-quitting or Bluetooth cycling.
+This verifies foreground recovery but leaves daemon-restart wakeup while fully
+suspended as a known limitation; it does not establish out-of-range return
+behavior. The installed app includes the `bluetooth-central` background mode.

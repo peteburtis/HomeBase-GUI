@@ -2,6 +2,9 @@ import Combine
 import Foundation
 import HomeBaseProtocol
 import Security
+#if os(iOS)
+import UIKit
+#endif
 
 /// Enrollment is saved before either network can complete it. A lost reply or
 /// process exit can therefore resume the same registration instead of duplicating it.
@@ -93,6 +96,7 @@ protocol BluetoothPresenceCommanding: Sendable {
 enum BluetoothPresenceTransportEvent {
     case selected(serverID: UUID, peripheralID: UUID)
     case opened(serverID: UUID)
+    case closed(serverID: UUID)
     case status(serverID: UUID, message: String)
     case cancelled(serverID: UUID, registrationID: UUID, message: String?)
     case revoked(serverID: UUID)
@@ -106,10 +110,13 @@ protocol BluetoothPresenceTransporting: AnyObject {
     func showPicker(for registration: BluetoothPresenceRegistration) throws
     func removeAccessory(peripheralID: UUID)
     func retryConnections()
+    func setForeground(_ isForeground: Bool)
     func controlTransport(serverID: UUID, clientID: UUID) async throws -> any HomeBaseControlTransport
 }
 
 extension BluetoothPresenceTransporting {
+    func setForeground(_ isForeground: Bool) {}
+
     func controlTransport(serverID: UUID, clientID: UUID) async throws -> any HomeBaseControlTransport {
         throw HomeBaseControlTransportError.unavailable
     }
@@ -120,20 +127,35 @@ final class BluetoothPresenceService: ObservableObject {
     static let shared = BluetoothPresenceService()
     @Published private(set) var registrations: [BluetoothPresenceRegistration] = []
     @Published private(set) var messages: [UUID: String] = [:]
+    @Published private(set) var connectedServerIDs: Set<UUID> = []
     @Published private(set) var errorMessage: String?
     @Published private(set) var busyServers: Set<UUID> = []
     private let store: any BluetoothPresenceStoring
     private var transport: (any BluetoothPresenceTransporting)?
     private var loaded = false
+    private let notificationCenter: NotificationCenter
+    private let applicationIsForeground: () -> Bool
+    private var lifecycleObservations: Set<AnyCancellable> = []
+    private var isForeground: Bool?
     private var locallyDisabled: Set<UUID> = []
     private var cleaningServers: [UUID: Task<Void, Never>] = [:]
     // Retain CnC only while an unselected system picker needs a cancellation path.
     private var commandClients: [UUID: any BluetoothPresenceCommanding] = [:]
 
     init(store: (any BluetoothPresenceStoring)? = nil,
-         transport: (any BluetoothPresenceTransporting)? = nil) {
+         transport: (any BluetoothPresenceTransporting)? = nil,
+         notificationCenter: NotificationCenter = .default,
+         applicationIsForeground: (() -> Bool)? = nil) {
         self.store = store ?? BluetoothPresenceKeychainStore()
         self.transport = transport
+        self.notificationCenter = notificationCenter
+        self.applicationIsForeground = applicationIsForeground ?? {
+#if os(iOS)
+            UIApplication.shared.applicationState != .background
+#else
+            true
+#endif
+        }
     }
 
     func start() {
@@ -153,7 +175,35 @@ final class BluetoothPresenceService: ObservableObject {
 #endif
             transport?.onEvent = { [weak self] event in self?.received(event) }
             transport?.synchronize(registrations)
+            observeApplicationLifecycle()
         } catch { errorMessage = BluetoothPresenceError.persistence.localizedDescription }
+    }
+
+    private func observeApplicationLifecycle() {
+#if os(iOS)
+        // Observe the process once, independent of tabs, windows, or the CnC
+        // route. Inactive transitions (including permission sheets) must not
+        // interrupt a healthy presence connection or trigger repeated probes.
+        notificationCenter.publisher(for: UIApplication.didEnterBackgroundNotification)
+            .sink { [weak self] _ in self?.setForeground(false) }
+            .store(in: &lifecycleObservations)
+        // Reconcile before foreground screens resume their CnC requests.
+        notificationCenter.publisher(for: UIApplication.willEnterForegroundNotification)
+            .sink { [weak self] _ in self?.setForeground(true) }
+            .store(in: &lifecycleObservations)
+        // An initial launch can become active without willEnterForeground.
+        // Deduplication keeps this from repeating the foreground reconciliation.
+        notificationCenter.publisher(for: UIApplication.didBecomeActiveNotification)
+            .sink { [weak self] _ in self?.setForeground(true) }
+            .store(in: &lifecycleObservations)
+#endif
+        setForeground(applicationIsForeground())
+    }
+
+    private func setForeground(_ isForeground: Bool) {
+        guard self.isForeground != isForeground else { return }
+        self.isForeground = isForeground
+        transport?.setForeground(isForeground)
     }
 
     func registrationForControlUpgrade(serverID: UUID) -> BluetoothPresenceRegistration? {
@@ -309,6 +359,7 @@ final class BluetoothPresenceService: ObservableObject {
     /// tombstone survives relaunch until the server acknowledges its removal.
     func remove(serverID: UUID) {
         guard var item = registration(for: serverID) else { return }
+        connectedServerIDs.remove(serverID)
         commandClients.removeValue(forKey: serverID)
         let peripheralID = item.peripheralID
         locallyDisabled.insert(serverID)
@@ -430,11 +481,15 @@ final class BluetoothPresenceService: ObservableObject {
                 transport?.synchronize(registrations.filter { !locallyDisabled.contains($0.serverID) })
             } catch { errorMessage = BluetoothPresenceError.persistence.localizedDescription }
         case .opened(let serverID):
-            guard var item = registration(for: serverID), item.phase != .removing else { return }
+            guard !locallyDisabled.contains(serverID), var item = registration(for: serverID), item.phase != .removing else { return }
+            connectedServerIDs.insert(serverID)
             commandClients.removeValue(forKey: serverID)
             item.phase = .paired
             do { try replace(item); messages[serverID] = "Connected over Bluetooth" }
             catch { errorMessage = BluetoothPresenceError.persistence.localizedDescription }
+        case .closed(let serverID):
+            connectedServerIDs.remove(serverID)
+            if messages[serverID] == "Connected over Bluetooth" { messages.removeValue(forKey: serverID) }
         case .status(let serverID, let message): messages[serverID] = message
         case .cancelled(let serverID, let registrationID, let message):
             let item = registration(for: serverID)

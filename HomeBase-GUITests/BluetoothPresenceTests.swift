@@ -32,6 +32,14 @@ final class BluetoothPresenceTests: XCTestCase {
         fixture.transport.onEvent?(.opened(serverID: fixture.serverID))
         XCTAssertEqual(fixture.service.registration(for: fixture.serverID)?.phase, .paired)
         XCTAssertEqual(fixture.service.registration(for: fixture.serverID)?.name, "My iPhone")
+        XCTAssertTrue(fixture.service.connectedServerIDs.contains(fixture.serverID))
+        fixture.service.controlUpgradeFailed(serverID: fixture.serverID, error: BluetoothPresenceError.invalidReply)
+        XCTAssertTrue(fixture.service.connectedServerIDs.contains(fixture.serverID),
+                      "A control-upgrade diagnostic does not close authenticated Bluetooth presence")
+        fixture.transport.onEvent?(.closed(serverID: fixture.serverID))
+        XCTAssertFalse(fixture.service.connectedServerIDs.contains(fixture.serverID))
+        XCTAssertEqual(fixture.service.registration(for: fixture.serverID)?.phase, .paired,
+                       "Disconnecting preserves pairing while clearing the connected diagnostic")
     }
 
     func testCnCClientIsRetainedOnlyWhileUnselectedPickerIsActive() async {
@@ -231,6 +239,7 @@ final class BluetoothPresenceTests: XCTestCase {
         fixture.transport.onEvent?(.opened(serverID: fixture.serverID))
         fixture.service.remove(serverID: fixture.serverID)
         XCTAssertTrue(fixture.transport.synchronized.last?.allSatisfy { $0.phase == .removing } == true)
+        XCTAssertFalse(fixture.service.connectedServerIDs.contains(fixture.serverID))
         XCTAssertEqual(fixture.transport.removed, [peripheral])
         XCTAssertNil(fixture.store.saves.last?.first?.offer)
         fixture.commands.failRemoval = true
@@ -401,14 +410,91 @@ final class BluetoothPresenceTests: XCTestCase {
                        "An idle owned connection can rediscover after its previous session ends")
     }
 
-    func testRecoveryBudgetStopsRepeatedWakeupsAndReplenishesOnlyOnLaterEvents() async {
-        var budget = BluetoothPresenceRecoveryBudget()
-        XCTAssertTrue(budget.consume(now: 100))
-        XCTAssertTrue(budget.consume(now: 110))
-        XCTAssertTrue(budget.consume(now: 120))
-        XCTAssertFalse(budget.consume(now: 130))
-        XCTAssertFalse(budget.consume(now: 399))
-        XCTAssertTrue(budget.consume(now: 400))
+    func testRecoveryContinuesBeyondOldRetryLimitWithCappedBackoff() async {
+        var policy = BluetoothPresenceRetryPolicy()
+        XCTAssertEqual((0..<10).map { policy.nextDelay(now: Double($0)) },
+                       [1, 2, 4, 8, 16, 30, 30, 30, 30, 30])
+        for attempt in 10..<1_000 {
+            XCTAssertEqual(policy.nextDelay(now: Double(attempt)), 30,
+                           "Retries must stay available rather than wait forever for an unrelated event")
+        }
+    }
+
+    func testImmediateFrameworkFailuresCannotSpinConnectionRequests() async {
+        var state = BluetoothPresenceConnectionState()
+        var policy = BluetoothPresenceRetryPolicy()
+        var now: TimeInterval = 0
+        XCTAssertEqual(state.action(poweredOn: true, peripheralConnected: false, sessionActive: false), .connect)
+        for expectedDelay: TimeInterval in [1, 2, 4, 8, 16, 30, 30, 30] {
+            // Model CoreBluetooth rejecting each submitted request immediately.
+            state.disconnected()
+            policy.nextDelay(now: now)
+            for _ in 0..<100 {
+                XCTAssertEqual(state.action(poweredOn: true, peripheralConnected: false, sessionActive: false,
+                                            retryDelay: policy.remainingDelay(now: now)), .retryAfter(expectedDelay))
+                XCTAssertFalse(state.connectionPending, "A local cooldown is not a pending CoreBluetooth request")
+            }
+            now += expectedDelay
+            XCTAssertEqual(state.action(poweredOn: true, peripheralConnected: false, sessionActive: false,
+                                        retryDelay: policy.remainingDelay(now: now)), .connect)
+            XCTAssertEqual(state.action(poweredOn: true, peripheralConnected: false, sessionActive: false,
+                                        retryDelay: policy.remainingDelay(now: now)), .wait,
+                           "Each elapsed deadline may submit only one request")
+        }
+    }
+
+    func testForegroundAndRadioRecoveryRespectRemainingCooldown() async {
+        var state = BluetoothPresenceConnectionState()
+        var policy = BluetoothPresenceRetryPolicy()
+        policy.nextDelay(now: 10)
+        state.reconcile(peripheralDisconnected: true)
+        XCTAssertEqual(state.action(poweredOn: false, peripheralConnected: false, sessionActive: false,
+                                    retryDelay: policy.remainingDelay(now: 10.5)), .wait)
+        XCTAssertEqual(state.action(poweredOn: true, peripheralConnected: false, sessionActive: false,
+                                    retryDelay: policy.remainingDelay(now: 10.5)), .retryAfter(0.5))
+        XCTAssertEqual(state.action(poweredOn: true, peripheralConnected: false, sessionActive: false,
+                                    retryDelay: policy.remainingDelay(now: 300)), .connect,
+                       "A suspended cooldown must not restart after the app resumes")
+        XCTAssertEqual(state.action(poweredOn: true, peripheralConnected: false, sessionActive: false,
+                                    retryDelay: policy.remainingDelay(now: 301)), .wait,
+                       "An out-of-range request stays pending without polling")
+    }
+
+    func testForegroundRepairsStalePendingConnectionWithoutDuplicatingValidRequest() async {
+        var state = BluetoothPresenceConnectionState(restoredConnecting: true)
+        state.reconcile(peripheralDisconnected: false)
+        XCTAssertEqual(state.action(poweredOn: true, peripheralConnected: false, sessionActive: false), .wait,
+                       "A valid CoreBluetooth pending connection must remain owned by the system")
+        state.reconcile(peripheralDisconnected: true)
+        XCTAssertEqual(state.action(poweredOn: true, peripheralConnected: false, sessionActive: false), .connect,
+                       "Foreground must repair a pending flag when the OS has no connection")
+        XCTAssertEqual(state.action(poweredOn: true, peripheralConnected: false, sessionActive: false), .wait,
+                       "The repaired connection is submitted exactly once")
+    }
+
+    func testForegroundCanRefreshPresenceWithoutReconnectingAnOwnedRadioLink() async {
+        var state = BluetoothPresenceConnectionState(restoredConnected: true)
+        state.reconcile(peripheralDisconnected: false)
+        XCTAssertEqual(state.action(poweredOn: true, peripheralConnected: true, sessionActive: true), .wait)
+        XCTAssertEqual(state.action(poweredOn: true, peripheralConnected: true, sessionActive: false), .discover,
+                       "Closing the old presence stream must permit a fresh handshake on the owned link")
+    }
+
+    func testBriefSuccessCannotResetRepeatedFailureBackoff() async {
+        var policy = BluetoothPresenceRetryPolicy()
+        XCTAssertEqual(policy.nextDelay(now: 0), 1)
+        policy.connected(now: 1)
+        XCTAssertEqual(policy.nextDelay(now: 2), 2)
+        policy.connected(now: 4)
+        XCTAssertEqual(policy.nextDelay(now: 5), 4)
+    }
+
+    func testStableConnectionResetsRetryBackoff() async {
+        var policy = BluetoothPresenceRetryPolicy()
+        for attempt in 0..<8 { _ = policy.nextDelay(now: Double(attempt)) }
+        policy.connected(now: 10)
+        XCTAssertEqual(policy.nextDelay(now: 70), 1)
+        XCTAssertEqual(policy.nextDelay(now: 71), 2)
     }
 
     func testHandshakeRequiresMatchingResponseAndSupportsFragmentedFrames() async throws {

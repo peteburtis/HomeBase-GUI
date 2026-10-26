@@ -3,6 +3,7 @@ import AccessorySetupKit
 import CoreBluetooth
 import Foundation
 import HomeBaseProtocol
+import OSLog
 import UIKit
 
 /// CoreBluetooth owns idle radio connections while the app is suspended. This
@@ -26,6 +27,15 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
     private let serviceUUID = CBUUID(string: HBBluetoothProtocol.serviceUUID)
     private let identityUUID = CBUUID(string: HBBluetoothProtocol.identityCharacteristicUUID)
     private let recoveryUUID = CBUUID(string: HBBluetoothProtocol.recoveryCharacteristicUUID)
+    private static let logger = Logger(subsystem: "io.pjb.HomeBase-GUI", category: "BluetoothPresence")
+    private static let clockOrigin = ContinuousClock.now
+    private var isForeground: Bool?
+    private var backgroundTimeExpired = false
+
+    private var recoveryTime: TimeInterval {
+        let elapsed = Self.clockOrigin.duration(to: .now).components
+        return Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+    }
 
     private final class Link {
         var registration: BluetoothPresenceRegistration
@@ -37,12 +47,19 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         var opening = false
         var authenticated = false
         var discovering = false
-        var retries = 0
-        var recoveryBudget = BluetoothPresenceRecoveryBudget()
+        var retryPolicy = BluetoothPresenceRetryPolicy()
+        var reconnectTask: Task<Void, Never>?
+        var reconnectID: UUID?
+        var reconnectActivity: UIBackgroundTaskIdentifier = .invalid
+        var cancellingConnection = false
+        var automaticRetryBlocked = false
         var handshake: BluetoothPresenceHandshake?
         var output = Data()
         var decoder = HBBluetoothFrameDecoder()
         var timeout: Task<Void, Never>?
+        var setupDeadline: TimeInterval?
+        var setupID: UUID?
+        var backgroundTask: UIBackgroundTaskIdentifier = .invalid
         var cncHandshake: HBBluetoothCnCClientHandshake?
         var cncHandshakeRequestID: UUID?
         var cncTimeout: Task<Void, Never>?
@@ -207,6 +224,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
             pickerRegistration = nil
         }
         for (identifier, link) in contexts where !self.registrations.contains(where: { $0.peripheralID == identifier }) {
+            cancelReconnect(link)
             close(link)
             disconnectWhenReady(link.peripheral)
             contexts.removeValue(forKey: identifier)
@@ -227,6 +245,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
 
     private func activate() {
         if central == nil {
+            Self.logger.notice("Creating Bluetooth central with state restoration")
             central = CBCentralManager(delegate: self, queue: .main, options: [
                 CBCentralManagerOptionRestoreIdentifierKey: "io.pjb.HomeBase-GUI.bluetooth-presence.central",
                 CBCentralManagerOptionShowPowerAlertKey: false
@@ -356,6 +375,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        Self.logger.notice("Bluetooth radio state=\(central.state.rawValue)")
         if central.state == .poweredOn {
             for peripheral in peripheralsToDisconnect.values {
                 central.cancelPeripheralConnection(peripheral)
@@ -365,8 +385,10 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
             return
         }
         for link in contexts.values {
+            cancelReconnect(link)
             close(link)
             link.connection.disconnected()
+            link.cancellingConnection = false
         }
         let message: String
         switch central.state {
@@ -389,6 +411,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
                 restoredConnected: peripheral.state == .connected,
                 restoredConnecting: peripheral.state == .connecting)
             contexts[peripheral.identifier] = link
+            log("restored", link: link)
             peripheral.delegate = self
             // Restoration arrives before the manager's state callback. Retain
             // its local connection, but wait for poweredOn before GATT work.
@@ -420,18 +443,67 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
     }
 
     private func continueConnection(_ link: Link) {
-        guard let central else { return }
+        guard let central, !link.automaticRetryBlocked, !link.cancellingConnection else { return }
         switch link.connection.action(poweredOn: central.state == .poweredOn,
                                       peripheralConnected: link.peripheral.state == .connected,
-                                      sessionActive: link.channel != nil || link.discovering || link.opening) {
+                                      sessionActive: link.channel != nil || link.discovering || link.opening,
+                                      retryDelay: link.retryPolicy.remainingDelay(now: recoveryTime)) {
         case .wait: break
+        case .retryAfter(let delay):
+            scheduleReconnect(link, after: delay)
         case .connect:
+            cancelReconnect(link)
             onEvent?(.status(serverID: link.registration.serverID,
                 message: "Waiting for the controller to come within Bluetooth range"))
+            log("connect requested", link: link)
+            // Once submitted, CoreBluetooth owns the indefinite out-of-range
+            // wait. Enforce failure backoff locally: the OS can reject connect
+            // options immediately, before applying a requested start delay.
             central.connect(link.peripheral)
         case .discover:
+            cancelReconnect(link)
             discover(link)
         }
+    }
+
+    private func scheduleReconnect(_ link: Link, after delay: TimeInterval) {
+        guard link.reconnectTask == nil else { return }
+        let id = UUID()
+        link.reconnectID = id
+        log("retry scheduled delay=\(delay)s", link: link)
+        if !backgroundTimeExpired {
+            link.reconnectActivity = UIApplication.shared.beginBackgroundTask(withName: "Bluetooth reconnect") { [weak self, weak link] in
+                MainActor.assumeIsolated {
+                    guard let self, let link, link.reconnectID == id else { return }
+                    self.backgroundTimeExpired = true
+                    self.log("retry background time expired", link: link)
+                    self.endReconnectActivity(link)
+                    // Retain the deadline/task. Foreground or a Bluetooth wake
+                    // will reconcile it; expiration must not bypass backoff.
+                }
+            }
+        }
+        link.reconnectTask = Task { [weak self, weak link] in
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard let self, let link, self.contexts[link.peripheral.identifier] === link,
+                  link.reconnectID == id else { return }
+            self.cancelReconnect(link)
+            self.continueConnection(link)
+        }
+    }
+
+    private func cancelReconnect(_ link: Link) {
+        link.reconnectTask?.cancel()
+        link.reconnectTask = nil
+        link.reconnectID = nil
+        endReconnectActivity(link)
+    }
+
+    private func endReconnectActivity(_ link: Link) {
+        guard link.reconnectActivity != .invalid else { return }
+        let task = link.reconnectActivity
+        link.reconnectActivity = .invalid
+        UIApplication.shared.endBackgroundTask(task)
     }
 
     private func disconnectWhenReady(_ peripheral: CBPeripheral) {
@@ -444,24 +516,77 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
 
     func retryConnections() {
         for link in contexts.values {
-            link.retries = 0
-            link.recoveryBudget = BluetoothPresenceRecoveryBudget()
+            cancelReconnect(link)
+            link.automaticRetryBlocked = false
+            link.retryPolicy = BluetoothPresenceRetryPolicy()
+            reconcile(link, reason: "manual reconnect")
         }
         connectSavedPeripherals()
     }
 
+    func setForeground(_ foreground: Bool) {
+        guard isForeground != foreground else { return }
+        let returning = isForeground == false && foreground
+        isForeground = foreground
+        if foreground { backgroundTimeExpired = false }
+        Self.logger.notice("Application foreground=\(foreground)")
+        guard returning else { return }
+        // Once per app transition, not per tab. Refresh the presence handshake
+        // instead of treating a retained Stream object as proof of liveness.
+        for link in contexts.values {
+            // Renew a previously expired background assertion if needed, but
+            // preserve the original retry deadline when re-arming its task.
+            cancelReconnect(link)
+            reconcile(link, reason: "foreground")
+        }
+        connectSavedPeripherals()
+    }
+
+    private func reconcile(_ link: Link, reason: String) {
+        log("reconcile \(reason)", link: link)
+        guard central?.state == .poweredOn, !link.automaticRetryBlocked else { return }
+        link.connection.reconcile(peripheralDisconnected: link.peripheral.state == .disconnected)
+        if link.peripheral.state == .disconnected {
+            link.cancellingConnection = false
+        }
+        guard !link.cancellingConnection else { return }
+        if !link.authenticated && (link.discovering || link.opening || link.setupDeadline != nil) {
+            if let deadline = link.setupDeadline, deadline > recoveryTime {
+                return // An actual, bounded setup is already in progress.
+            }
+            failed(link, message: "Bluetooth setup timed out; reconnecting.", retry: true, reason: "expired setup on foreground")
+            return
+        }
+        // Do not cancel a genuine OS-owned pending connection while away.
+        // A stale pending flag with a disconnected peripheral was cleared above.
+        close(link, preserveControlWaiter: true)
+        continueConnection(link)
+    }
+
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         guard let link = contexts[peripheral.identifier] else { return }
-        link.recoveryBudget = BluetoothPresenceRecoveryBudget()
+        log("connected", link: link)
+        guard !link.automaticRetryBlocked, !link.cancellingConnection else {
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
         link.connection.connected()
+        cancelReconnect(link)
         discover(link)
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         guard let link = contexts[peripheral.identifier] else { return }
+        log("disconnected", link: link, error: error)
+        let interruptedSetup = !link.cancellingConnection && !link.authenticated &&
+            (link.discovering || link.opening || link.channel != nil)
         close(link)
+        link.cancellingConnection = false
         link.connection.disconnected()
-        onEvent?(.status(serverID: link.registration.serverID, message: "Waiting for the controller to come within Bluetooth range"))
+        if interruptedSetup { link.retryPolicy.nextDelay(now: recoveryTime) }
+        if !link.automaticRetryBlocked {
+            onEvent?(.status(serverID: link.registration.serverID, message: "Waiting for the controller to come within Bluetooth range"))
+        }
         // This request is left pending in CoreBluetooth while away. There is no
         // scan loop or timer waking the application to look for the controller.
         continueConnection(link)
@@ -469,12 +594,18 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         guard let link = contexts[peripheral.identifier] else { return }
+        log("connect failed", link: link, error: error)
+        let wasCancelling = link.cancellingConnection
+        link.cancellingConnection = false
         link.connection.disconnected()
-        failed(link, message: "Bluetooth could not connect. Try again when near the controller.", retry: false)
-        if central.state == .poweredOn, link.retries < 2 {
-            link.retries += 1
-            continueConnection(link)
+        close(link)
+        if !wasCancelling {
+            link.retryPolicy.nextDelay(now: recoveryTime)
         }
+        if !link.automaticRetryBlocked {
+            onEvent?(.status(serverID: link.registration.serverID, message: "Bluetooth could not connect; retrying automatically."))
+        }
+        continueConnection(link)
     }
 
     private func discover(_ link: Link) {
@@ -485,25 +616,28 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         link.identity = nil
         link.recovery = nil
         link.peripheral.delegate = self
+        log("discovering services", link: link)
         link.peripheral.discoverServices([serviceUUID])
         startTimeout(link)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let link = contexts[peripheral.identifier] else { return }
+        guard let link = contexts[peripheral.identifier], link.discovering, !link.cancellingConnection else { return }
+        log("services discovered", link: link, error: error)
         guard error == nil, let service = peripheral.services?.first(where: { $0.uuid == serviceUUID }) else {
-            failed(link, message: "The selected accessory does not provide HomeBase Bluetooth presence.", retry: false)
+            failed(link, message: "HomeBase Bluetooth services could not be discovered.", retry: true, reason: "service discovery")
             return
         }
         peripheral.discoverCharacteristics([identityUUID, recoveryUUID], for: service)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        guard let link = contexts[peripheral.identifier] else { return }
+        guard let link = contexts[peripheral.identifier], link.discovering, !link.cancellingConnection else { return }
+        log("characteristics discovered", link: link, error: error)
         link.identity = service.characteristics?.first(where: { $0.uuid == identityUUID })
         link.recovery = service.characteristics?.first(where: { $0.uuid == recoveryUUID })
         guard error == nil, link.identity != nil, let recovery = link.recovery else {
-            failed(link, message: "The controller is missing required Bluetooth characteristics.", retry: false)
+            failed(link, message: "The controller's Bluetooth characteristics could not be discovered.", retry: true, reason: "characteristic discovery")
             return
         }
         if recovery.isNotifying { readIdentity(link) }
@@ -511,9 +645,11 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
-        guard let link = contexts[peripheral.identifier], characteristic.uuid == recoveryUUID else { return }
+        guard let link = contexts[peripheral.identifier], link.discovering, !link.cancellingConnection,
+              characteristic.uuid == recoveryUUID else { return }
+        log("recovery subscription updated", link: link, error: error)
         guard error == nil, characteristic.isNotifying else {
-            failed(link, message: "Bluetooth recovery notifications could not be enabled.", retry: false)
+            failed(link, message: "Bluetooth recovery notifications could not be enabled.", retry: true, reason: "recovery subscription")
             return
         }
         readIdentity(link)
@@ -524,13 +660,19 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard let link = contexts[peripheral.identifier] else { return }
+        guard let link = contexts[peripheral.identifier], !link.cancellingConnection else { return }
         if characteristic.uuid == recoveryUUID {
+            log("recovery notification", link: link, error: error)
             // A delayed notification must never replace a healthy connection.
             if link.channel == nil, !link.opening, !link.discovering { recover(link) }
             return
         }
-        guard characteristic.uuid == identityUUID, link.channel == nil, !link.opening else { return }
+        guard characteristic.uuid == identityUUID, link.discovering, link.channel == nil, !link.opening else { return }
+        log("identity read", link: link, error: error)
+        if error != nil {
+            failed(link, message: "Bluetooth controller identity could not be read.", retry: true, reason: "identity read")
+            return
+        }
         do {
             guard error == nil, let data = characteristic.value, let offer = link.registration.offer else {
                 throw BluetoothPresenceError.invalidReply
@@ -539,11 +681,12 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
             link.handshake = try BluetoothPresenceHandshake(identity: identity, offer: offer)
             link.discovering = false
             link.opening = true
+            log("opening L2CAP", link: link)
             peripheral.openL2CAPChannel(identity.psm)
         } catch {
             // Identity mismatch is terminal for this selection. No token leaves
             // the phone before this verification succeeds.
-            failed(link, message: error.localizedDescription, retry: false)
+            failed(link, message: error.localizedDescription, retry: false, reason: "identity validation")
         }
     }
 
@@ -551,7 +694,8 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         guard let link = contexts[peripheral.identifier] else {
             channel?.inputStream.close(); channel?.outputStream.close(); return
         }
-        guard link.opening else { channel?.inputStream.close(); channel?.outputStream.close(); return }
+        guard link.opening, !link.cancellingConnection else { channel?.inputStream.close(); channel?.outputStream.close(); return }
+        log("L2CAP opened", link: link, error: error)
         link.opening = false
         guard error == nil, let channel, let handshake = link.handshake else {
             failed(link, message: "The controller's Bluetooth channel could not open.", retry: true)
@@ -569,15 +713,16 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
     }
 
     func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
-        guard let link = contexts[peripheral.identifier], invalidatedServices.contains(where: { $0.uuid == serviceUUID }) else { return }
-        close(link)
-        discover(link)
+        guard let link = contexts[peripheral.identifier], !link.automaticRetryBlocked, !link.cancellingConnection,
+              invalidatedServices.contains(where: { $0.uuid == serviceUUID }) else { return }
+        failed(link, message: "Bluetooth services changed; reconnecting.", retry: true, reason: "services invalidated")
     }
 
     func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
         guard let link = contexts.values.first(where: { $0.channel?.inputStream === aStream || $0.channel?.outputStream === aStream }) else { return }
         if eventCode.contains(.endEncountered) || eventCode.contains(.errorOccurred) {
-            failed(link, message: "Bluetooth disconnected; reconnecting.", retry: true)
+            log("stream ended event=\(eventCode.rawValue)", link: link, error: aStream.streamError)
+            failed(link, message: "Bluetooth disconnected; reconnecting.", retry: true, reason: "stream ended")
             return
         }
         if eventCode.contains(.hasSpaceAvailable) { drain(link) }
@@ -619,44 +764,81 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
                     guard let handshake = link.handshake else { throw BluetoothPresenceError.invalidReply }
                     try handshake.accept(payload)
                     link.authenticated = true
-                    link.retries = 0
+                    link.retryPolicy.connected(now: recoveryTime)
+                    cancelReconnect(link)
                     link.timeout?.cancel(); link.timeout = nil
+                    link.setupDeadline = nil
+                    endSetupActivity(link)
+                    log("presence authenticated", link: link)
                     onEvent?(.opened(serverID: link.registration.serverID))
                     beginControlIfRequested(link)
                 }
-            } catch { failed(link, message: error.localizedDescription, retry: false); return }
+            } catch {
+                log("protocol or authentication rejected", link: link, error: error)
+                failed(link, message: error.localizedDescription, retry: false, reason: "protocol or authentication validation")
+                return
+            }
         }
     }
 
     private func startTimeout(_ link: Link) {
         link.timeout?.cancel()
+        endSetupActivity(link)
+        let setupID = UUID()
+        link.setupID = setupID
+        link.setupDeadline = recoveryTime + 25
+        // Protect only the short setup exchange. CoreBluetooth, not a background
+        // assertion, owns the potentially indefinite wait for radio range.
+        if link.backgroundTask == .invalid, !backgroundTimeExpired {
+            link.backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Bluetooth presence setup") { [weak self, weak link] in
+                MainActor.assumeIsolated {
+                    guard let self, let link, link.setupID == setupID, !link.authenticated else { return }
+                    self.backgroundTimeExpired = true
+                    self.failed(link, message: "Bluetooth setup interrupted; reconnecting.", retry: true,
+                                reason: "background setup time expired")
+                }
+            }
+            log("setup activity began", link: link)
+        }
         link.timeout = Task { [weak self, weak link] in
             do { try await Task.sleep(for: .seconds(25)) } catch { return }
-            guard let self, let link, !link.authenticated else { return }
-            self.failed(link, message: "Bluetooth setup timed out. Try again near the controller.", retry: false)
+            guard let self, let link, link.setupID == setupID, !link.authenticated else { return }
+            self.failed(link, message: "Bluetooth setup timed out; reconnecting.", retry: true, reason: "setup deadline")
         }
     }
 
-    private func failed(_ link: Link, message: String, retry: Bool) {
+    private func failed(_ link: Link, message: String, retry: Bool, reason: String = "session failure") {
+        log("failed reason=\(reason) automaticRetry=\(retry)", link: link)
         close(link)
+        link.automaticRetryBlocked = !retry
+        if !retry { cancelReconnect(link) }
         onEvent?(.status(serverID: link.registration.serverID, message: message))
-        if retry, link.retries < 2, link.peripheral.state == .connected {
-            link.retries += 1
-            recover(link)
+        guard let central, central.state == .poweredOn else { return }
+        if retry {
+            link.retryPolicy.nextDelay(now: recoveryTime)
+        }
+        if link.peripheral.state == .disconnected {
+            link.connection.disconnected()
+            link.cancellingConnection = false
+            continueConnection(link)
+        } else if !link.cancellingConnection {
+            // Tear down the failed local connection first. The disconnect
+            // callback respects the same cooldown before submitting a new
+            // OS-owned connection request.
+            link.cancellingConnection = true
+            log("cancelling failed connection", link: link)
+            central.cancelPeripheralConnection(link.peripheral)
         }
     }
 
     private func recover(_ link: Link) {
-        guard link.recoveryBudget.consume(now: ProcessInfo.processInfo.systemUptime) else {
-            onEvent?(.status(serverID: link.registration.serverID,
-                message: "Bluetooth recovery paused after repeated connection losses. Use Reconnect Bluetooth to try again."))
-            return
-        }
-        discover(link)
+        guard !link.automaticRetryBlocked, !link.cancellingConnection else { return }
+        continueConnection(link)
     }
 
-    private func close(_ link: Link) {
-        if let waiter = controlWaiters[link.registration.serverID] {
+    private func close(_ link: Link, preserveControlWaiter: Bool = false) {
+        let wasAuthenticated = link.authenticated
+        if !preserveControlWaiter, let waiter = controlWaiters[link.registration.serverID] {
             cancelControlWaiter(serverID: link.registration.serverID, id: waiter.id, error: HomeBaseControlTransportError.closed)
         }
         link.cncTimeout?.cancel(); link.cncTimeout = nil
@@ -664,6 +846,9 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         link.attachment.reset(); link.secureChannel = nil; link.cncHandshake = nil
         link.cncHandshakeRequestID = nil; link.cncClientID = nil; link.outgoing = nil
         link.timeout?.cancel(); link.timeout = nil
+        link.setupDeadline = nil
+        link.setupID = nil
+        endSetupActivity(link)
         if let channel = link.channel {
             for stream in [channel.inputStream as Stream, channel.outputStream as Stream] {
                 stream.delegate = nil
@@ -678,6 +863,22 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         link.handshake = nil
         link.output = Data()
         link.decoder = HBBluetoothFrameDecoder()
+        if wasAuthenticated { onEvent?(.closed(serverID: link.registration.serverID)) }
+    }
+
+    private func endSetupActivity(_ link: Link) {
+        guard link.backgroundTask != .invalid else { return }
+        let task = link.backgroundTask
+        link.backgroundTask = .invalid
+        UIApplication.shared.endBackgroundTask(task)
+        log("setup activity ended", link: link)
+    }
+
+    private func log(_ event: String, link: Link, error: Error? = nil) {
+        // Correlation IDs and framework error codes only: never tokens, keys,
+        // peer-provided error text, or command/response contents.
+        let error = error as NSError?
+        Self.logger.notice("\(event, privacy: .public) registration=\(link.registration.registrationID.uuidString, privacy: .public) peripheral=\(link.peripheral.identifier.uuidString, privacy: .public) state=\(link.peripheral.state.rawValue) local=\(link.connection.isLocallyConnected) pending=\(link.connection.connectionPending) cancelling=\(link.cancellingConnection) discovering=\(link.discovering) opening=\(link.opening) authenticated=\(link.authenticated) blocked=\(link.automaticRetryBlocked) errorDomain=\(error?.domain ?? "none", privacy: .public) errorCode=\(error?.code ?? 0)")
     }
 }
 #endif
@@ -688,21 +889,24 @@ import HomeBaseProtocol
 /// Distinguish this app's connection from the system-wide peripheral state.
 /// Only genuine restoration or didConnect establishes local ownership.
 struct BluetoothPresenceConnectionState {
-    enum Action: Equatable { case wait, connect, discover }
+    enum Action: Equatable { case wait, retryAfter(TimeInterval), connect, discover }
     private(set) var isLocallyConnected: Bool
-    private var connectionPending: Bool
+    private(set) var connectionPending: Bool
 
     init(restoredConnected: Bool = false, restoredConnecting: Bool = false) {
         isLocallyConnected = restoredConnected
         connectionPending = restoredConnecting && !restoredConnected
     }
 
-    mutating func action(poweredOn: Bool, peripheralConnected: Bool, sessionActive: Bool) -> Action {
+    mutating func action(poweredOn: Bool, peripheralConnected: Bool, sessionActive: Bool,
+                         retryDelay: TimeInterval = 0) -> Action {
         guard poweredOn else { return .wait }
         if isLocallyConnected && peripheralConnected {
-            return sessionActive ? .wait : .discover
+            if sessionActive { return .wait }
+            return retryDelay > 0 ? .retryAfter(retryDelay) : .discover
         }
         guard !connectionPending else { return .wait }
+        guard retryDelay <= 0 else { return .retryAfter(retryDelay) }
         isLocallyConnected = false
         connectionPending = true
         return .connect
@@ -717,17 +921,38 @@ struct BluetoothPresenceConnectionState {
         isLocallyConnected = false
         connectionPending = false
     }
+
+    mutating func reconcile(peripheralDisconnected: Bool) {
+        // A real OS-owned pending request remains intact. Only contradictory
+        // local bookkeeping is discarded on foreground entry.
+        if peripheralDisconnected { disconnected() }
+    }
 }
 
-/// Replenished only when an event arrives; this never schedules a wakeup. Short
-/// successful handshakes do not erase the budget for repeated stream failures.
-struct BluetoothPresenceRecoveryBudget {
-    private var attempts: [TimeInterval] = []
-    mutating func consume(now: TimeInterval) -> Bool {
-        attempts.removeAll { now - $0 >= 300 || now < $0 }
-        guard attempts.count < 3 else { return false }
-        attempts.append(now)
-        return true
+/// Retry forever with a locally enforced deadline. A brief
+/// successful handshake must not turn a repeated drop/reopen loop into a spin.
+struct BluetoothPresenceRetryPolicy {
+    private var failures = 0
+    private var connectedAt: TimeInterval?
+    private var retryNotBefore: TimeInterval?
+
+    mutating func connected(now: TimeInterval) {
+        connectedAt = now
+        retryNotBefore = nil
+    }
+
+    func remainingDelay(now: TimeInterval) -> TimeInterval {
+        max(0, (retryNotBefore ?? now) - now)
+    }
+
+    @discardableResult
+    mutating func nextDelay(now: TimeInterval) -> TimeInterval {
+        if let connectedAt, now - connectedAt >= 60 { failures = 0 }
+        connectedAt = nil
+        let delay = min(30, pow(2, Double(failures)))
+        failures = min(failures + 1, 5)
+        retryNotBefore = now + delay
+        return delay
     }
 }
 

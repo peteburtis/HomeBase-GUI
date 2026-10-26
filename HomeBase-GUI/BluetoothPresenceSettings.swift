@@ -13,6 +13,7 @@ struct BluetoothPresenceSettingsSection: View {
 #if os(iOS)
             let registration = presence.settingsRegistration(for: server.id)
             let busy = presence.busyServers.contains(server.id)
+            let bluetoothConnected = presence.connectedServerIDs.contains(server.id)
             if registration?.phase == .removing {
                 Label("Disabled on this iPhone", systemImage: "iphone.slash")
                 Text(presence.messages[server.id] ?? "Server removal will finish when connected.")
@@ -22,7 +23,7 @@ struct BluetoothPresenceSettingsSection: View {
                     .textContentType(.nickname)
                     .disabled(busy || registration?.phase == .pending)
                 if let registration {
-                    Label(registration.phase == .paired ? "Paired" : "Setup incomplete", systemImage: "antenna.radiowaves.left.and.right")
+                    Label(registration.phase == .paired ? (bluetoothConnected ? "Paired, connected" : "Paired") : "Setup incomplete", systemImage: "antenna.radiowaves.left.and.right")
                     if let message = presence.messages[server.id] {
                         Text(message).foregroundStyle(.secondary)
                     }
@@ -35,7 +36,7 @@ struct BluetoothPresenceSettingsSection: View {
                                 Task { await presence.rename(serverID: server.id, name: name, client: client) }
                             }.disabled(!isConnected || busy)
                         }
-                        if presence.messages[server.id] != "Connected over Bluetooth" {
+                        if !bluetoothConnected {
                             Button("Reconnect Bluetooth") { presence.reconnect() }
                         }
                     }
