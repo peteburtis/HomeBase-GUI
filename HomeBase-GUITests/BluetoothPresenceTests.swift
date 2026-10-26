@@ -349,6 +349,54 @@ final class BluetoothPresenceTests: XCTestCase {
         XCTAssertEqual(fixture.service.registration(for: fixture.serverID)?.registrationID, identifier)
     }
 
+    func testRenamePreservesControlCredentialSavedBeforeResponse() async throws {
+        let fixture = Fixture()
+        await fixture.pair()
+        fixture.transport.onEvent?(.opened(serverID: fixture.serverID))
+        let original = try XCTUnwrap(fixture.service.registration(for: fixture.serverID))
+        let clientID = UUID()
+        let credential = HBBluetoothCnCCredential(controllerID: fixture.commands.controllerID,
+            registrationID: original.registrationID, keyID: UUID(), secret: Data(repeating: 9, count: 32))
+        fixture.commands.onRename = {
+            try fixture.service.saveControlCredential(credential, serverID: fixture.serverID, clientID: clientID)
+        }
+        defer { fixture.commands.onRename = nil }
+
+        await fixture.service.rename(serverID: fixture.serverID, name: "Kitchen Phone", client: fixture.commands)
+
+        var expected = original
+        expected.name = "Kitchen Phone"
+        expected.cncCredential = credential
+        expected.cncClientID = clientID
+        XCTAssertEqual(fixture.commands.renames, 1)
+        XCTAssertNil(fixture.service.errorMessage)
+        XCTAssertEqual(fixture.service.registration(for: fixture.serverID), expected)
+        let restored = BluetoothPresenceService(store: fixture.store, transport: Transport())
+        restored.start()
+        XCTAssertEqual(restored.registration(for: fixture.serverID), expected,
+            "The renamed pairing must retain the new credentials across relaunch.")
+    }
+
+    func testRenameResponseCannotOverwriteRemoval() async throws {
+        let fixture = Fixture()
+        await fixture.pair()
+        fixture.transport.onEvent?(.opened(serverID: fixture.serverID))
+        var removed: BluetoothPresenceRegistration?
+        var savesAfterRemoval = 0
+        fixture.commands.onRename = {
+            fixture.service.remove(serverID: fixture.serverID)
+            removed = fixture.service.registration(for: fixture.serverID)
+            savesAfterRemoval = fixture.store.saves.count
+        }
+        defer { fixture.commands.onRename = nil }
+
+        await fixture.service.rename(serverID: fixture.serverID, name: "Kitchen Phone", client: fixture.commands)
+
+        XCTAssertEqual(try XCTUnwrap(removed).phase, .removing)
+        XCTAssertEqual(fixture.service.registration(for: fixture.serverID), removed)
+        XCTAssertEqual(fixture.store.saves.count, savesAfterRemoval)
+    }
+
     func testHandshakeRejectsWrongControllerBeforeBuildingCredentialRequest() async throws {
         let fixture = Fixture()
         let offer = fixture.commands.offer(registrationID: UUID())
@@ -578,6 +626,7 @@ final class BluetoothPresenceTests: XCTestCase {
         var pendingRemoval: CheckedContinuation<Void, Error>?
         var onRemoval: (() -> Void)?
         var onStatus: (() -> Void)?
+        var onRename: (() throws -> Void)?
         var failCancellation = false
         var cancellations: [UUID] = []
         var registered: [HBBluetoothRegisteredController] = []
@@ -608,6 +657,9 @@ final class BluetoothPresenceTests: XCTestCase {
             if failRemoval { throw BluetoothPresenceError.invalidReply }
             removals += 1
         }
-        func renameBluetoothController(registrationID: UUID, name: String) async throws { renames += 1 }
+        func renameBluetoothController(registrationID: UUID, name: String) async throws {
+            renames += 1
+            try onRename?()
+        }
     }
 }

@@ -456,16 +456,18 @@ final class BluetoothPresenceService: ObservableObject {
     }
 
     func rename(serverID: UUID, name: String, client: any BluetoothPresenceCommanding) async {
-        guard var item = registration(for: serverID), item.phase == .paired else { return }
+        guard let item = registration(for: serverID), item.phase == .paired else { return }
         let name = normalizedName(name)
         guard name != item.name, !busyServers.contains(serverID) else { return }
         busyServers.insert(serverID)
         defer { busyServers.remove(serverID) }
         do {
             try await client.renameBluetoothController(registrationID: item.registrationID, name: name)
-            guard registration(for: serverID)?.phase == .paired else { return }
-            item.name = name
-            try replace(item)
+            // Credential enrollment can update the pairing while the rename is in flight.
+            guard var current = registration(for: serverID), current.phase == .paired,
+                  current.registrationID == item.registrationID else { return }
+            current.name = name
+            try replace(current)
             errorMessage = nil
         } catch { errorMessage = error.localizedDescription }
     }
