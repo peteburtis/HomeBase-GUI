@@ -136,6 +136,41 @@ final class CameraGridPreviewTests: XCTestCase {
         XCTAssertEqual(timestamp, 400)
     }
 
+    func testLoadedGridImageHidesAndClearsOnMetadataWithoutPollingJPEGAgain() async throws {
+        let camera = try camera("Camera", playback: true), id = try playbackID(camera)
+        let raw = GridThumbnailFetcher(outcomes: [id: [.image(timestamp: 123)]])
+        let authority = TagAuthority(instance: UUID().uuidString, hidden: false)
+        let updates = AsyncStream<HBNVRTagChange>.makeStream()
+        let source = CameraTaggedHistorySource(source: raw, updates: updates.stream) { try await authority.read($0) }
+        await source.observe()
+        let model = CameraGridPreviewModel(makeTransport: { source }, decode: { _ in try Self.image() },
+            sleep: { _ in try await Task.sleep(for: .seconds(3600)) })
+        let run = Task { await model.run(cameras: [camera]) }
+        defer { run.cancel() }
+        for _ in 0..<1000 {
+            if case .thumbnail = model.preview(for: camera.id) { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        guard case .thumbnail(let original, _) = model.preview(for: camera.id) else { return XCTFail("Thumbnail never loaded") }
+        for hidden in [true, false] {
+            await authority.setHidden(hidden)
+            updates.continuation.yield(.init(instanceID: UUID().uuidString, revision: 1, reset: true, ranges: []))
+            for _ in 0..<1000 {
+                if case .hidden = model.preview(for: camera.id), hidden { break }
+                if case .thumbnail = model.preview(for: camera.id), !hidden { break }
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            if hidden { guard case .hidden = model.preview(for: camera.id) else { return XCTFail("Expected hidden cached image") } }
+            else {
+                guard case .thumbnail(let image, let timestamp) = model.preview(for: camera.id) else { return XCTFail("Expected cleared cached image") }
+                XCTAssertTrue(image === original); XCTAssertEqual(timestamp, 123)
+            }
+        }
+        let reads = await raw.requests.count
+        XCTAssertEqual(reads, 1)
+        run.cancel(); await run.value
+    }
+
     private func makeModel(
         _ fetcher: GridThumbnailFetcher
     ) -> CameraGridPreviewModel {

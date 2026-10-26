@@ -6,6 +6,38 @@ import XCTest
 
 @MainActor
 final class CameraHistoryExportTests: XCTestCase {
+    func testTagMonitorIgnoresOtherFootageAndRejectsMatchingChanges() throws {
+        let camera = UUID().uuidString, instance = UUID().uuidString
+        let monitor = CameraHistoryExportTagMonitor(cameraID: camera, range: .init(start: 1000, end: 1010))
+        monitor.receive(.init(instanceID: instance, revision: 1, reset: false, ranges: [
+            .init(cameraID: UUID().uuidString, epochID: "epoch", start: 1000, end: 1010),
+            .init(cameraID: camera, epochID: "epoch", start: 990, end: 1000),
+            .init(cameraID: camera, epochID: "epoch", start: 1010, end: 1020)
+        ]))
+        XCTAssertNoThrow(try monitor.check())
+        monitor.receive(.init(instanceID: instance, revision: 2, reset: false, ranges: [
+            .init(cameraID: camera, epochID: "epoch", start: 1005, end: 1006)
+        ]))
+        XCTAssertThrowsError(try monitor.check()) {
+            guard case CameraHistoryExportError.tagsChanged = $0 else { return XCTFail("Expected an invalidated export") }
+        }
+        monitor.receive(.init(instanceID: instance, revision: 3, reset: false, ranges: []))
+        XCTAssertThrowsError(try monitor.check(), "Later events cannot make already-written bytes safe again")
+    }
+
+    func testTagMonitorIncludesWrittenDecoderPrerollAndResets() async throws {
+        let camera = UUID().uuidString, instance = UUID().uuidString
+        let monitor = CameraHistoryExportTagMonitor(cameraID: camera, range: .init(start: 1000.4, end: 1000.8))
+        monitor.include(try historyPiece(try await S3MediaFixture.make(count: 15)))
+        monitor.receive(.init(instanceID: instance, revision: 1, reset: false, ranges: [
+            .init(cameraID: camera, epochID: "epoch", start: 1000, end: 1000.1)
+        ]))
+        XCTAssertThrowsError(try monitor.check())
+        let reset = CameraHistoryExportTagMonitor(cameraID: camera, range: .init(start: 1000, end: 1010))
+        reset.receive(.init(instanceID: instance, revision: 2, reset: true, ranges: []))
+        XCTAssertThrowsError(try reset.check())
+    }
+
     func testHiddenExportIncludesPrerollInVeilCheckAndRequiresReveal() async throws {
         let original = try historyPiece(try await S3MediaFixture.make(count: 15))
         var samples = original.samples

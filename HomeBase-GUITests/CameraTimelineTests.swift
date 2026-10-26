@@ -10,6 +10,32 @@ import HomeBaseProtocol
 final class CameraTimelineTests: XCTestCase {
     private let camera = UUID().uuidString
 
+    func testCachedTimelineThumbnailRefreshesTagsWithoutReloadingImage() async throws {
+        let raw = TimelineFetcher(jpeg: try sampleJPEG())
+        let authority = TagAuthority(instance: UUID().uuidString, hidden: false)
+        let updates = AsyncStream<HBNVRTagChange>.makeStream()
+        let source = CameraTaggedHistorySource(source: raw, updates: updates.stream) { try await authority.read($0) }
+        await source.observe()
+        let model = CameraTimelineModel(clock: { 100 })
+        model.setViewport(1)
+        await model.open(cameraID: camera, transport: source)
+        defer { model.close() }
+        let position = TimelineFetcher.anchor - 3600
+        model.follow(.canonical(position, paused: true))
+        let tile = Int(floor(position / CameraTimelineScale.seconds))
+        try await wait { model.previews[tile]?.metadata != nil }
+        guard let entry = model.previews[tile], case .image(let original) = entry.preview else { return XCTFail("Missing image") }
+        for hidden in [true, false] {
+            await authority.setHidden(hidden)
+            updates.continuation.yield(.init(instanceID: UUID().uuidString, revision: 1, reset: true, ranges: []))
+            try await wait { model.previews[tile]?.isHidden == hidden }
+            guard let result = model.previews[tile], case .image(let image) = result.preview else { return XCTFail("Missing refreshed image") }
+            XCTAssertTrue(image === original)
+            XCTAssertEqual(result.expires, entry.expires)
+            XCTAssertEqual(result.metadata?.timestamp, entry.metadata?.timestamp)
+        }
+    }
+
     func testTimelineStandardThumbnailIsFullSixteenByNineSize() {
         XCTAssertEqual(
             CameraTimelineSizing.standard,

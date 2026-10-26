@@ -74,6 +74,11 @@ final class CameraHistoryPlayback {
     private var transport: (any CameraHistoryFetching)?
     private var task: Task<Void, Never>?
     private var token = UUID()
+    private var tagObserver: Task<Void, Never>?
+    private let tagRefresh = CameraFootageRefreshTask()
+    private var tagSerial: UInt64 = 0
+    private var tagRegistrationPending = false
+    private var tagGeneration = UUID()
     private var localHead: Double = 0
     private var initialOffset: Double = 0
     private var relativeCaptureTime: Double = 0
@@ -90,13 +95,58 @@ final class CameraHistoryPlayback {
 
     func configure(cameraID: String, transport: any CameraHistoryFetching) {
         self.cameraID = cameraID; self.transport = transport
-        ensureRequest()
+        tagObserver?.cancel(); tagRefresh.cancel(); tagGeneration = UUID()
+        tagRegistrationPending = transport is any CameraFootageTagRefreshing
+        if let source = transport as? any CameraFootageTagRefreshing {
+            let generation = tagGeneration
+            tagObserver = Task { [weak self] in
+                let stream = await source.tagChanges()
+                guard let self, self.tagGeneration == generation, !Task.isCancelled else { return }
+                self.tagRegistrationPending = false
+                self.refreshFootageTags(using: source)
+                self.ensureRequest()
+                for await change in stream {
+                    guard !Task.isCancelled, self.tagGeneration == generation else { return }
+                    if CameraFootageTags.affects(change, cameraID: cameraID) {
+                        self.tagSerial &+= 1
+                        self.invalidateNavigation()
+                        self.refreshFootageTags(using: source)
+                    }
+                }
+            }
+        } else { ensureRequest() }
+    }
+    private func refreshFootageTags(using source: any CameraFootageTagRefreshing) {
+        let generation = tagGeneration
+        tagRefresh.schedule { [weak self] revision in
+            guard let self else { return }
+            let batches = self.buffer.batches.map(\.batch)
+            do {
+                let refreshed = try await source.refreshTags(batches)
+                guard self.tagRefresh.isCurrent(revision), self.tagGeneration == generation else { return }
+                let current = self.location(preferredPiece: nil)
+                let wasHidden = current.map { $0.piece.samples[$0.index].isHidden }
+                for batch in refreshed { self.buffer.replaceTags(in: batch) }
+                let updated = self.location(preferredPiece: nil)
+                if wasHidden != updated.map({ $0.piece.samples[$0.index].isHidden }) {
+                    // A hidden paused target may have been decoded with
+                    // display:false. Replay its retained GOP after a clear;
+                    // also supersede an in-flight presentation when hiding.
+                    self.resetPresentation?()
+                }
+                self.invalidateNavigation(); self.refreshState(); self.ensureRequest(); self.changed?()
+            } catch {
+                guard self.tagRefresh.isCurrent(revision), self.tagGeneration == generation else { return }
+                self.failure = error.localizedDescription
+                self.refreshState(); self.changed?()
+            }
+        }
     }
     /// Credential repair can make previously confirmed LOCAL gaps readable.
     /// Keep the cursor/pause state, but invalidate that source's cached coverage.
     func replaceSource(cameraID: String, transport: any CameraHistoryFetching) {
         disconnect(); buffer.removeAll(); failure = nil; retryAfter = 0; quickRetries = 0
-        self.cameraID = cameraID; self.transport = transport
+        configure(cameraID: cameraID, transport: transport)
         if let position, let liveEdge { goal = CameraHistoryPolicy.initialWindow(at: position, liveEdge: liveEdge) }
         resetPresentation?(); refreshState(); ensureRequest(); changed?()
     }
@@ -226,6 +276,8 @@ final class CameraHistoryPlayback {
         groupClock = false; groupLiveEdge = nil
     }
     func disconnect() {
+        tagGeneration = UUID(); tagObserver?.cancel(); tagObserver = nil
+        tagRefresh.cancel(); tagRegistrationPending = false
         cancelRequest()
         let old = transport; transport = nil
         Task { await old?.close() }
@@ -260,7 +312,7 @@ final class CameraHistoryPlayback {
     }
     private func ensureRequest() {
         guard isActive || bufferNavigation != nil else { return }
-        guard !fetching, clock() >= retryAfter, let transport, let cameraID else { return }
+        guard !tagRegistrationPending, !fetching, clock() >= retryAfter, let transport, let cameraID else { return }
         let request: HBNVRMediaRequest
         let capturedHead = bufferNavigation?.head ?? localHead
         let capturedOffset = bufferNavigation.map { min(0, $0.position - $0.head) } ?? initialOffset
@@ -317,7 +369,7 @@ final class CameraHistoryPlayback {
                 timeline: "canonical", range: .init(start: window.start, end: window.end), relativeTo: "live")
         }
         let id = UUID(); token = id
-        let previous = task
+        let previous = task, initialTagSerial = tagSerial
         fetching = true
         task = Task { [weak self] in
             await previous?.value
@@ -368,6 +420,9 @@ final class CameraHistoryPlayback {
                 }
                 if fetchedFrames {
                     self.buffer.insert(batch, at: self.clock(), around: self.position!)
+                    if self.tagSerial != initialTagSerial, let source = transport as? any CameraFootageTagRefreshing {
+                        self.refreshFootageTags(using: source)
+                    }
                 } else if request.operation == "neighbors" {
                     guard let neighbors = batch.neighbors else { throw CameraHistoryError.invalidResponse }
                     self.navigation = batch.sourceWarning.map { .partial(neighbors, $0) } ?? .ready(neighbors)

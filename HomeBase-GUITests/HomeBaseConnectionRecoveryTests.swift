@@ -18,6 +18,81 @@ final class HomeBaseConnectionRecoveryTests: XCTestCase {
         XCTFail("Condition was not reached")
     }
 
+    func testSnapshotBeforeAnyEventStillInvalidatesRetainedObserversOnReconnect() async throws {
+        let factory = RecoverySocketFactory(), camera = UUID().uuidString, nvr = UUID().uuidString
+        let client = client(factory)
+        var events = await client.footageTagChanges(cameraID: camera).makeAsyncIterator()
+        let query = HBNVRTagQuery(cameraID: camera, ranges: [.init(start: 100, end: 101)], keys: [CameraVideoTags.hiddenKey])
+        let snapshot = try await client.footageTagSnapshot(instanceID: nvr, query: query)
+        XCTAssertEqual(snapshot?.instanceID, nvr)
+        await factory.server.ignore(HBProtocolOperations.ping, on: 0)
+        try await client.reactivate()
+        let reset = await events.next()
+        XCTAssertTrue(reset?.reset == true)
+        XCTAssertEqual(reset?.instanceID, nvr)
+        let refreshed = try await client.footageTagSnapshot(instanceID: nvr, query: query)
+        XCTAssertNotNil(refreshed)
+        XCTAssertEqual(factory.count, 2)
+        await client.disconnect()
+    }
+
+    func testTagRevisionMaximumAndGapProduceBoundedResets() async throws {
+        let factory = RecoverySocketFactory(), camera = UUID().uuidString, nvr = UUID().uuidString
+        let client = client(factory)
+        try await client.connect()
+        var events = await client.footageTagChanges(cameraID: camera).makeAsyncIterator()
+        try await client.receiveFootageTagChange(.init(instanceID: nvr, revision: UInt64.max, reset: true, ranges: []))
+        let first = await events.next()
+        XCTAssertTrue(first?.reset == true)
+        try await client.receiveFootageTagChange(.init(instanceID: nvr, revision: UInt64.max, reset: true, ranges: []))
+        let second = await events.next()
+        XCTAssertEqual(second?.revision, UInt64.max)
+        let replacement = UUID().uuidString
+        try await factory.server.emit(.init(instanceID: replacement, revision: 1, reset: false,
+            ranges: [.init(cameraID: camera, epochID: "e", start: 1, end: 2)]), on: 0)
+        let restarted = await events.next()
+        XCTAssertTrue(restarted?.reset == true)
+        try await factory.server.emit(.init(instanceID: replacement, revision: 3, reset: false,
+            ranges: [.init(cameraID: camera, epochID: "e", start: 1, end: 2)]), on: 0)
+        let gap = await events.next()
+        XCTAssertTrue(gap?.reset == true)
+        await client.disconnect()
+    }
+
+    func testValidTagEventRestoresCapabilityAfterOldNVRUpgrade() async throws {
+        let factory = RecoverySocketFactory(), camera = UUID().uuidString, nvr = UUID().uuidString
+        let client = client(factory)
+        await factory.server.tagError("unsupported_operation")
+        let query = HBNVRTagQuery(cameraID: camera, ranges: [.init(start: 100, end: 101)], keys: [CameraVideoTags.hiddenKey])
+        let old = try await client.footageTagSnapshot(instanceID: nvr, query: query)
+        XCTAssertNil(old)
+        var events = await client.footageTagChanges().makeAsyncIterator()
+        await factory.server.tagError(nil)
+        try await factory.server.emit(.init(instanceID: nvr, revision: 0, reset: true, ranges: []), on: 0)
+        _ = await events.next()
+        let updated = try await client.footageTagSnapshot(instanceID: nvr, query: query)
+        XCTAssertNotNil(updated)
+        await client.disconnect()
+    }
+
+    func testPermissionDeniedFallsBackOnlyWhenDiscoveryProvesOldDaemon() async throws {
+        for advertised in [false, true] {
+            let factory = RecoverySocketFactory(), client = client(factory)
+            await factory.server.tagError(HBProtocolErrorCodes.permissionDenied)
+            await factory.server.advertiseTags(advertised)
+            let query = HBNVRTagQuery(cameraID: UUID().uuidString, ranges: [.init(start: 100, end: 101)], keys: [CameraVideoTags.hiddenKey])
+            do {
+                let snapshot = try await client.footageTagSnapshot(instanceID: UUID().uuidString, query: query)
+                XCTAssertFalse(advertised, "Real authorization failures cannot bypass snapshots")
+                XCTAssertNil(snapshot)
+            } catch {
+                XCTAssertTrue(advertised)
+                XCTAssertEqual((error as? HBProtocolError)?.code, HBProtocolErrorCodes.permissionDenied)
+            }
+            await client.disconnect()
+        }
+    }
+
     func testSilentPingIsBoundedAndConcurrentRecoveryUsesOneReplacementSocket() async throws {
         let factory = RecoverySocketFactory()
         let client = client(factory)
@@ -158,6 +233,7 @@ private nonisolated final class RecoverySocket: HomeBaseControlSocket, @unchecke
         @unknown default: throw URLError(.badServerResponse)
         }
         let request = try JSONDecoder().decode(HBProtocolEnvelope.self, from: data)
+        await server.attach(inbox, on: index)
         if let response = try await server.response(to: request, socket: index) {
             await inbox.push(.data(try JSONEncoder().encode(response)))
         }
@@ -192,6 +268,21 @@ private actor RecoveryServer {
     private var requests: [(Int, String)] = []
     private let instance = UUID()
     private var session = UUID()
+    private var inboxes: [Int: RecoveryInbox] = [:]
+    private var clients: [Int: UUID] = [:]
+    private var sequences: [Int: Int64] = [:]
+    private var tagsError: String?
+    private var tagsAdvertised = true
+    func advertiseTags(_ value: Bool) { tagsAdvertised = value }
+    func attach(_ inbox: RecoveryInbox, on socket: Int) { inboxes[socket] = inbox }
+    func tagError(_ code: String?) { tagsError = code }
+    func emit(_ change: HBNVRTagChange, on socket: Int) async throws {
+        guard let inbox = inboxes[socket], let client = clients[socket] else { return }
+        sequences[socket, default: 0] += 1
+        let event = HBProtocolEnvelope(messageKind: .event, clientID: client, operation: HBProtocolOperations.nvrTagsChanged,
+            payload: try HBJSONValue(encoding: change), sessionID: session, deliverySequence: sequences[socket])
+        await inbox.push(.data(try JSONEncoder().encode(event)))
+    }
     func ignore(_ operation: String, on socket: Int) { ignored[socket, default: []].insert(operation) }
     func rejectResume(on socket: Int) { rejectedResumes.insert(socket) }
     func count(_ operation: String, on socket: Int) -> Int {
@@ -199,6 +290,7 @@ private actor RecoveryServer {
     }
     func response(to request: HBProtocolEnvelope, socket: Int) throws -> HBProtocolEnvelope? {
         requests.append((socket, request.operation))
+        clients[socket] = request.clientID
         if ignored[socket]?.contains(request.operation) == true { return nil }
         let body: HBProtocolResponse
         switch request.operation {
@@ -216,6 +308,16 @@ private actor RecoveryServer {
                 body = try .success(HBWebSocketSessionResumed(sessionID: resume.sessionID,
                     serverInstanceID: instance, replayedMessageCount: 0,
                     latestDeliverySequence: resume.acknowledgedDeliverySequence))
+            }
+        case HBProtocolOperations.describeProtocol:
+            body = try .success(HBJSONValue.object(["authorization": .object([
+                "userOperations": .array(tagsAdvertised ? [.string(HBProtocolOperations.snapshotNVRTags)] : [])])]))
+        case HBProtocolOperations.snapshotNVRTags:
+            if let tagsError { body = .failure(.init(code: tagsError, message: "fixture capability")) }
+            else {
+                let value = try request.decodedPayload(as: HBNVRTagSnapshotRequest.self)
+                body = try .success(HBNVRTagSnapshot(instanceID: value.nvrInstanceID, revision: 0,
+                    cameraID: value.query.cameraID, spans: []))
             }
         case HBProtocolOperations.ping: body = .successWithoutResult
         case HBProtocolOperations.openCameraLiveStream:

@@ -27,7 +27,7 @@ struct CameraHistoryExportDraft {
 }
 
 enum CameraHistoryExportError: LocalizedError {
-    case noVideo, invalidRange, incomplete(String), writing, hiddenVideo
+    case noVideo, invalidRange, incomplete(String), writing, hiddenVideo, tagsChanged
     var errorDescription: String? {
         switch self {
         case .noVideo: "No recorded video is available in this interval."
@@ -35,7 +35,39 @@ enum CameraHistoryExportError: LocalizedError {
         case .incomplete(let message): "The complete interval could not be read. \(message)"
         case .writing: "The history video could not be written to a movie."
         case .hiddenVideo: "This interval contains hidden footage. Show hidden video with the eye button before exporting it."
+        case .tagsChanged: "Footage tags changed while this video was being prepared. Try exporting again."
         }
+    }
+}
+
+/// A single invalidation flag covers the movie being prepared, including any
+/// decoder preroll already written. No tag event history is retained.
+@MainActor
+final class CameraHistoryExportTagMonitor {
+    nonisolated deinit {}
+
+    private let cameraID: String
+    private var range: CameraHistoryRange
+    private var invalidated = false
+
+    init(cameraID: String, range: CameraHistoryRange) {
+        self.cameraID = cameraID; self.range = range
+    }
+
+    func include(_ piece: CameraHistoryPiece) {
+        guard let first = piece.samples.first else { return }
+        range = .init(start: min(range.start, first.time(in: piece.segment)), end: range.end)
+    }
+
+    func receive(_ change: HBNVRTagChange) {
+        if change.reset || change.ranges.contains(where: {
+            $0.cameraID.caseInsensitiveCompare(cameraID) == .orderedSame
+                && $0.start < range.end && $0.end > range.start
+        }) { invalidated = true }
+    }
+
+    func check() throws {
+        if invalidated { throw CameraHistoryExportError.tagsChanged }
     }
 }
 
@@ -54,6 +86,18 @@ enum CameraHistoryExporter {
                        windowDuration: Double = 10, showsHiddenVideo: Bool = false,
                        progress: (Double) -> Void = { _ in }) async throws -> Result {
         let movies = CameraHistoryMovieWriter(name: name, range: range, showsHiddenVideo: showsHiddenVideo)
+        let tags = CameraHistoryExportTagMonitor(cameraID: cameraID, range: range)
+        var tagTask: Task<Void, Never>?
+        if !showsHiddenVideo, let source = source as? any CameraFootageTagRefreshing {
+            let changes = await source.tagChanges()
+            tagTask = Task {
+                for await change in changes {
+                    guard !Task.isCancelled else { return }
+                    tags.receive(change)
+                }
+            }
+        }
+        defer { tagTask?.cancel() }
         do {
             guard range.isValid, range.duration <= CameraHistoryExportDraft.maximumDuration,
                   windowDuration > 0, windowDuration <= 120 else { throw CameraHistoryExportError.invalidRange }
@@ -61,16 +105,20 @@ enum CameraHistoryExporter {
             var hasGaps = false
             while cursor < range.end {
                 try Task.checkCancellation()
+                try tags.check()
                 let end = min(range.end, cursor + windowDuration)
                 let batch = try await source.fetch(.init(requestID: UUID().uuidString, operation: "frames",
                     cameraID: cameraID, timeline: "canonical", range: .init(start: cursor, end: end)))
                 try Task.checkCancellation()
+                try tags.check()
                 guard batch.unresolved.isEmpty else {
                     throw CameraHistoryExportError.incomplete(batch.sourceWarning ?? "Some footage could not be retrieved.")
                 }
                 hasGaps = hasGaps || !batch.gaps.isEmpty
                 for piece in batch.pieces.sorted(by: { $0.segment.range.start < $1.segment.range.start }) {
+                    tags.include(piece)
                     try await movies.append(piece, window: .init(start: cursor, end: end))
+                    try tags.check()
                 }
                 cursor = end
                 progress((cursor - range.start) / range.duration)
@@ -78,8 +126,10 @@ enum CameraHistoryExporter {
             }
             try await movies.finish()
             try Task.checkCancellation()
+            try tags.check()
             await source.close()
             try Task.checkCancellation()
+            try tags.check()
             return Result(recordings: movies.recordings, hasGaps: hasGaps)
         } catch {
             movies.discard()

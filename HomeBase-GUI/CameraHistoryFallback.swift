@@ -255,28 +255,45 @@ actor CameraHistoryFallback: CameraHistoryFetching {
 
 @MainActor
 enum CameraHistorySources {
+    private static func tagged(_ source: any CameraHistoryFetching, metadata: HBCameraPlaybackMetadata,
+                               client: HomeBaseWebSocketClient) async -> CameraTaggedHistorySource {
+        // Register before opening media so an edit during a load cannot be lost.
+        let updates = await client.footageTagChanges(cameraID: metadata.cameraID)
+        let result = CameraTaggedHistorySource(source: source, updates: updates) { query in
+            try await client.footageTagSnapshot(instanceID: metadata.nvrInstanceID, query: query)
+        }
+        await result.setCamera(metadata.cameraID)
+        await result.observe()
+        return result
+    }
     static func thumbnails(metadata: HBCameraPlaybackMetadata, client: HomeBaseWebSocketClient,
                            credentials: CameraS3Credentials?) async -> any CameraThumbnailFetching {
         let local = await client.makeHistoryTransport()
-        guard let store = metadata.s3Store, store.playbackManifestVersion == 1,
-              let credentials, credentials.destinationID == CameraS3Destination(store: store).id,
-              let objects = try? CameraS3ObjectReader(destination: store, credentials: credentials) else { return local }
-        return CameraThumbnailFallback(local: local, remote: CameraS3ThumbnailReader(store: store,
-            cameraID: metadata.cameraID, password: credentials.encryptionPassword, objects: objects))
+        var source: any CameraHistoryFetching = local
+        if let store = metadata.s3Store, store.playbackManifestVersion == 1,
+           let credentials, credentials.destinationID == CameraS3Destination(store: store).id,
+           let objects = try? CameraS3ObjectReader(destination: store, credentials: credentials) {
+            source = CameraThumbnailFallback(local: local, remote: CameraS3ThumbnailReader(store: store,
+                cameraID: metadata.cameraID, password: credentials.encryptionPassword, objects: objects))
+        }
+        return await tagged(source, metadata: metadata, client: client)
     }
     static func make(metadata: HBCameraPlaybackMetadata, client: HomeBaseWebSocketClient,
                      credentials: CameraS3Credentials?) async -> any CameraHistoryFetching {
         let local = await client.makeHistoryTransport()
-        guard let store = metadata.s3Store, store.playbackManifestVersion == 1,
-              let credentials, credentials.destinationID == CameraS3Destination(store: store).id else { return local }
-        do {
-            let objects = try CameraS3ObjectReader(destination: store, credentials: credentials)
-            let remote = CameraS3HistoryReader(store: store, cameraID: metadata.cameraID,
-                password: credentials.encryptionPassword, objects: objects)
-            return CameraHistoryFallback(local: local, remote: remote)
-        } catch {
-            return CameraHistoryFallback(local: local, remote: CameraHistoryUnavailableSource(message: error.localizedDescription))
+        var source: any CameraHistoryFetching = local
+        if let store = metadata.s3Store, store.playbackManifestVersion == 1,
+           let credentials, credentials.destinationID == CameraS3Destination(store: store).id {
+            do {
+                let objects = try CameraS3ObjectReader(destination: store, credentials: credentials)
+                let remote = CameraS3HistoryReader(store: store, cameraID: metadata.cameraID,
+                    password: credentials.encryptionPassword, objects: objects)
+                source = CameraHistoryFallback(local: local, remote: remote)
+            } catch {
+                source = CameraHistoryFallback(local: local, remote: CameraHistoryUnavailableSource(message: error.localizedDescription))
+            }
         }
+        return await tagged(source, metadata: metadata, client: client)
     }
 }
 

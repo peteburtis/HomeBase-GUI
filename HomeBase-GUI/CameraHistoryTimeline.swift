@@ -125,7 +125,7 @@ nonisolated struct CameraTimelineDetents {
 @MainActor
 final class CameraTimelineModel: ObservableObject {
     enum Preview { case image(CGImage), empty, failed }
-    struct Entry { let preview: Preview; let expires: Double; var isHidden = false }
+    struct Entry { let preview: Preview; let expires: Double; var isHidden = false; var metadata: CameraThumbnail? = nil }
     @Published private(set) var cursor: Double?
     @Published private(set) var latest: Double?
     @Published private(set) var start: Double = 0
@@ -139,6 +139,9 @@ final class CameraTimelineModel: ObservableObject {
     private var anchor: (utc: Double, host: Double)?
     private var fetchTask: Task<Void, Never>?
     private var generation = UUID()
+    private var tagObserver: Task<Void, Never>?
+    private let tagRefresh = CameraFootageRefreshTask()
+    private var tagSerial: UInt64 = 0
     private var wanted: [Int] = []
     private var viewport: Double = 700
     private var viewportPlayhead: Double = 350
@@ -166,6 +169,18 @@ final class CameraTimelineModel: ObservableObject {
         self.cameraID = cameraID; self.transport = transport
         let token = generation
         message = nil; unsupported = false
+        if let source = transport as? any CameraFootageTagRefreshing {
+            let stream = await source.tagChanges()
+            guard generation == token, !Task.isCancelled else { return }
+            tagObserver = Task { [weak self] in
+                for await change in stream {
+                    guard let self, !Task.isCancelled, self.generation == token else { return }
+                    if CameraFootageTags.affects(change, cameraID: cameraID) {
+                        self.tagSerial &+= 1; self.refreshFootageTags(using: source)
+                    }
+                }
+            }
+        }
         do {
             var request = HBNVRMediaRequest(requestID: UUID().uuidString, operation: "availability", cameraID: cameraID,
                 range: .init(start: -0.001, end: 0), relativeTo: "live")
@@ -278,6 +293,7 @@ final class CameraTimelineModel: ObservableObject {
                 let midpoint = (Double(tile) + 0.5) * CameraTimelineScale.seconds
                 let point = min(midpoint, (self.latest ?? midpoint) - 0.001)
                 do {
+                    let initialTagSerial = self.tagSerial
                     let result = try await transport.thumbnail(.init(requestID: UUID().uuidString, cameraID: self.cameraID,
                         timeline: "canonical", timestamp: point, size: .init(width: 320, height: 180)))
                     try Task.checkCancellation()
@@ -294,7 +310,10 @@ final class CameraTimelineModel: ObservableObject {
                     } else { preview = .empty }
                     // Recent/missing footage can change as shards become readable.
                     let lifetime: Double = result == nil || point < midpoint ? 60 : 3600
-                    self.previews[tile] = Entry(preview: preview, expires: self.clock() + lifetime, isHidden: result?.isHidden ?? false)
+                    self.previews[tile] = Entry(preview: preview, expires: self.clock() + lifetime, isHidden: result?.isHidden ?? false, metadata: result.map { .init(data: Data(), width: $0.width, height: $0.height, timestamp: $0.timestamp, isHidden: $0.isHidden, epochID: $0.epochID) })
+                    if self.tagSerial != initialTagSerial, let source = transport as? any CameraFootageTagRefreshing {
+                        self.refreshFootageTags(using: source)
+                    }
                 } catch is CancellationError { return }
                 catch CameraThumbnailError.unsupported {
                     guard self.generation == token, !Task.isCancelled else { return }
@@ -307,7 +326,29 @@ final class CameraTimelineModel: ObservableObject {
             }
         }
     }
+    private func refreshFootageTags(using source: any CameraFootageTagRefreshing) {
+        let token = generation
+        tagRefresh.schedule { [weak self] revision in
+            guard let self else { return }
+            let entries = self.previews.compactMap { key, value in value.metadata.map { (key, $0) } }
+            guard !entries.isEmpty else { return }
+            do {
+                let images = try await source.refreshThumbnails(entries.map { $0.1 }, cameraID: self.cameraID)
+                guard self.tagRefresh.isCurrent(revision), self.generation == token else { return }
+                for (entry, image) in zip(entries, images) {
+                    guard var current = self.previews[entry.0], current.metadata?.timestamp == image.timestamp,
+                          current.metadata?.epochID == image.epochID else { continue }
+                    current.isHidden = image.isHidden; current.metadata = image
+                    self.previews[entry.0] = current
+                }
+            } catch {
+                guard self.tagRefresh.isCurrent(revision), self.generation == token else { return }
+                self.message = "Footage tags could not be refreshed"
+            }
+        }
+    }
     func close() {
+        tagObserver?.cancel(); tagObserver = nil; tagRefresh.cancel()
         generation = UUID(); dragging = false
         previews.removeAll() // Includes decrypted cloud images; never retain across authorization/background changes.
         fetchTask?.cancel(); fetchTask = nil

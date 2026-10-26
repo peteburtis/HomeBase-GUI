@@ -8,6 +8,7 @@ nonisolated struct CameraThumbnail: Sendable {
     let height: Int
     let timestamp: Double
     var isHidden = false
+    var epochID: String? = nil
 }
 nonisolated protocol CameraThumbnailFetching: CameraHistoryFetching {
     func thumbnail(_ request: HBNVRThumbnailRequest) async throws -> CameraThumbnail?
@@ -21,6 +22,8 @@ nonisolated struct CameraThumbnailParser {
         let mimeType: String; let width: Int; let height: Int; let byteCount: Int
         let timestamp: Double; let keyFrame: Bool
         let tags: [String: String]?
+        struct Time: Decodable { let epochID: String }
+        let time: Time?
     }
     private struct Record: Decodable {
         let type: String; let requestID: String
@@ -69,7 +72,7 @@ nonisolated struct CameraThumbnailParser {
                 guard record.outcome == "complete", record.frames == 1, self.data.count == header.byteCount else {
                     throw CameraHistoryError.invalidResponse
                 }
-                result = CameraThumbnail(data: self.data, width: header.width, height: header.height, timestamp: header.timestamp, isHidden: CameraVideoTags.hidden(header.tags))
+                result = CameraThumbnail(data: self.data, width: header.width, height: header.height, timestamp: header.timestamp, isHidden: CameraVideoTags.hidden(header.tags), epochID: header.time?.epochID)
             } else {
                 guard record.outcome == "unavailable", record.frames == 0 else { throw CameraHistoryError.invalidResponse }
             }

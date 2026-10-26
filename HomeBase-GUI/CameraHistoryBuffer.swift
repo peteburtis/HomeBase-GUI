@@ -37,6 +37,10 @@ nonisolated struct CameraHistoryBuffer {
             batches.remove(at: index)
         }
     }
+    mutating func replaceTags(in batch: CameraHistoryBatch) {
+        guard let index = batches.firstIndex(where: { $0.batch.id == batch.id }) else { return }
+        batches[index] = Stored(batch: batch, received: batches[index].received)
+    }
     mutating func removeAll() { batches.removeAll() }
 
     /// Near-edge gaps are provisional: a file fragment can become readable on

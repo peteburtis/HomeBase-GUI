@@ -19,6 +19,83 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         var state = DeviceMetadataObservation()
     }
     private var metadataObservers: [UUID: MetadataObserver] = [:]
+    private struct FootageTagObserver {
+        let cameraID: String?
+        let continuation: AsyncStream<HBNVRTagChange>.Continuation
+    }
+    private var footageTagObservers: [UUID: FootageTagObserver] = [:]
+    private var footageTagSerial: UInt64 = 0
+    private var footageTagInstance: String?
+    private var footageTagRevision: UInt64 = 0
+    private var footageTagsUnsupported = false
+
+    func footageTagChanges(cameraID: String? = nil) -> AsyncStream<HBNVRTagChange> {
+        let id = UUID(), pair = AsyncStream<HBNVRTagChange>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        footageTagObservers[id] = .init(cameraID: cameraID, continuation: pair.continuation)
+        pair.continuation.onTermination = { [weak self] _ in Task { await self?.removeFootageTagObserver(id) } }
+        return pair.stream
+    }
+    private func removeFootageTagObserver(_ id: UUID) { footageTagObservers.removeValue(forKey: id) }
+    func receiveFootageTagChange(_ value: HBNVRTagChange) throws {
+        try value.validate()
+        footageTagsUnsupported = false
+        let reset = value.reset || footageTagInstance != value.instanceID
+            || (footageTagInstance != nil && footageTagRevision < UInt64.max && value.revision > footageTagRevision + 1)
+        guard reset || value.revision > footageTagRevision else { return }
+        footageTagInstance = value.instanceID; footageTagRevision = value.revision; footageTagSerial &+= 1
+        let change = reset ? CameraFootageTags.reset(value) : value
+        for observer in footageTagObservers.values where observer.cameraID.map({ CameraFootageTags.affects(change, cameraID: $0) }) ?? true {
+            CameraFootageTags.yield(change, to: observer.continuation)
+        }
+    }
+    private func invalidateFootageTags() {
+        footageTagSerial &+= 1
+        guard let instance = footageTagInstance else { return }
+        let change = HBNVRTagChange(instanceID: instance, revision: footageTagRevision, reset: true, ranges: [])
+        for observer in footageTagObservers.values { CameraFootageTags.yield(change, to: observer.continuation) }
+    }
+    func footageTagSnapshot(instanceID: String, query: HBNVRTagQuery) async throws -> HBNVRTagSnapshot? {
+        if footageTagsUnsupported { return nil }
+        try query.validate()
+        let deadline = ProcessInfo.processInfo.systemUptime + min(5, requestTimeout)
+        for _ in 0..<2 {
+            try await connect()
+            let serial = footageTagSerial, instance = footageTagInstance ?? instanceID
+            let request = try sessionRequest(operation: HBProtocolOperations.snapshotNVRTags,
+                payload: HBNVRTagSnapshotRequest(nvrInstanceID: instance, query: query))
+            do {
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                guard remaining > 0 else { throw URLError(.timedOut) }
+                let reply = try await sendRequest(request, timeout: remaining)
+                let snapshot = try reply.decodedPayload(as: HBProtocolResponse.self).decodedResult(as: HBNVRTagSnapshot.self)
+                try snapshot.validate()
+                guard snapshot.instanceID == instance, snapshot.cameraID.caseInsensitiveCompare(query.cameraID) == .orderedSame else {
+                    throw ClientError.invalidMessage("Footage tag snapshot identity changed")
+                }
+                if serial == footageTagSerial && (footageTagInstance != instance || snapshot.revision >= footageTagRevision) {
+                    // Remember identity for disconnect invalidation, without
+                    // moving the event cursor past other windows' updates.
+                    if footageTagInstance == nil { footageTagInstance = snapshot.instanceID }
+                    return snapshot
+                }
+            } catch let error as HBProtocolError where error.code == HBProtocolErrorCodes.unknownOperation || error.code == "unsupported_operation" {
+                footageTagsUnsupported = true; return nil
+            } catch let error as HBProtocolError where error.code == HBProtocolErrorCodes.permissionDenied {
+                // Older daemons classify unknown operations as administrative.
+                // Only explicit capability discovery proves this is legacy;
+                // a real denial from a capable server must remain an error.
+                let reply = try await sendRequest(sessionRequest(operation: HBProtocolOperations.describeProtocol))
+                let description = try reply.decodedPayload(as: HBProtocolResponse.self).decodedResult(as: HBJSONValue.self)
+                if let operations = description.objectValue?["authorization"]?.objectValue?["userOperations"]?.arrayValue,
+                   operations.allSatisfy({ $0.stringValue != nil }),
+                   !operations.contains(.string(HBProtocolOperations.snapshotNVRTags)) {
+                    footageTagsUnsupported = true; return nil
+                }
+                throw error
+            }
+        }
+        throw ClientError.resynchronizationRequired("Footage tags changed during metadata refresh")
+    }
     struct CameraLiveLease: Sendable {
         let mediaHost: String
         let opened: HBCameraLiveOpenResult
@@ -586,11 +663,16 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
             group.addTask { try await transport.receive() }
             group.addTask {
                 try await Task.sleep(for: .seconds(timeout))
-                transport.close()
                 throw URLError(.timedOut)
             }
             defer { group.cancelAll() }
-            return try await group.next()!
+            do { return try await group.next()! }
+            catch {
+                // Record the winning deadline error before closing the socket;
+                // otherwise its cancelled receive can race and mask timeout.
+                transport.close()
+                throw error
+            }
         }
     }
     private func adopt(_ candidate: PreparedConnection) {
@@ -598,6 +680,8 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         task = candidate.transport
         sessionID = candidate.id; resumeToken = candidate.token; serverInstanceID = candidate.instance
         acknowledgedDeliverySequence = candidate.checkpoint
+        footageTagsUnsupported = false
+        invalidateFootageTags()
         startReceiveLoop(using: candidate.transport)
         publishRoute(candidate.transport.route)
         if candidate.transport.route == .bluetooth { scheduleWebSocketPreference() }
@@ -1599,6 +1683,10 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
     }
 
     func disconnect() async {
+        // Explicit teardown must not prompt observers to reconnect. Transport
+        // failures keep observers alive and send reset instead.
+        for observer in footageTagObservers.values { observer.continuation.finish() }
+        footageTagObservers.removeAll()
         connectionIntent &+= 1
         let arbiter = liveStreamArbiter
         liveStreamArbiter = nil
@@ -1647,11 +1735,11 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
     }
 
     private func sendRequest(
-        _ request: HBProtocolEnvelope
+        _ request: HBProtocolEnvelope, timeout: TimeInterval? = nil
     ) async throws -> HBProtocolEnvelope {
         if let handoverTask { try await handoverTask.value }
         guard let task else { throw ClientError.notConnected }
-        return try await sendRequest(request, using: task)
+        return try await sendRequest(request, using: task, timeout: timeout)
     }
 
     private func sendRequest(
@@ -1935,6 +2023,9 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
 
     private func processEvent(_ envelope: HBProtocolEnvelope) throws {
         switch envelope.operation {
+        case HBProtocolOperations.nvrTagsChanged:
+            guard envelope.deliverySequence != nil else { throw ClientError.invalidMessage("Unsequenced footage tag event") }
+            try receiveFootageTagChange(envelope.decodedPayload(as: HBNVRTagChange.self))
         case HBProtocolOperations.deviceMetadataChanged:
             let event = try envelope.decodedPayload(as: HBDeviceMetadataChanged.self)
             guard let sequence = envelope.deliverySequence else { throw ClientError.invalidMessage("unsequenced metadata event") }
@@ -2340,6 +2431,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
             acknowledgedDeliverySequence = 0
         }
 
+        invalidateFootageTags()
         let pending = pendingResponses.values
         let observers = metadataObservers.values
         metadataObservers.removeAll()

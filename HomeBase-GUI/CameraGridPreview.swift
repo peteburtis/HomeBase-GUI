@@ -23,6 +23,10 @@ final class CameraGridPreviewModel: ObservableObject {
     private var thumbnailCandidates: Set<String> = []
     private var thumbnailsUnsupported = false
     private var generation = UUID()
+    private var client: HomeBaseWebSocketClient?
+    private var cached: [String: (metadata: CameraThumbnail, image: CGImage)] = [:]
+    private let tagRefresh = CameraFootageRefreshTask()
+    private var tagSerial: UInt64 = 0
     private let makeTransport: @Sendable () async -> any CameraThumbnailFetching
     private let decode: (CameraThumbnail) throws -> CGImage
     private let sleep: @Sendable (Double) async throws -> Void
@@ -35,6 +39,7 @@ final class CameraGridPreviewModel: ObservableObject {
         }
     ) {
         makeTransport = { await client.makeHistoryTransport() }
+        self.client = client
         self.decode = decode
         self.sleep = sleep
     }
@@ -61,7 +66,30 @@ final class CameraGridPreviewModel: ObservableObject {
         prepare(cameras)
         guard !thumbnailsUnsupported, !thumbnailCandidates.isEmpty else { return }
 
-        let transport = await makeTransport()
+        var transport: any CameraThumbnailFetching = await makeTransport()
+        if let client {
+            let updates = await client.footageTagChanges()
+            let instances = Dictionary(cameras.compactMap { camera -> (String, String)? in
+                guard let metadata = CameraPlaybackHistoryAvailability.metadata(in: camera.device.metadata) else { return nil }
+                return (metadata.cameraID.lowercased(), metadata.nvrInstanceID)
+            }, uniquingKeysWith: { first, _ in first })
+            let tagged = CameraTaggedHistorySource(source: transport, updates: updates) { query in
+                guard let instance = instances[query.cameraID.lowercased()] else { throw CameraHistoryError.invalidResponse }
+                return try await client.footageTagSnapshot(instanceID: instance, query: query)
+            }
+            await tagged.observe(); transport = tagged
+        }
+        var observer: Task<Void, Never>?
+        if let source = transport as? any CameraFootageTagRefreshing {
+            let stream = await source.tagChanges()
+            observer = Task { [weak self] in
+                for await _ in stream {
+                    guard let self, !Task.isCancelled, self.generation == token else { return }
+                    self.tagSerial &+= 1
+                    self.refreshFootageTags(cameras: cameras, source: source, token: token)
+                }
+            }
+        }
         await transport.start()
         do {
             while !Task.isCancelled, generation == token {
@@ -72,7 +100,30 @@ final class CameraGridPreviewModel: ObservableObject {
         } catch {
             // Individual requests already select or retain their fallback.
         }
+        observer?.cancel()
+        if generation == token { tagRefresh.cancel() }
         await transport.close()
+    }
+
+    private func refreshFootageTags(cameras: [CameraVideoDevice], source: any CameraFootageTagRefreshing, token: UUID) {
+        tagRefresh.schedule { [weak self] revision in
+            guard let self else { return }
+            for camera in cameras {
+                guard let metadata = CameraPlaybackHistoryAvailability.metadata(in: camera.device.metadata),
+                      let entry = self.cached[camera.id] else { continue }
+                do {
+                    guard let image = try await source.refreshThumbnails([entry.metadata], cameraID: metadata.cameraID).first else { continue }
+                    guard self.tagRefresh.isCurrent(revision), self.generation == token else { return }
+                    guard self.cached[camera.id]?.metadata.timestamp == image.timestamp,
+                          self.cached[camera.id]?.metadata.epochID == image.epochID else { continue }
+                    self.cached[camera.id] = (image, entry.image)
+                    self.previews[camera.id] = image.isHidden ? .hidden : .thumbnail(entry.image, timestamp: image.timestamp)
+                } catch {
+                    // Preserve the last accepted state. The next event or
+                    // normal ten-second poll supplies another bounded attempt.
+                }
+            }
+        }
     }
 
     /// Internal so the source-selection policy can be tested without a timer.
@@ -93,6 +144,7 @@ final class CameraGridPreviewModel: ObservableObject {
             ) else { continue }
 
             do {
+                let initialTagSerial = tagSerial
                 let thumbnail = try await transport.thumbnail(HBNVRThumbnailRequest(
                     requestID: UUID().uuidString,
                     cameraID: metadata.cameraID,
@@ -104,12 +156,18 @@ final class CameraGridPreviewModel: ObservableObject {
                 try Task.checkCancellation()
                 guard generation == activeToken else { return false }
                 if let thumbnail {
+                    let image = try decode(thumbnail)
+                    self.cached[camera.id] = (.init(data: Data(), width: thumbnail.width, height: thumbnail.height,
+                        timestamp: thumbnail.timestamp, isHidden: thumbnail.isHidden, epochID: thumbnail.epochID), image)
+                    if tagSerial != initialTagSerial, let source = transport as? any CameraFootageTagRefreshing {
+                        refreshFootageTags(cameras: cameras, source: source, token: activeToken)
+                    }
                     if thumbnail.isHidden {
                         previews[camera.id] = .hidden
                         continue
                     }
                     previews[camera.id] = .thumbnail(
-                        try decode(thumbnail),
+                        image,
                         timestamp: thumbnail.timestamp
                     )
                 } else {
@@ -140,6 +198,7 @@ final class CameraGridPreviewModel: ObservableObject {
     private func prepare(_ cameras: [CameraVideoDevice]) {
         let cameraIDs = Set(cameras.map(\.id))
         previews = previews.filter { cameraIDs.contains($0.key) }
+        cached = cached.filter { cameraIDs.contains($0.key) }
         let candidates = Set(cameras.compactMap { camera in
             CameraPlaybackHistoryAvailability.metadata(in: camera.device.metadata) == nil
                 ? nil
