@@ -223,6 +223,19 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertTrue(controls.hasAnyControl)
     }
 
+    func testShutterStillDiscoversExistingEnginePrivacyControls() {
+        let metadataControl = liveControl(
+            identifier: "Vendor.Privacy", kind: "BinarySwitch", value: 1,
+            metadata: ["cameraPrivacy": true]
+        )
+        let semanticControl = liveControl(
+            identifier: "Privacy.Enabled", kind: "BinarySwitch", value: 0
+        )
+        XCTAssertEqual(CameraDetailControlSet(controls: [metadataControl]).shutter?.id, metadataControl.id)
+        XCTAssertEqual(CameraDetailControlSet(controls: [semanticControl]).shutter?.id, semanticControl.id)
+        XCTAssertEqual(CameraDetailControlSet(controls: [metadataControl]).observedShutterClosed, true)
+    }
+
     func testDetailControlsUseStandardSemanticFallbacks() {
         let tilt = liveControl(
             identifier: "PTZ.Tilt.Position",

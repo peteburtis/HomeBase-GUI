@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import HomeBaseProtocol
 import VideoToolbox
 import XCTest
@@ -6,6 +7,125 @@ import XCTest
 
 @MainActor
 final class CameraLivePlaybackTests: XCTestCase {
+    func testVeilBlanksNativeOutputsBeforePublishingCoverAndBeforeBootstrap() async throws {
+        let fixture = try video(), owner = UUID()
+        let controller = CameraLivePlaybackController()
+        let replica = CameraVideoDisplayReplica()
+        _ = try controller.configure(fixture.configuration, ownerID: owner)
+        controller.renderer.displayRelay.attach(replica)
+        defer { controller.renderer.displayRelay.detach(replica); controller.close() }
+        let observation = controller.$isFrameHidden.dropFirst().sink { hidden in
+            if hidden {
+                XCTAssertTrue(controller.renderer.layer.isHidden,
+                    "The native surface must already be black when SwiftUI learns about the veil")
+                XCTAssertTrue(replica.layer.isHidden)
+            }
+        }
+        for (index, var frame) in fixture.frames.prefix(3).enumerated() {
+            frame.tags = index == 1 ? ["homebase.hidden": "true"] : [:]
+            _ = try controller.receive(frame, ownerID: owner)
+            if index == 1 {
+                XCTAssertTrue(controller.renderer.layer.isHidden)
+                let connecting = CameraVideoDisplayReplica()
+                controller.renderer.displayRelay.attach(connecting)
+                XCTAssertTrue(connecting.layer.isHidden,
+                    "An external display must be veiled before replaying its cached GOP")
+                controller.renderer.displayRelay.detach(connecting)
+            }
+        }
+        for _ in 0..<100 where controller.renderer.layer.isHidden || replica.layer.isHidden {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertFalse(controller.renderer.layer.isHidden, "Public dependent frames resume without another keyframe")
+        XCTAssertFalse(replica.layer.isHidden)
+        withExtendedLifetime(observation) {}
+    }
+
+    func testReCoverKeepsNativeVideoBlackUntilRevealedImageHasBeenRemoved() async throws {
+        let display = CameraVideoDisplayReplica()
+        display.setVeiled(true)
+        display.flush(removingDisplayedImage: true)
+        display.setVeiled(false)
+        XCTAssertTrue(display.layer.isHidden,
+            "Removing the SwiftUI cover must not expose an image whose asynchronous flush is still pending")
+        for _ in 0..<100 where display.layer.isHidden {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertFalse(display.layer.isHidden)
+        display.flush(removingDisplayedImage: true)
+        display.setVeiled(true)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertTrue(display.layer.isHidden, "A late flush completion cannot undo a newer veil decision")
+    }
+
+    func testBufferedSeekBlanksHiddenTargetBeforeDecoderPrerollStarts() async throws {
+        let fixture = try video(), owner = UUID()
+        let controller = CameraLivePlaybackController()
+        _ = try controller.configure(fixture.configuration, ownerID: owner)
+        defer { controller.close() }
+        for (index, var frame) in fixture.frames.enumerated() {
+            frame.tags = index < 15 ? ["homebase.hidden": "true"] : [:]
+            _ = try controller.receive(frame, ownerID: owner)
+        }
+        XCTAssertFalse(controller.isVeiled)
+        controller.seek(by: -2)
+        XCTAssertTrue(controller.isVeiled)
+        XCTAssertTrue(controller.renderer.layer.isHidden,
+            "Seeking must cover before yielding to the asynchronous preroll task")
+    }
+
+    func testReadingHistoryPositionDoesNotPublishWhileLoading() {
+        for paused in [false, true] {
+            let controller = CameraLivePlaybackController()
+            defer { controller.close() }
+            controller.setNVRHistoryAvailable(true)
+            controller.seek(to: Date(timeIntervalSince1970: 940), paused: paused)
+            XCTAssertEqual(controller.historyState, .loading)
+            var publications = 0
+            let observation = controller.objectWillChange.sink { publications += 1 }
+            for _ in 0..<10 {
+                XCTAssertEqual(controller.positionForCameraSwitch(metadata: [:]), .canonical(940, paused: paused))
+            }
+            XCTAssertEqual(publications, 0,
+                "The history toolbar reads this snapshot during body evaluation; publishing here creates a redraw loop")
+            withExtendedLifetime(observation) {}
+        }
+    }
+
+    func testReadingBufferedPositionDoesNotAdvancePlaybackClock() throws {
+        var now = 0.0
+        let fixture = try video(), owner = UUID()
+        let controller = CameraLivePlaybackController(clock: { now })
+        defer { controller.close() }
+        _ = try controller.configure(fixture.configuration, ownerID: owner)
+        _ = try controller.receive(fixture.frames[0], ownerID: owner)
+        controller.togglePause()
+        for frame in fixture.frames.dropFirst() { _ = try controller.receive(frame, ownerID: owner) }
+        controller.togglePause()
+        let cursor = controller.timeline.position
+        now = 0.25
+        for _ in 0..<10 { _ = controller.positionForCameraSwitch(metadata: [:]) }
+        XCTAssertEqual(controller.timeline.position, cursor, "View reads must not drive playback")
+        controller.tick()
+        XCTAssertEqual(try XCTUnwrap(controller.timeline.position), 0.25, accuracy: 0.000_001,
+            "The ticker must still consume the elapsed time")
+    }
+
+    func testHiddenStatePublishesOnlyAtLiveTagTransitions() throws {
+        let fixture = try video(), owner = UUID()
+        let controller = CameraLivePlaybackController()
+        defer { controller.close() }
+        _ = try controller.configure(fixture.configuration, ownerID: owner)
+        var hiddenStates: [Bool] = []
+        let observation = controller.$isFrameHidden.dropFirst().sink { hiddenStates.append($0) }
+        for (index, var frame) in fixture.frames.prefix(8).enumerated() {
+            frame.tags = (2..<5).contains(index) ? ["homebase.hidden": "true"] : [:]
+            _ = try controller.receive(frame, ownerID: owner)
+        }
+        XCTAssertEqual(hiddenStates, [true, false], "Ordinary video frames must not invalidate the whole viewer")
+        withExtendedLifetime(observation) {}
+    }
+
     func testExternalDisplayCannotRevealHiddenBootstrapOrRetainImageAfterReCovering() async throws {
         let clip = try video(), owner = UUID()
         let playback = CameraLivePlaybackController()

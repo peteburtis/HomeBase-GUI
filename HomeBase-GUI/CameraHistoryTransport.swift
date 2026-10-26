@@ -6,12 +6,33 @@ typealias CameraHistoryBeginHandler = @Sendable (CameraHistoryRange, Double?) as
 nonisolated protocol CameraHistoryFetching: Sendable {
     func start() async
     func fetch(_ request: HBNVRMediaRequest, onBegin: CameraHistoryBeginHandler?) async throws -> CameraHistoryBatch
+    func neighbors(_ request: HBNVRMediaRequest, excludingHidden: Bool) async throws -> CameraHistoryBatch
     func close() async
 }
 
 extension CameraHistoryFetching {
+    nonisolated func neighbors(_ request: HBNVRMediaRequest, excludingHidden: Bool) async throws -> CameraHistoryBatch {
+        guard request.operation == "neighbors" else { throw CameraHistoryError.invalidResponse }
+        guard !excludingHidden else { throw CameraHistoryError.hiddenNeighborsUnsupported }
+        return try await fetch(request)
+    }
     nonisolated func fetch(_ request: HBNVRMediaRequest) async throws -> CameraHistoryBatch {
         try await fetch(request, onBegin: nil)
+    }
+}
+
+/// Keep the optional v1 extension at the client boundary. This also builds with
+/// shared protocol packages that predate the hidden-neighbor request property.
+nonisolated struct CameraHistoryNeighborRequest: Encodable {
+    let request: HBNVRMediaRequest
+    let excludeHidden: Bool
+    private enum CodingKeys: String, CodingKey { case excludeHidden }
+    func encode(to encoder: any Encoder) throws {
+        try request.encode(to: encoder)
+        if excludeHidden {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(true, forKey: .excludeHidden)
+        }
     }
 }
 
@@ -42,6 +63,7 @@ actor CameraHistoryTransport: CameraHistoryFetching {
         let socket: any CameraHistorySocket
         let keepalive: Bool
         let neighbors: Bool
+        let hiddenNeighbors: Bool
         let thumbnails: Bool
         let opened: Double
     }
@@ -51,6 +73,7 @@ actor CameraHistoryTransport: CameraHistoryFetching {
         let maxMessageBytes: Int
         let supportsKeepalive: Bool?
         let supportsNeighbors: Bool?
+        let supportsHiddenNeighbors: Bool?
         let supportsThumbnails: Bool?
     }
     private struct Alive: Decodable { let type: String; let requestID: String }
@@ -114,6 +137,16 @@ actor CameraHistoryTransport: CameraHistoryFetching {
     }
 
     func fetch(_ request: HBNVRMediaRequest, onBegin: CameraHistoryBeginHandler?) async throws -> CameraHistoryBatch {
+        try await fetch(request, excludingHidden: false, onBegin: onBegin)
+    }
+
+    func neighbors(_ request: HBNVRMediaRequest, excludingHidden: Bool) async throws -> CameraHistoryBatch {
+        guard request.operation == "neighbors" else { throw CameraHistoryError.invalidResponse }
+        return try await fetch(request, excludingHidden: excludingHidden, onBegin: nil)
+    }
+
+    private func fetch(_ request: HBNVRMediaRequest, excludingHidden: Bool,
+                       onBegin: CameraHistoryBeginHandler?) async throws -> CameraHistoryBatch {
         var request = request
         if request.operation == "frames" { request.includeTags = true }
         try request.validate()
@@ -123,6 +156,7 @@ actor CameraHistoryTransport: CameraHistoryFetching {
         if let heartbeat { try? await heartbeat.value }
         try Task.checkCancellation()
         let value = try await ready()
+        guard !excludingHidden || value.hiddenNeighbors else { throw CameraHistoryError.hiddenNeighborsUnsupported }
         guard request.operation != "neighbors" || value.neighbors else { throw CameraHistoryError.neighborsUnsupported }
         let deadline = ProcessInfo.processInfo.systemUptime + requestTimeout
         let watchdog = Task {
@@ -134,7 +168,7 @@ actor CameraHistoryTransport: CameraHistoryFetching {
         do {
             return try await withTaskCancellationHandler {
                 try Task.checkCancellation()
-                let encoded = try JSONEncoder().encode(request)
+                let encoded = try JSONEncoder().encode(CameraHistoryNeighborRequest(request: request, excludeHidden: excludingHidden))
                 try await value.socket.send(.string(String(decoding: encoded, as: UTF8.self)))
                 while parser.result == nil {
                     try Task.checkCancellation()
@@ -239,6 +273,7 @@ actor CameraHistoryTransport: CameraHistoryFetching {
                           info.framing == "websocket-text-json,binary-chunks" else { throw CameraHistoryError.invalidResponse }
                     try Task.checkCancellation()
                     return Connection(socket: socket, keepalive: info.supportsKeepalive == true, neighbors: info.supportsNeighbors == true,
+                                      hiddenNeighbors: info.supportsHiddenNeighbors == true,
                                       thumbnails: info.supportsThumbnails == true,
                                       opened: ProcessInfo.processInfo.systemUptime)
                 } onCancel: { socket.close() }

@@ -89,6 +89,46 @@ nonisolated struct CameraVideoTagTimeline: Codable, Equatable, Sendable {
         }
         return hidden
     }
+
+    /// Navigation uses recorder ticks as an approximation of container sample
+    /// boundaries. Playback still uses hidden(ticks:frame:) with actual samples.
+    func approximateVisibleRanges(endTicks: Int64) -> [Range<Int64>] {
+        guard endTicks > 0 else { return [] }
+        struct Boundary {
+            var baseHidden: Bool?
+            var starting: [Int] = []
+            var ending: [Int] = []
+        }
+        var boundaries: [Int64: Boundary] = [0: Boundary(), endTicks: Boundary()]
+        for change in changes where change.ticks < endTicks {
+            boundaries[change.ticks, default: Boundary()].baseHidden = CameraVideoTags.hidden(change.tags)
+        }
+        if let unknownFromTicks, unknownFromTicks < endTicks {
+            boundaries[unknownFromTicks, default: Boundary()].baseHidden = false
+        }
+        let edits = overrides ?? []
+        for (index, edit) in edits.enumerated() where edit.key == CameraVideoTags.hiddenKey {
+            let start = max(0, edit.start), end = min(endTicks, edit.end)
+            guard start < end else { continue }
+            boundaries[start, default: Boundary()].starting.append(index)
+            boundaries[end, default: Boundary()].ending.append(index)
+        }
+        let ticks = boundaries.keys.sorted()
+        var baseHidden = false, active = IndexSet()
+        var result: [Range<Int64>] = []
+        for (start, end) in zip(ticks, ticks.dropFirst()) {
+            let boundary = boundaries[start]!
+            if let value = boundary.baseHidden { baseHidden = value }
+            for index in boundary.ending { active.remove(index) }
+            for index in boundary.starting { active.insert(index) }
+            let hidden = active.last.map { edits[$0].value != nil } ?? baseHidden
+            if !hidden {
+                if let last = result.last, last.upperBound == start { result[result.count - 1] = last.lowerBound..<end }
+                else { result.append(start..<end) }
+            }
+        }
+        return result
+    }
 }
 
 nonisolated struct CameraStoredVideoTags: Codable, Equatable, Sendable {

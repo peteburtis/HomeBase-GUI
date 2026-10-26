@@ -657,7 +657,7 @@ struct CameraHistoryTimeline: View {
                     case .image(let image):
                         if entry.isHidden && !showsHiddenVideo {
                             Color.black
-                            Image(systemName: "eye.slash").foregroundStyle(.white).accessibilityLabel("Private Video")
+                            Image(systemName: "eye.slash").foregroundStyle(.white).accessibilityLabel("Hidden")
                         } else { Image(decorative: image, scale: 1).resizable().aspectRatio(contentMode: .fill) }
                     case .empty: Text("No preview").font(.caption2)
                     case .failed: Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)

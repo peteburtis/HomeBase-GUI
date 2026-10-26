@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Combine
 import VideoToolbox
 import HomeBaseProtocol
 import XCTest
@@ -8,6 +9,49 @@ import XCTest
 @MainActor
 final class CameraHistoryTests: XCTestCase {
     let camera = UUID().uuidString
+
+    func testReadingReadyAndGapPositionsDoesNotDrivePlaybackOrPublish() async throws {
+        for unavailable in [false, true] {
+            var now = 0.0
+            let controller = CameraLivePlaybackController(clock: { now })
+            defer { controller.close() }
+            controller.setNVRHistoryAvailable(true)
+            controller.history.configure(cameraID: camera, transport: HistoryFetcher(unavailable: unavailable))
+            controller.seek(to: Date(timeIntervalSince1970: 940), paused: false)
+            try await settled(controller.history)
+            XCTAssertEqual(controller.historyState, unavailable ? .gap : .ready)
+            let cursor = try XCTUnwrap(controller.history.position)
+            var publications = 0
+            let observation = controller.objectWillChange.sink { publications += 1 }
+            now = 0.25
+            for _ in 0..<10 {
+                XCTAssertEqual(controller.positionForCameraSwitch(metadata: [:]), .canonical(cursor, paused: false))
+            }
+            XCTAssertEqual(controller.history.position, cursor)
+            XCTAssertEqual(publications, 0, "Toolbar evaluation cannot advance history, start decoding, or publish")
+            controller.tick()
+            XCTAssertEqual(try XCTUnwrap(controller.history.position), cursor + 0.25, accuracy: 0.000_001)
+            withExtendedLifetime(observation) {}
+        }
+    }
+
+    func testLoadingAndGapTicksDoNotRepublishUnchangedHiddenState() async throws {
+        let controller = CameraLivePlaybackController()
+        defer { controller.close() }
+        controller.setNVRHistoryAvailable(true)
+        controller.seek(to: Date(timeIntervalSince1970: 940), paused: true)
+        var hiddenStates: [Bool] = []
+        let observation = controller.$isFrameHidden.dropFirst().sink { hiddenStates.append($0) }
+        for _ in 0..<10 { controller.tick() }
+        XCTAssertEqual(hiddenStates, [])
+        controller.history.configure(cameraID: camera, transport: HistoryFetcher(unavailable: true))
+        try await settled(controller.history)
+        XCTAssertEqual(controller.historyState, .gap)
+        hiddenStates.removeAll()
+        for _ in 0..<10 { controller.tick() }
+        XCTAssertEqual(hiddenStates, [], "A black gap is stable presentation state")
+        withExtendedLifetime(observation) {}
+    }
 
     func testHistorySuspensionPreservesPausedPositionAndCacheThroughReconnect() async throws {
         for initiallyPaused in [false, true] {
@@ -155,6 +199,44 @@ final class CameraHistoryTests: XCTestCase {
         let operations = await socket.core.operations
         XCTAssertFalse(operations.contains("neighbors"))
         _ = try await transport.fetch(self.request())
+        await transport.close()
+    }
+
+    func testHiddenNeighborCapabilityAndWireFilterKeepOrdinaryRequestsUsable() async throws {
+        let request = HBNVRMediaRequest(requestID: "hidden", operation: "neighbors", cameraID: camera,
+            timeline: "canonical", range: .init(start: 100, end: 102))
+        for supported in [false, true] {
+            let socket = HistorySocket(neighbors: true, hiddenNeighbors: supported)
+            let transport = CameraHistoryTransport(makeSocket: { socket })
+            if supported {
+                let result = try await transport.neighbors(request, excludingHidden: true)
+                XCTAssertEqual(result.neighbors, .init(previous: nil, next: nil))
+            } else {
+                do { _ = try await transport.neighbors(request, excludingHidden: true); XCTFail("Must negotiate before sending") }
+                catch { XCTAssertEqual(error as? CameraHistoryError, .hiddenNeighborsUnsupported) }
+                let sent = await socket.core.operations
+                XCTAssertFalse(sent.contains("neighbors"))
+            }
+            _ = try await transport.neighbors(request, excludingHidden: false)
+            let filters = await socket.core.neighborFilters
+            XCTAssertEqual(filters, supported ? [true, nil] : [nil])
+            _ = try await transport.fetch(self.request())
+            await transport.close()
+        }
+    }
+
+    func testHiddenNeighborServerErrorNeverConfirmsAnEmptyArchiveAndKeepsSessionUsable() async throws {
+        let socket = HistorySocket(neighbors: true, hiddenNeighbors: true, neighborError: true)
+        let transport = CameraHistoryTransport(makeSocket: { socket })
+        let request = HBNVRMediaRequest(requestID: "hidden", operation: "neighbors", cameraID: camera,
+            range: .init(start: 100, end: 102))
+        do { _ = try await transport.neighbors(request, excludingHidden: true); XCTFail("An error is not an empty neighbors reply") }
+        catch {
+            XCTAssertEqual((error as? CameraHistoryFetchFailure)?.underlying as? CameraHistoryError, .remote(3, "Search incomplete"))
+        }
+        _ = try await transport.fetch(self.request())
+        let operations = await socket.core.operations
+        XCTAssertEqual(operations.filter { $0 == HBProtocolOperations.openSession }.count, 1)
         await transport.close()
     }
 
@@ -867,6 +949,9 @@ private actor HistoryFetcher: CameraHistoryFetching {
     }
     func start() {}
     func close() {}
+    func neighbors(_ request: HBNVRMediaRequest, excludingHidden: Bool) async throws -> CameraHistoryBatch {
+        try await fetch(request)
+    }
     func fetch(_ request: HBNVRMediaRequest, onBegin: CameraHistoryBeginHandler?) async throws -> CameraHistoryBatch {
         requests.append(request)
         if rejectLive && request.relativeTo == "live" { throw CameraHistoryError.remote(3, "No live frame") }
@@ -903,20 +988,31 @@ private actor HistoryBeginProbe {
 
 private nonisolated final class HistorySocket: CameraHistorySocket, Sendable {
     let core: Core
-    init(keepalive: Bool = true, blockFrames: Bool = false, thumbnails: Bool = false) { core = Core(keepalive: keepalive, blockFrames: blockFrames, thumbnails: thumbnails) }
+    init(keepalive: Bool = true, blockFrames: Bool = false, thumbnails: Bool = false,
+         neighbors: Bool = false, hiddenNeighbors: Bool = false, neighborError: Bool = false) {
+        core = Core(keepalive: keepalive, blockFrames: blockFrames, thumbnails: thumbnails,
+            neighbors: neighbors, hiddenNeighbors: hiddenNeighbors, neighborError: neighborError)
+    }
     func send(_ message: URLSessionWebSocketTask.Message) async throws { try await core.send(message) }
     func receive() async throws -> URLSessionWebSocketTask.Message { try await core.receive() }
     func close() { Task { await core.close() } }
     actor Core {
         var operations: [String] = []
+        var neighborFilters: [Bool?] = []
         var messages: [URLSessionWebSocketTask.Message] = []
         var bufferedMessageCount: Int { messages.count }
         let session = UUID(), keepalive: Bool
         let blockFrames: Bool
         let thumbnails: Bool
+        let neighbors: Bool
+        let hiddenNeighbors: Bool
+        let neighborError: Bool
         var closed = false
         var waiting: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
-        init(keepalive: Bool, blockFrames: Bool, thumbnails: Bool) { self.keepalive = keepalive; self.blockFrames = blockFrames; self.thumbnails = thumbnails }
+        init(keepalive: Bool, blockFrames: Bool, thumbnails: Bool, neighbors: Bool, hiddenNeighbors: Bool, neighborError: Bool) {
+            self.keepalive = keepalive; self.blockFrames = blockFrames; self.thumbnails = thumbnails
+            self.neighbors = neighbors; self.hiddenNeighbors = hiddenNeighbors; self.neighborError = neighborError
+        }
         func send(_ message: URLSessionWebSocketTask.Message) throws {
             guard !closed, case .string(let string) = message else { throw URLError(.cancelled) }
             let data = Data(string.utf8)
@@ -933,13 +1029,24 @@ private nonisolated final class HistorySocket: CameraHistorySocket, Sendable {
                 } else {
                     result = HBProtocolResponse(status: .success, result: try HBJSONValue(encoding: [
                         "version": HBJSONValue.integer(1), "framing": .string("websocket-text-json,binary-chunks"),
-                        "maxMessageBytes": .integer(65536), "supportsKeepalive": .bool(keepalive), "supportsThumbnails": .bool(thumbnails)]))
+                        "maxMessageBytes": .integer(65536), "supportsKeepalive": .bool(keepalive), "supportsThumbnails": .bool(thumbnails),
+                        "supportsNeighbors": .bool(neighbors), "supportsHiddenNeighbors": .bool(hiddenNeighbors)]))
                 }
                 var response = try HBProtocolEnvelope.response(to: request, body: result)
                 response.sessionID = session
                 messages.append(.string(String(decoding: try JSONEncoder().encode(response), as: UTF8.self)))
             } else if operation == "keepalive" {
                 try append(["type": "alive", "requestID": value["requestID"]!])
+            } else if operation == "neighbors" {
+                neighborFilters.append(value["excludeHidden"] as? Bool)
+                try append(["type": "begin", "requestID": value["requestID"]!, "cameraID": value["cameraID"]!,
+                    "timeline": "canonical", "range": value["range"]!])
+                if neighborError {
+                    try append(["type": "end", "requestID": value["requestID"]!, "outcome": "error", "code": 3, "error": "Search incomplete"])
+                } else {
+                    try append(["type": "neighbors", "requestID": value["requestID"]!, "neighbors": [:]])
+                    try append(["type": "end", "requestID": value["requestID"]!, "outcome": "complete", "frames": 0])
+                }
             } else if operation == "thumbnail" {
                 if blockFrames { return }
                 try append(["type": "begin", "requestID": value["requestID"]!, "cameraID": value["cameraID"]!,

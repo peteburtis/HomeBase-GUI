@@ -319,9 +319,26 @@ final class CameraLivePlaybackController: ObservableObject {
     private(set) var showsHiddenVideo = false
     var isVeiled: Bool { isFrameHidden && !showsHiddenVideo }
 
+    private func updateFrameHidden(_ hidden: Bool) {
+        renderer.setVeiled(hidden && !showsHiddenVideo)
+        // This invalidates the entire viewer, including its history toolbar.
+        // Publish only at tag transitions, not for every frame or empty tick.
+        if isFrameHidden != hidden { isFrameHidden = hidden }
+        updateBufferNavigation()
+    }
+
+    private func updateBufferNavigation() {
+        history.updateBufferNavigation(
+            position: isVeiled && timeline.hasAvailableNVRHistory ? timeline.position : nil,
+            head: timeline.head)
+    }
+
     func setShowsHiddenVideo(_ value: Bool) {
         guard showsHiddenVideo != value else { return }
         showsHiddenVideo = value
+        renderer.setVeiled(isVeiled)
+        history.setShowsHiddenVideo(value)
+        updateBufferNavigation()
         // Clear a previously revealed private image before covering it. It must
         // not reappear briefly when the next public frame removes the cover.
         if !value && isFrameHidden { renderer.reset() }
@@ -403,7 +420,9 @@ final class CameraLivePlaybackController: ObservableObject {
     }
 
     func positionForCameraSwitch(metadata: [String: HBJSONValue]) -> CameraSwitchPosition {
-        updateClock()
+        // Also read while SwiftUI evaluates the history export button. Keep
+        // snapshots side-effect free: only ticks/actions may advance playback,
+        // decode frames, or publish state back to the observing view.
         guard !isLive else { return .live }
         let source = CameraPlaybackHistoryAvailability.metadata(in: metadata)
         if let position = history.switchPosition(cameraID: source?.cameraID) { return position }
@@ -614,7 +633,7 @@ final class CameraLivePlaybackController: ObservableObject {
         guard timeline.isLive, !history.isActive else { return nil }
         guard !liveSynchronizationEnabled else { return nil }
         try activateRenderer(for: timeline.sourceEpoch)
-        isFrameHidden = CameraVideoTags.hidden(frame.tags)
+        updateFrameHidden(CameraVideoTags.hidden(frame.tags))
         let sample = try renderer.enqueue(frame, display: !isVeiled)
         return isVeiled ? nil : sample
     }
@@ -826,10 +845,10 @@ final class CameraLivePlaybackController: ObservableObject {
         if history.isActive { presentHistory(); return }
         switch timeline.presentation(includeLive: liveSynchronizationEnabled) {
         case .unchanged:
-            break
+            updateBufferNavigation()
         case .black:
-            isFrameHidden = false
             renderer.reset()
+            updateFrameHidden(false)
             if !externallyClocked, timeline.hasAvailableNVRHistory, historyTransport != nil,
                let position = timeline.position, let head = timeline.head {
                 let paused = timeline.mode == .paused
@@ -837,6 +856,7 @@ final class CameraLivePlaybackController: ObservableObject {
                 history.enter(localPosition: position, localHead: head, paused: paused)
             }
         case .frames(let frames, let resetDecoder):
+            if let target = frames.last { updateFrameHidden(CameraVideoTags.hidden(target.tags)) }
             do {
                 guard let epoch = timeline.presentationEpoch else { throw PlaybackError.missingConfiguration }
                 try activateRenderer(for: epoch)
@@ -863,7 +883,6 @@ final class CameraLivePlaybackController: ObservableObject {
                         }
                         try Task.checkCancellation()
                         let target = index == frames.count - 1
-                        if target { self.isFrameHidden = CameraVideoTags.hidden(frame.tags) }
                         try self.renderer.enqueue(frame, display: target && !self.isVeiled)
                         if index % 16 == 15 { await Task.yield() }
                     }
@@ -890,12 +909,13 @@ final class CameraLivePlaybackController: ObservableObject {
 
     private func presentHistory() {
         guard let location = history.location(preferredPiece: historyPiece) else {
-            isFrameHidden = false
             if !historyShowingBlack { renderer.reset(); historyShowingBlack = true }
+            updateFrameHidden(false)
             historyPiece = nil; historyIndex = nil
             return
         }
         let piece = location.piece, target = location.index
+        updateFrameHidden(piece.samples[target].isHidden)
         let reset = historyPiece != piece.id || historyIndex == nil || historyIndex! > target
         let start = reset ? (piece.samples[...target].lastIndex(where: { $0.frame.keyFrame }) ?? 0) : historyIndex! + 1
         guard start <= target else { return }
@@ -917,7 +937,6 @@ final class CameraLivePlaybackController: ObservableObject {
                     }
                     try Task.checkCancellation()
                     let target = index == samples.count - 1
-                    if target { self.isFrameHidden = sample.isHidden }
                     try self.renderer.enqueueHistory(sample, segment: piece.segment, display: target && !self.isVeiled)
                     if index % 16 == 15 { await Task.yield() }
                 }

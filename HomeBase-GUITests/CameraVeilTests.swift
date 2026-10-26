@@ -131,6 +131,36 @@ import UIKit
         tags.overrides = [.init(start: 0, end: 0, key: "homebase.hidden", value: nil)]
         XCTAssertThrowsError(try tags.validate())
     }
+
+    func testApproximateNavigationRangesHonorChangesOverrideOrderRemovalAndUnknownTail() throws {
+        let tags = CameraVideoTagTimeline(version: 2, changes: [
+            .init(ticks: 0, frame: 0, tags: [:]),
+            .init(ticks: 10, frame: 1, tags: ["homebase.hidden": "false"]),
+            .init(ticks: 20, frame: 2, tags: [:]),
+            .init(ticks: 30, frame: 3, tags: ["homebase.hidden": ""]),
+            .init(ticks: 40, frame: 4, tags: [:]),
+        ], unknownFromTicks: 50, unknownFromFrame: 5, overrides: [
+            .init(start: 5, end: 8, key: "homebase.hidden", value: "true"),
+            .init(start: 6, end: 7, key: "homebase.hidden", value: nil),
+            .init(start: 45, end: 80, key: "homebase.hidden", value: "true"),
+            .init(start: 52, end: 55, key: "homebase.hidden", value: nil),
+            .init(start: 0, end: 60, key: "unrelated", value: "true"),
+        ])
+        try tags.validate()
+        let spans = tags.approximateVisibleRanges(endTicks: 60)
+        XCTAssertEqual(spans, [0..<5, 6..<7, 8..<10, 20..<30, 40..<45, 52..<55])
+        for tick in Int64(0)..<60 {
+            XCTAssertEqual(spans.contains { $0.contains(tick) }, !tags.hidden(ticks: tick, frame: nil))
+        }
+        XCTAssertTrue(tags.approximateVisibleRanges(endTicks: 0).isEmpty)
+    }
+
+    func testApproximateNavigationDoesNotInventHiddenTagsInLegacyUnknownMetadata() throws {
+        let tags = CameraVideoTagTimeline(version: 2, changes: [], unknownFromTicks: 0, unknownFromFrame: 0,
+            overrides: [.init(start: 5, end: 10, key: "homebase.hidden", value: "false")])
+        try tags.validate()
+        XCTAssertEqual(tags.approximateVisibleRanges(endTicks: 20), [0..<5, 10..<20])
+    }
 }
 
 @MainActor private final class VeilAuthenticationStub: CameraVeilAuthenticating {

@@ -218,11 +218,13 @@ final class CameraExternalDisplayTests: XCTestCase {
 @MainActor
 final class CameraDisplayOutputSpy: CameraVideoDisplayOutput {
     var needsRecovery = false
+    private(set) var isVeiled = false
     var samples: [CMSampleBuffer] = []
     var flushes: [Bool] = []
 
     nonisolated deinit {}
 
+    func setVeiled(_ veiled: Bool) { isVeiled = veiled }
     func enqueue(_ sample: CMSampleBuffer) { samples.append(sample) }
     func flush(removingDisplayedImage: Bool) { flushes.append(removingDisplayedImage) }
     func isHidden(at index: Int) -> Bool {

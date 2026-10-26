@@ -18,6 +18,51 @@ final class CameraHistoryPlayback {
     private var navigationBounds: CameraHistoryRange?
     private var navigationExpires: Double = 0
     private var navigationRefresh: Task<Void, Never>?
+    private var showsHiddenVideo = false
+    private var bufferNavigation: (position: Double, head: Double)?
+    var hasNavigationRegion: Bool {
+        if !isActive { return bufferNavigation != nil }
+        if state == .gap { return true }
+        guard !showsHiddenVideo, let location = location(preferredPiece: nil) else { return false }
+        return location.piece.samples[location.index].isHidden
+    }
+
+    private var navigationPosition: Double? {
+        if isActive { return position }
+        guard let bufferNavigation, let canonicalOffset else { return nil }
+        return bufferNavigation.position + canonicalOffset
+    }
+
+    func setShowsHiddenVideo(_ value: Bool) {
+        guard showsHiddenVideo != value else { return }
+        showsHiddenVideo = value
+        if value { bufferNavigation = nil }
+        invalidateNavigation()
+        ensureRequest(); changed?()
+    }
+
+    /// Live and buffered hidden pictures can offer archive navigation without
+    /// changing their playback mode or moving the visible cursor.
+    func updateBufferNavigation(position: Double?, head: Double?) {
+        guard !isActive else { return }
+        guard let position, let head, !showsHiddenVideo else {
+            guard bufferNavigation != nil else { return }
+            bufferNavigation = nil; invalidateNavigation(); changed?()
+            return
+        }
+        let wasEmpty = bufferNavigation == nil
+        bufferNavigation = (position, head)
+        if wasEmpty { invalidateNavigation() }
+        ensureRequest()
+    }
+
+    private func invalidateNavigation() {
+        if navigation == .loading { cancelRequest() }
+        else {
+            navigationRefresh?.cancel(); navigationRefresh = nil
+            navigation = .idle; navigationBounds = nil
+        }
+    }
     private var resolvedLoadingPosition: Double?
     var loadingDate: Date? {
         guard state == .loading, let target = position ?? resolvedLoadingPosition else { return nil }
@@ -66,6 +111,7 @@ final class CameraHistoryPlayback {
     }
 
     func enter(localPosition: Double, localHead: Double, paused: Bool) {
+        bufferNavigation = nil
         groupClock = false; groupLiveEdge = nil
         cancelRequest()
         isActive = true; isPaused = paused; self.localHead = localHead
@@ -79,6 +125,7 @@ final class CameraHistoryPlayback {
 
     func enter(canonicalTime: Double, localHead: Double, paused: Bool, groupClock: Bool = false) {
         guard canonicalTime.isFinite, abs(canonicalTime) < 1e11 - 60 else { return }
+        bufferNavigation = nil
         self.groupClock = groupClock
         if !groupClock { groupLiveEdge = nil }
         cancelRequest()
@@ -168,6 +215,7 @@ final class CameraHistoryPlayback {
         refreshState(); ensureRequest(); changed?()
     }
     func deactivate() {
+        bufferNavigation = nil
         isActive = false; state = .idle; goal = nil
         cancelRequest(); changed?()
     }
@@ -211,21 +259,46 @@ final class CameraHistoryPlayback {
         else { state = failure.map(State.failed) ?? .loading }
     }
     private func ensureRequest() {
-        guard isActive, !fetching, clock() >= retryAfter, let transport, let cameraID else { return }
+        guard isActive || bufferNavigation != nil else { return }
+        guard !fetching, clock() >= retryAfter, let transport, let cameraID else { return }
         let request: HBNVRMediaRequest
-        let capturedHead = localHead, capturedOffset = initialOffset
+        let capturedHead = bufferNavigation?.head ?? localHead
+        let capturedOffset = bufferNavigation.map { min(0, $0.position - $0.head) } ?? initialOffset
         let capturedPosition = position
-        if position != nil, canonicalOffset == nil {
+        let excludingHidden = !showsHiddenVideo
+        if !isActive {
+            guard navigation != .unsupported, navigation != .hiddenUnsupported else { return }
+            guard let bufferNavigation,
+                  navigationPosition.map({ navigationNeedsRefresh(at: $0) })
+                    ?? (navigation == .idle || clock() >= navigationExpires) else { return }
+            if let navigationPosition {
+                request = HBNVRMediaRequest(requestID: UUID().uuidString, operation: "neighbors", cameraID: cameraID,
+                    timeline: "canonical", range: .init(start: navigationPosition, end: navigationPosition + 0.000_01))
+            } else {
+                let end = min(0, bufferNavigation.position - bufferNavigation.head)
+                request = HBNVRMediaRequest(requestID: UUID().uuidString, operation: "neighbors", cameraID: cameraID,
+                    timeline: "canonical", range: .init(start: end - 0.000_01, end: end), relativeTo: "live")
+            }
+            navigation = .loading
+        } else if position != nil, canonicalOffset == nil {
             // Resolve the live edge without fetching unrelated video or using
             // the phone's wall clock as a live-to-canonical mapping.
             request = HBNVRMediaRequest(requestID: UUID().uuidString, operation: "availability", cameraID: cameraID,
                 timeline: "canonical", range: .init(start: -1, end: 0), relativeTo: "live")
         } else if let position, let liveEdge {
-            if state == .gap, navigationNeedsRefresh(at: position) {
-                // A tiny excluded interval around the cursor; the server searches
-                // the whole retained catalog on both sides, not just this minute.
+            if hasNavigationRegion, navigationNeedsRefresh(at: position) {
+                // Search the retained catalog around the unviewable cursor.
+                var excluded = CameraHistoryRange(start: position, end: position + 0.000_01)
+                if !showsHiddenVideo, let location = location(preferredPiece: nil), location.piece.samples[location.index].isHidden {
+                    let sample = location.piece.samples[location.index]
+                    let start = max(sample.time(in: location.piece.segment), position - 43_200)
+                    // Exclude the entire known hidden frame. Approximate S3 tag
+                    // boundaries inside it must not advertise that frame again.
+                    excluded = .init(start: start,
+                        end: min(max(sample.end(in: location.piece.segment), position + 0.000_01), start + 86_400))
+                }
                 request = HBNVRMediaRequest(requestID: UUID().uuidString, operation: "neighbors", cameraID: cameraID,
-                    timeline: "canonical", range: .init(start: position, end: position + 0.000_01))
+                    timeline: "canonical", range: .init(start: excluded.start, end: excluded.end))
                 navigation = .loading
             } else {
                 if let goal, buffer.missing(goal, now: clock(), liveEdge: liveEdge).isEmpty { self.goal = nil }
@@ -256,10 +329,14 @@ final class CameraHistoryPlayback {
                     await self?.requestBegan(id: id, anchor: anchor, offset: capturedOffset)
                 }
                 do {
-                    do { batch = try await transport.fetch(request, onBegin: onBegin) }
+                    do {
+                        if request.operation == "neighbors" { batch = try await transport.neighbors(request, excludingHidden: excludingHidden) }
+                        else { batch = try await transport.fetch(request, onBegin: onBegin) }
+                    }
                     catch CameraHistoryError.remote(3, _) where request.relativeTo == "live" {
                         var fallback = request; fallback.relativeTo = "now"
-                        batch = try await transport.fetch(fallback, onBegin: onBegin)
+                        if request.operation == "neighbors" { batch = try await transport.neighbors(fallback, excludingHidden: excludingHidden) }
+                        else { batch = try await transport.fetch(fallback, onBegin: onBegin) }
                     }
                 } catch {
                     try Task.checkCancellation()
@@ -282,10 +359,10 @@ final class CameraHistoryPlayback {
                 if self.canonicalOffset == nil {
                     guard let anchor = batch.anchor else { throw CameraHistoryError.invalidResponse }
                     self.canonicalOffset = anchor - capturedHead
-                    if let position = self.position {
+                    if self.isActive, let position = self.position {
                         if !self.groupClock { self.position = min(position, anchor - 0.000_001) }
                         self.goal = CameraHistoryPolicy.initialWindow(at: self.position!, liveEdge: self.requestLiveEdge(self.liveEdge!))
-                    } else {
+                    } else if self.isActive {
                         self.position = anchor + capturedOffset
                     }
                 }
@@ -293,25 +370,28 @@ final class CameraHistoryPlayback {
                     self.buffer.insert(batch, at: self.clock(), around: self.position!)
                 } else if request.operation == "neighbors" {
                     guard let neighbors = batch.neighbors else { throw CameraHistoryError.invalidResponse }
-                    self.navigation = .ready(neighbors)
+                    self.navigation = batch.sourceWarning.map { .partial(neighbors, $0) } ?? .ready(neighbors)
                     self.navigationBounds = CameraHistoryRange(start: neighbors.previous?.end ?? -1e11,
                         end: neighbors.next?.start ?? 1e11)
                     // New live footage can appear quickly; older gaps still get
                     // periodic refreshes for newly accessible stores or retention.
-                    self.navigationExpires = self.clock() + (neighbors.next == nil ? 5 : 60)
+                    self.navigationExpires = self.clock() + (neighbors.next == nil || batch.sourceWarning != nil ? 5 : 60)
                     self.scheduleNavigationRefresh()
                 }
-                self.fetching = false; self.task = nil; self.failure = batch.sourceWarning; self.quickRetries = 0
-                if batch.sourceWarning != nil { self.retryAfter = self.clock() + 5 }
+                self.fetching = false; self.task = nil; self.quickRetries = 0
+                if request.operation != "neighbors" {
+                    self.failure = batch.sourceWarning
+                    if batch.sourceWarning != nil { self.retryAfter = self.clock() + 5 }
+                }
                 self.refreshState(); self.ensureRequest(); self.changed?()
             } catch {
                 guard let self, self.token == id, !Task.isCancelled else { return }
                 if self.canonicalOffset == nil, let resolved = error as? CameraHistoryFetchFailure, let anchor = resolved.anchor {
                     self.canonicalOffset = anchor - capturedHead
-                    if let position = self.position {
+                    if self.isActive, let position = self.position {
                         if !self.groupClock { self.position = min(position, anchor - 0.000_001) }
                         self.goal = CameraHistoryPolicy.initialWindow(at: self.position!, liveEdge: self.requestLiveEdge(self.liveEdge!))
-                    } else {
+                    } else if self.isActive {
                         self.position = anchor + capturedOffset
                         self.goal = resolved.range
                     }
@@ -319,11 +399,16 @@ final class CameraHistoryPlayback {
                 let underlying = (error as? CameraHistoryFetchFailure)?.underlying ?? error
                 if request.operation == "neighbors" {
                     self.fetching = false; self.task = nil
-                    self.navigation = (underlying as? CameraHistoryError) == .neighborsUnsupported
-                        ? .unsupported : .failed(error.localizedDescription)
-                    self.navigationBounds = .init(start: request.range.start - 30, end: request.range.end + 30)
+                    switch underlying as? CameraHistoryError {
+                    case .neighborsUnsupported: self.navigation = .unsupported
+                    case .hiddenNeighborsUnsupported: self.navigation = .hiddenUnsupported
+                    default: self.navigation = .failed(error.localizedDescription)
+                    }
+                    let failedRange = (error as? CameraHistoryFetchFailure)?.range
+                        ?? .init(start: request.range.start, end: request.range.end)
+                    self.navigationBounds = .init(start: failedRange.start - 30, end: failedRange.end + 30)
                     self.navigationExpires = self.clock() + 5
-                    if self.navigation != .unsupported { self.scheduleNavigationRefresh() }
+                    if self.navigation != .unsupported && self.navigation != .hiddenUnsupported { self.scheduleNavigationRefresh() }
                     self.changed?()
                     return
                 }
@@ -340,10 +425,11 @@ final class CameraHistoryPlayback {
                 self.refreshState(); self.changed?()
             }
         }
+        if request.operation == "neighbors" { changed?() }
     }
 
     private func navigationNeedsRefresh(at position: Double) -> Bool {
-        if navigation == .unsupported { return false }
+        if navigation == .unsupported || navigation == .hiddenUnsupported { return false }
         return navigationBounds?.contains(position) != true || clock() >= navigationExpires
     }
 
@@ -352,14 +438,23 @@ final class CameraHistoryPlayback {
         let delay = max(0.1, navigationExpires - clock())
         navigationRefresh = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(delay)) } catch { return }
-            guard let self, self.isActive, self.state == .gap, !Task.isCancelled else { return }
+            guard let self, self.hasNavigationRegion, !Task.isCancelled else { return }
             self.ensureRequest(); self.changed?()
         }
     }
 
     func adjacentRecording(previous: Bool) -> Date? {
-        guard state == .gap, case .ready(let neighbors) = navigation,
-              let range = previous ? neighbors.previous : neighbors.next else { return nil }
+        guard hasNavigationRegion, let position = navigationPosition,
+              navigationBounds?.contains(position) == true else { return nil }
+        let neighbors: CameraHistoryNeighbors
+        switch navigation {
+        case .ready(let value), .partial(let value, _): neighbors = value
+        default: return nil
+        }
+        guard let range = previous ? neighbors.previous : neighbors.next else { return nil }
+        if !showsHiddenVideo, let refined = buffer.visiblePosition(near: range.start, before: range.end) {
+            return Date(timeIntervalSince1970: refined)
+        }
         return Date(timeIntervalSince1970: range.start)
     }
 

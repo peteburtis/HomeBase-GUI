@@ -401,7 +401,8 @@ final class CameraH264Renderer: ObservableObject {
         }
     }
 
-    let layer = AVSampleBufferDisplayLayer()
+    private let display = CameraVideoDisplayReplica()
+    var layer: AVSampleBufferDisplayLayer { display.layer }
     let displayRelay = CameraVideoDisplayRelay()
     var suppressesDisplay = false
     private var formatDescription: CMVideoFormatDescription?
@@ -415,6 +416,11 @@ final class CameraH264Renderer: ObservableObject {
     init() {
         layer.videoGravity = .resizeAspect
         layer.backgroundColor = CGColor(gray: 0, alpha: 1)
+    }
+
+    func setVeiled(_ veiled: Bool) {
+        display.setVeiled(veiled)
+        displayRelay.setVeiled(veiled)
     }
 
     func configure(
@@ -613,10 +619,7 @@ final class CameraH264Renderer: ObservableObject {
 
     func reset(removingDisplayedImage: Bool = true) {
         displayRelay.flush(removingDisplayedImage: removingDisplayedImage)
-        layer.sampleBufferRenderer.flush(
-            removingDisplayedImage: removingDisplayedImage,
-            completionHandler: nil
-        )
+        display.flush(removingDisplayedImage: removingDisplayedImage)
         firstTimestamp = nil
         firstHistoryTimestamp = nil
         waitingForKeyframe = true
@@ -719,6 +722,7 @@ final class CameraLiveVideoModel: ObservableObject {
     func setShowsHiddenVideo(_ value: Bool) {
         guard showsHiddenVideo != value else { return }
         showsHiddenVideo = value
+        if !usesPlaybackController { renderer.setVeiled(previewIsHidden && !value) }
         if !value && previewIsHidden && !usesPlaybackController { renderer.reset() }
     }
 
@@ -934,6 +938,7 @@ final class CameraLiveVideoModel: ObservableObject {
             if state != .playing { state = .waiting("Waiting for video…") }
         case .videoAccessUnit:
             let hidden = CameraVideoTags.hidden(frame.tags)
+            if !usesPlaybackController { renderer.setVeiled(hidden && !showsHiddenVideo) }
             if previewIsHidden != hidden { previewIsHidden = hidden }
             let sampleBuffer: CMSampleBuffer?
             if let playbackController {
@@ -2246,7 +2251,9 @@ private struct CameraFullScreenCameraContent: View {
             if visiblePlayerControls {
                 CameraPlayerPanelPlacement(panel: panel, timelineBounds: timelineBounds, leading: true) {
                     HStack(spacing: 12) {
-                        CameraVeilButton(veil: veil)
+                        if presentation.visibleSessions.contains(where: { $0.playback.isFrameHidden }) {
+                            CameraVeilButton(veil: veil)
+                        }
                         if let destination = lockedS3Destination, access.session != nil {
                             CameraS3PadlockButton { s3Destination = destination }
                         }

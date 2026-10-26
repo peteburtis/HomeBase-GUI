@@ -2,15 +2,25 @@ import SwiftUI
 
 struct CameraHistoryNavigationControls: View {
     let neighbors: CameraHistoryNeighbors
+    var searchIsComplete = true
+    var excludesHidden = false
     let jump: (Bool) -> Void
 
     var body: some View {
         HStack(spacing: 20) {
             if neighbors.previous != nil { navigationButton(previous: true) }
-            Text(neighbors.previous == nil && neighbors.next == nil ? "No other video available" : "Next available")
+            Text(statusLabel)
                 .font(.callout)
             if neighbors.next != nil { navigationButton(previous: false) }
         }
+    }
+
+    private var statusLabel: String {
+        if neighbors.previous == nil && neighbors.next == nil {
+            if !searchIsComplete { return "Search incomplete" }
+            return "No other video available"
+        }
+        return "Next available"
     }
 
     private func navigationButton(previous: Bool) -> some View {
@@ -23,7 +33,9 @@ struct CameraHistoryNavigationControls: View {
         }
         .buttonStyle(.plain)
         .cameraGlassBacker(in: Circle(), interactive: true)
-        .accessibilityLabel(previous ? "Previous available recording" : "Next available recording")
+        .accessibilityLabel(excludesHidden
+            ? (previous ? "Previous unveiled recording" : "Next unveiled recording")
+            : (previous ? "Previous available recording" : "Next available recording"))
         .accessibilityHint(previous ? "Jump to the preceding recording" : "Jump to the following recording")
     }
 }

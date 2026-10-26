@@ -40,15 +40,28 @@ actor CameraS3HistoryReader: CameraHistoryFetching {
     }
 
     func fetch(_ request: HBNVRMediaRequest, onBegin: CameraHistoryBeginHandler?) async throws -> CameraHistoryBatch {
+        try await fetch(request, excludingHidden: false, onBegin: onBegin)
+    }
+
+    func neighbors(_ request: HBNVRMediaRequest, excludingHidden: Bool) async throws -> CameraHistoryBatch {
+        guard request.operation == "neighbors" else { throw CameraHistoryError.invalidResponse }
+        return try await fetch(request, excludingHidden: excludingHidden, onBegin: nil)
+    }
+
+    private func fetch(_ request: HBNVRMediaRequest, excludingHidden: Bool,
+                       onBegin: CameraHistoryBeginHandler?) async throws -> CameraHistoryBatch {
         try request.validate(); try check()
         guard request.cameraID == cameraID, request.relativeTo == nil,
               request.timeline == nil || request.timeline == "canonical",
-              request.range.end - request.range.start <= 120.001 else { throw CameraHistoryError.invalidResponse }
+              request.operation == "neighbors" || request.range.end - request.range.start <= 120.001 else {
+            throw CameraHistoryError.invalidResponse
+        }
         let range = CameraHistoryRange(start: request.range.start, end: request.range.end)
         await onBegin?(range, nil)
         let catalog = try await catalog()
         try check()
         if request.operation == "neighbors" {
+            if excludingHidden { return try await visibleNeighbors(range, catalog: catalog) }
             return try await neighbors(range, catalog: catalog)
         }
         let indexed = try await entries(days: catalog.days.filter { $0.range.intersection(range) != nil }, catalog: catalog)
@@ -295,6 +308,113 @@ actor CameraS3HistoryReader: CameraHistoryFetching {
             }
         }
         return result.values.sorted { ($0.range.start, $0.id) < ($1.range.start, $1.id) }
+    }
+
+    private struct NavigationShard {
+        let id: String
+        let range: CameraHistoryRange
+        let timescale: UInt32
+        let endTicks: Int64
+        let tags: CameraStoredVideoTags?
+    }
+
+    private func visibleNeighbors(_ range: CameraHistoryRange, catalog: CameraS3Catalog) async throws -> CameraHistoryBatch {
+        let today = CameraS3ManifestLayout.day(now())
+        let publishedDay = CameraS3ManifestLayout.day(catalog.generatedAt)
+        let periods = Dictionary(grouping: catalog.days) { day in
+            day.day == today || day.day == publishedDay ? day.day : String(day.day.prefix(7))
+        }.map { period, days in
+            (id: period, days: days, bounds: CameraHistoryRange(start: days.map(\.start).min()!, end: days.map(\.end).max()!))
+        }
+        let deadline = ProcessInfo.processInfo.systemUptime + 45
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        var loaded: Set<String> = [], shards: [NavigationShard] = []
+        var identities: [String: SHA256.Digest] = [:]
+        var visibleCache: [String: [CameraHistoryRange]] = [:]
+        var intervalCount = 0, metadataBytes = 0
+        func checkSearch() throws {
+            try check()
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                throw CameraHistoryError.remote(nil, "Timed out finding available S3 video.")
+            }
+        }
+        func nearest(previous: Bool) throws -> CameraHistoryRange? {
+            var coveredEnd = -Double.infinity
+            var selectable: [(shard: NavigationShard, start: Double)] = []
+            // Match the reader's source order: an earlier shard owns overlaps,
+            // including its hidden spans. Later public copies cannot unveil it.
+            for shard in shards.sorted(by: { ($0.range.start, $0.id) < ($1.range.start, $1.id) }) {
+                let selectableStart = max(shard.range.start, coveredEnd)
+                coveredEnd = max(coveredEnd, shard.range.end)
+                if selectableStart < shard.range.end, previous ? selectableStart < range.start : shard.range.end > range.end {
+                    selectable.append((shard, selectableStart))
+                }
+            }
+            let ordered = selectable.sorted {
+                previous ? min($0.shard.range.end, range.start) > min($1.shard.range.end, range.start)
+                    : max($0.start, range.end) < max($1.start, range.end)
+            }
+            var best: CameraHistoryRange?
+            for value in ordered {
+                try checkSearch()
+                let shard = value.shard
+                let bound = previous ? min(shard.range.end, range.start) : max(value.start, range.end)
+                if let best, previous ? bound <= best.end : bound >= best.start { break }
+                let visible: [CameraHistoryRange]
+                if let cached = visibleCache[shard.id] { visible = cached }
+                else {
+                    let tags = try shard.tags?.thaw(password: password)
+                    visible = tags?.approximateVisibleRanges(endTicks: shard.endTicks).map { ticks in
+                        CameraHistoryRange(start: shard.range.start + Double(ticks.lowerBound) / Double(shard.timescale),
+                            end: shard.range.start + Double(ticks.upperBound) / Double(shard.timescale))
+                    } ?? [shard.range]
+                    intervalCount += visible.count
+                    guard intervalCount <= 100_000 else { throw CameraHistoryError.tooLarge }
+                    visibleCache[shard.id] = visible
+                }
+                for span in visible {
+                    let start = max(span.start, value.start, previous ? span.start : range.end)
+                    let end = min(span.end, previous ? range.start : span.end)
+                    guard start < end else { continue }
+                    let candidate = CameraHistoryRange(start: start, end: end)
+                    if previous ? end > (best?.end ?? -.infinity) : start < (best?.start ?? .infinity) { best = candidate }
+                }
+            }
+            return best
+        }
+        for backward in [true, false] {
+            let ordered = periods.filter { backward ? $0.bounds.start < range.start : $0.bounds.end > range.end }
+                .sorted { backward ? $0.bounds.end > $1.bounds.end : $0.bounds.start < $1.bounds.start }
+            var best = try nearest(previous: backward)
+            for period in ordered {
+                try checkSearch()
+                // Include all periods that can overlap the returned interval so
+                // source precedence is resolved before publishing a destination.
+                if let best, backward ? period.bounds.end <= best.start : period.bounds.start >= best.end { break }
+                guard loaded.insert(period.id).inserted else { continue }
+                let indexed = try await entries(days: period.days, catalog: catalog)
+                let existing = try await existing(indexed, monthly: true)
+                try checkSearch()
+                for shard in existing {
+                    let encoded = try encoder.encode(shard), identity = SHA256.hash(data: encoded)
+                    if let previous = identities[shard.id] {
+                        guard previous == identity else { throw CameraS3HistoryError.invalidManifest }
+                        continue
+                    }
+                    guard shards.count < 100_000 else { throw CameraHistoryError.tooLarge }
+                    metadataBytes += encoded.count
+                    guard metadataBytes <= 64 * 1024 * 1024 else { throw CameraHistoryError.tooLarge }
+                    identities[shard.id] = identity
+                    shards.append(.init(id: shard.id, range: shard.range, timescale: shard.timing.timescale,
+                        endTicks: shard.endTicks, tags: shard.tagMetadata))
+                    try checkSearch()
+                }
+                best = try nearest(previous: backward)
+            }
+        }
+        // The second direction can load an overlapping earlier source.
+        let previous = try nearest(previous: true), next = try nearest(previous: false)
+        return .init(id: UUID(), range: range, anchor: nil, pieces: [], gaps: [], neighbors: .init(previous: previous, next: next))
     }
     private func neighbors(_ range: CameraHistoryRange, catalog: CameraS3Catalog) async throws -> CameraHistoryBatch {
         // Catalog bounds narrow the search; exact neighbors come from entries,

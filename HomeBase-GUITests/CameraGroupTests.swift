@@ -1406,6 +1406,9 @@ private actor GroupHistoryFetcher: CameraHistoryFetching {
     init(anchor: Double = 1000) { self.anchor = anchor }
     func start() {}
     func close() {}
+    func neighbors(_ request: HBNVRMediaRequest, excludingHidden: Bool) async throws -> CameraHistoryBatch {
+        try await fetch(request)
+    }
     func fetch(_ request: HBNVRMediaRequest, onBegin: CameraHistoryBeginHandler?) async throws -> CameraHistoryBatch {
         let relative = request.relativeTo == nil ? 0 : anchor
         let range = CameraHistoryRange(start: request.range.start + relative, end: request.range.end + relative)

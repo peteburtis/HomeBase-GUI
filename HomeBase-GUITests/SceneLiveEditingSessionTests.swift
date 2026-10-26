@@ -451,7 +451,9 @@ final class SceneLiveEditingSessionTests: XCTestCase {
     }
 }
 
-private actor SceneLiveEditingClientSpy: SceneLiveEditingRemoteClient {
+// Match the remote-client protocol's MainActor isolation under Xcode 27.
+@MainActor
+private final class SceneLiveEditingClientSpy: SceneLiveEditingRemoteClient {
     enum Event: Equatable {
         case reactivate
         case hold(
@@ -573,27 +575,27 @@ private actor SceneLiveEditingClientSpy: SceneLiveEditingRemoteClient {
         return HBControlReleaseResult(releasedCount: 1)
     }
 
-    func recordedEvents() -> [Event] {
+    func recordedEvents() async -> [Event] {
         events
     }
 
-    func clearEvents() {
+    func clearEvents() async {
         events = []
     }
 
-    func failReleaseAsNotFound(token: String) {
+    func failReleaseAsNotFound(token: String) async {
         notFoundReleaseTokens.insert(token)
     }
 
-    func failRelease(token: String) {
+    func failRelease(token: String) async {
         failingReleaseTokens.insert(token)
     }
 
-    func allowRelease(token: String) {
+    func allowRelease(token: String) async {
         failingReleaseTokens.remove(token)
     }
 
-    func replaceSession() {
+    func replaceSession() async {
         sessionIdentifier = UUID(
             uuidString: "00000000-0000-0000-0000-000000000002"
         )!

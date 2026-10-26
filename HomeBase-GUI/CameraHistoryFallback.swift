@@ -12,6 +12,138 @@ actor CameraHistoryFallback: CameraHistoryFetching {
     }
     func start() async { await local.start() }
     func close() async { closed = true; await local.close(); await remote?.close() }
+    func neighbors(_ request: HBNVRMediaRequest, excludingHidden: Bool) async throws -> CameraHistoryBatch {
+        guard request.operation == "neighbors" else { throw CameraHistoryError.invalidResponse }
+        guard excludingHidden else { return try await fetch(request) }
+        try Task.checkCancellation()
+        guard !closed else { throw CancellationError() }
+        let deadline = ProcessInfo.processInfo.systemUptime + 45
+        var localResult: CameraHistoryBatch?, localError: Error?
+        do {
+            let result = try await local.neighbors(request, excludingHidden: true)
+            guard result.neighbors != nil else { throw CameraHistoryError.invalidResponse }
+            localResult = result
+        }
+        catch {
+            try checkNavigation(deadline: deadline)
+            if error is CancellationError || (error as? CameraHistoryFetchFailure)?.underlying is CancellationError { throw CancellationError() }
+            localError = error
+        }
+        try checkCancellation()
+        guard let remote else {
+            if let localResult { return localResult }
+            throw localError ?? CameraHistoryError.unavailable
+        }
+        let failure = localError as? CameraHistoryFetchFailure
+        // A cloud manifest cannot resolve the recorder's relative Live clock.
+        guard request.relativeTo == nil || localResult?.anchor != nil || failure?.anchor != nil else {
+            throw localError ?? CameraHistoryError.invalidResponse
+        }
+        let range = localResult?.range ?? failure?.range ?? .init(start: request.range.start, end: request.range.end)
+        let absolute = absolute(request, range: range)
+        var previous = localResult?.neighbors?.previous, next = localResult?.neighbors?.next
+        var warnings = [localResult?.sourceWarning, localError?.localizedDescription].compactMap { $0 }
+        var cloudError: Error?, remaining = 128
+        do {
+            try checkNavigation(deadline: deadline)
+            let cloud = try await remote.neighbors(absolute, excludingHidden: true)
+            guard cloud.neighbors != nil else { throw CameraHistoryError.invalidResponse }
+            if let warning = cloud.sourceWarning { warnings.append(warning) }
+            for backward in [true, false] {
+                do {
+                    let candidate = try await cloudNeighbor(previous: backward, initial: cloud, request: absolute,
+                        localDestination: backward ? previous : next, localSearchFailed: localError != nil,
+                        remote: remote, remaining: &remaining, deadline: deadline)
+                    if let candidate {
+                        if backward { previous = candidate } else { next = candidate }
+                    }
+                } catch {
+                    try checkCancellation(error)
+                    cloudError = error; warnings.append(error.localizedDescription)
+                }
+            }
+        } catch {
+            try checkCancellation(error)
+            cloudError = error; warnings.append(error.localizedDescription)
+        }
+        try checkCancellation()
+        // A failed source cannot establish that both archive directions end.
+        if previous == nil && next == nil && !warnings.isEmpty {
+            throw cloudError ?? localError ?? CameraHistoryError.unavailable
+        }
+        return .init(id: UUID(), range: range, anchor: localResult?.anchor ?? failure?.anchor, pieces: [], gaps: [],
+            neighbors: .init(previous: previous, next: next),
+            sourceWarning: warnings.isEmpty ? nil : Array(Set(warnings)).sorted().joined(separator: " "))
+    }
+
+    private func checkCancellation(_ error: Error? = nil) throws {
+        try Task.checkCancellation()
+        guard !closed else { throw CancellationError() }
+        if error is CancellationError || (error as? CameraHistoryFetchFailure)?.underlying is CancellationError { throw CancellationError() }
+    }
+
+    private func checkNavigation(deadline: Double) throws {
+        try checkCancellation()
+        guard ProcessInfo.processInfo.systemUptime < deadline else {
+            throw CameraHistoryError.remote(nil, "Timed out finding available video.")
+        }
+    }
+
+    private func cloudNeighbor(previous: Bool, initial: CameraHistoryBatch, request: HBNVRMediaRequest,
+                               localDestination: CameraHistoryRange?, localSearchFailed: Bool,
+                               remote: any CameraHistoryFetching, remaining: inout Int,
+                               deadline: Double) async throws -> CameraHistoryRange? {
+        var result = initial
+        var frontier = previous ? request.range.start : request.range.end
+        while let candidate = previous ? result.neighbors?.previous : result.neighbors?.next {
+            try checkNavigation(deadline: deadline)
+            guard candidate.isValid, previous ? candidate.end <= frontier : candidate.start >= frontier else {
+                throw CameraHistoryError.invalidResponse
+            }
+            if let localDestination, previous ? candidate.end <= localDestination.end : candidate.start >= localDestination.start { return nil }
+            var cursor = previous ? candidate.end : candidate.start
+            while previous ? cursor > candidate.start : cursor < candidate.end {
+                try checkNavigation(deadline: deadline)
+                guard remaining > 0 else { throw CameraHistoryError.tooLarge }
+                remaining -= 1
+                let chunk = CameraHistoryRange(start: previous ? max(candidate.start, cursor - 86_400) : cursor,
+                    end: previous ? cursor : min(candidate.end, cursor + 86_400))
+                let coverage: CameraHistoryBatch
+                do {
+                    // Playback gives local video precedence, including hidden
+                    // local footage. Cloud destinations must fall in local gaps.
+                    let probe = HBNVRMediaRequest(requestID: UUID().uuidString, operation: "availability", cameraID: request.cameraID,
+                        timeline: request.timeline, range: .init(start: chunk.start, end: chunk.end))
+                    coverage = try await local.fetch(probe)
+                    guard coverage.unresolved.isEmpty, coverage.sourceWarning == nil,
+                          coverage.range.start <= chunk.start, coverage.range.end >= chunk.end else { throw CameraHistoryError.unavailable }
+                } catch {
+                    try checkCancellation(error)
+                    try checkNavigation(deadline: deadline)
+                    // If the local source is offline, retain a cloud result with
+                    // the local failure warning, just as cloud playback does.
+                    if localSearchFailed { return candidate }
+                    throw error
+                }
+                try checkNavigation(deadline: deadline)
+                let gaps = coverage.gaps.compactMap { $0.intersection(chunk) }
+                let available = previous ? gaps.max(by: { $0.end < $1.end }) : gaps.min(by: { $0.start < $1.start })
+                if let available { return available }
+                cursor = previous ? chunk.start : chunk.end
+                if let localDestination, previous ? cursor <= localDestination.end : cursor >= localDestination.start { return nil }
+            }
+            let boundary = previous ? candidate.start : candidate.end
+            guard previous ? boundary < frontier : boundary > frontier else { throw CameraHistoryError.invalidResponse }
+            frontier = boundary
+            guard remaining > 0 else { throw CameraHistoryError.tooLarge }
+            remaining -= 1
+            let query = CameraHistoryRange(start: previous ? boundary : boundary - 0.000_01,
+                end: previous ? boundary + 0.000_01 : boundary)
+            result = try await remote.neighbors(absolute(request, range: query), excludingHidden: true)
+            guard result.neighbors != nil, result.sourceWarning == nil else { throw CameraHistoryError.unavailable }
+        }
+        return nil
+    }
     func fetch(_ request: HBNVRMediaRequest, onBegin: CameraHistoryBeginHandler?) async throws -> CameraHistoryBatch {
         try Task.checkCancellation()
         guard !closed else { throw CancellationError() }
@@ -153,6 +285,9 @@ private actor CameraHistoryUnavailableSource: CameraHistoryFetching {
     init(message: String) { self.message = message }
     func start() {}
     func close() {}
+    func neighbors(_ request: HBNVRMediaRequest, excludingHidden: Bool) async throws -> CameraHistoryBatch {
+        try fetch(request, onBegin: nil)
+    }
     func fetch(_ request: HBNVRMediaRequest, onBegin: CameraHistoryBeginHandler?) throws -> CameraHistoryBatch {
         throw CameraHistoryError.remote(nil, message)
     }
