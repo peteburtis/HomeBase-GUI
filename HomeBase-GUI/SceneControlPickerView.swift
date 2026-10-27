@@ -730,6 +730,7 @@ struct SceneControlPickerView<Repository: AutomationControlRepository>: View {
     }
 }
 
+@MainActor
 private struct SceneControlPickerTopologyList: View {
     let catalog: SceneControlPickerCatalog
     let submittingPath: String?
@@ -797,6 +798,7 @@ private struct SceneControlPickerTopologyList: View {
     }
 }
 
+@MainActor
 private struct SceneControlPickerRoomView: View {
     let room: HBTopologyRoomDescriptor
     let catalog: SceneControlPickerCatalog
@@ -860,6 +862,7 @@ private struct SceneControlPickerRoomView: View {
     }
 }
 
+@MainActor
 private struct SceneControlPickerGroupView: View {
     let group: HBTopologyGroupDescriptor
     let catalog: SceneControlPickerCatalog
@@ -914,6 +917,7 @@ private struct SceneControlPickerGroupView: View {
     }
 }
 
+@MainActor
 private struct SceneControlPickerDeviceRows: View {
     let devices: [SceneControlPickerCatalog.Device]
     let emptyMessage: String?
@@ -951,6 +955,7 @@ private struct SceneControlPickerDeviceRows: View {
     }
 }
 
+@MainActor
 private struct SceneControlPickerGroupRows: View {
     let groups: [HBTopologyGroupDescriptor]
     let catalog: SceneControlPickerCatalog
@@ -975,6 +980,7 @@ private struct SceneControlPickerGroupRows: View {
     }
 }
 
+@MainActor
 private struct SceneControlPickerControlList: View {
     let device: HBDeviceDescriptor
     let supportedControls: [HBControlDescriptor]
@@ -1001,6 +1007,7 @@ private struct SceneControlPickerControlList: View {
     }
 }
 
+@MainActor
 private struct SceneControlPickerControlSections: View {
     let deviceAddressableName: String
     let supportedControls: [HBControlDescriptor]
