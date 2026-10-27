@@ -5,9 +5,9 @@ import XCTest
 
 @MainActor
 final class HomeBaseConnectionRecoveryTests: XCTestCase {
-    private func client(_ factory: RecoverySocketFactory) -> HomeBaseWebSocketClient {
+    private func client(_ factory: RecoverySocketFactory, timeout: TimeInterval = 0.15) -> HomeBaseWebSocketClient {
         HomeBaseWebSocketClient(endpoint: HomeBaseEndpoint(host: "test.invalid", port: 10503)!,
-                                requestTimeout: 0.15, makeControlSocket: { _ in factory.makeSocket() })
+                                requestTimeout: timeout, makeControlSocket: { _ in factory.makeSocket() })
     }
 
     private func eventually(_ predicate: () async -> Bool) async {
@@ -66,6 +66,65 @@ final class HomeBaseConnectionRecoveryTests: XCTestCase {
         let refreshed = try await client.footageTagSnapshot(instanceID: nvr, query: query)
         XCTAssertNotNil(refreshed)
         XCTAssertEqual(factory.count, 2)
+        await client.disconnect()
+    }
+
+    func testOrdinaryTagCommitAcceptsOlderCoherentSnapshotWithoutRetry() async throws {
+        let factory = RecoverySocketFactory(), camera = UUID().uuidString, nvr = UUID().uuidString
+        let client = client(factory, timeout: 1)
+        try await client.connect()
+        try await client.receiveFootageTagChange(.init(instanceID: nvr, revision: 0, reset: true, ranges: []))
+        await factory.server.hold(HBProtocolOperations.snapshotNVRTags, on: 0)
+        let query = HBNVRTagQuery(cameraID: camera, ranges: [.init(start: 100, end: 101)], keys: [CameraVideoTags.hiddenKey])
+        let pending = Task { try await client.footageTagSnapshot(instanceID: nvr, query: query) }
+        await eventually { await factory.server.count(HBProtocolOperations.snapshotNVRTags, on: 0) == 1 }
+        try await client.receiveFootageTagChange(.init(instanceID: nvr, revision: 1, reset: false,
+            ranges: [.init(cameraID: camera, epochID: "epoch", start: 100, end: 101)]))
+        try await factory.server.releaseHeldResponses(on: 0)
+        let snapshot = try await pending.value
+        XCTAssertEqual(snapshot?.revision, 0)
+        let reads = await factory.server.count(HBProtocolOperations.snapshotNVRTags, on: 0)
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(factory.count, 1)
+        await client.disconnect()
+    }
+
+    func testAuthorityReplacementStillRetriesInFlightSnapshot() async throws {
+        let factory = RecoverySocketFactory(), nvr = UUID().uuidString, replacement = UUID().uuidString
+        let client = client(factory, timeout: 1)
+        try await client.connect()
+        try await client.receiveFootageTagChange(.init(instanceID: nvr, revision: 0, reset: true, ranges: []))
+        await factory.server.hold(HBProtocolOperations.snapshotNVRTags, on: 0)
+        let query = HBNVRTagQuery(cameraID: UUID().uuidString, ranges: [.init(start: 100, end: 101)], keys: [CameraVideoTags.hiddenKey])
+        let pending = Task { try await client.footageTagSnapshot(instanceID: nvr, query: query) }
+        await eventually { await factory.server.count(HBProtocolOperations.snapshotNVRTags, on: 0) == 1 }
+        try await client.receiveFootageTagChange(.init(instanceID: replacement, revision: 0, reset: true, ranges: []))
+        try await factory.server.releaseHeldResponses(on: 0)
+        let snapshot = try await pending.value
+        XCTAssertEqual(snapshot?.instanceID, replacement)
+        let reads = await factory.server.count(HBProtocolOperations.snapshotNVRTags, on: 0)
+        XCTAssertEqual(reads, 2)
+        await client.disconnect()
+    }
+
+    func testSourceResetPreventsDelayedUnsupportedReplyFromRecachingMissingCapability() async throws {
+        let factory = RecoverySocketFactory(), nvr = UUID().uuidString
+        let client = client(factory, timeout: 1)
+        try await client.connect()
+        await factory.server.tagError("unsupported_operation")
+        await factory.server.hold(HBProtocolOperations.snapshotNVRTags, on: 0)
+        let query = HBNVRTagQuery(cameraID: UUID().uuidString, ranges: [.init(start: 100, end: 101)], keys: [CameraVideoTags.hiddenKey])
+        let pending = Task { try await client.footageTagSnapshot(instanceID: nvr, query: query) }
+        await eventually { await factory.server.count(HBProtocolOperations.snapshotNVRTags, on: 0) == 1 }
+        await factory.server.tagError(nil)
+        try await client.receiveFootageTagChange(.init(instanceID: nvr, revision: 0, reset: true, ranges: []))
+        try await factory.server.releaseHeldResponses(on: 0)
+        let snapshot = try await pending.value
+        XCTAssertNotNil(snapshot)
+        let subsequent = try await client.footageTagSnapshot(instanceID: nvr, query: query)
+        XCTAssertNotNil(subsequent)
+        let reads = await factory.server.count(HBProtocolOperations.snapshotNVRTags, on: 0)
+        XCTAssertEqual(reads, 3)
         await client.disconnect()
     }
 

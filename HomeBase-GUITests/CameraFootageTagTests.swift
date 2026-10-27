@@ -77,7 +77,7 @@ final class CameraFootageTagTests: XCTestCase {
         await source.close()
     }
 
-    func testEventDuringSnapshotDiscardsStaleCompletionAndReadsOnceMore() async throws {
+    func testCommitDuringSnapshotAcceptsCoherentBeforeImageAndRefreshesOnNextRead() async throws {
         let raw = TagMediaSource(hidden: false)
         let authority = TagAuthority(instance: instance, hidden: true, blockFirst: true)
         let updates = AsyncStream<HBNVRTagChange>.makeStream()
@@ -91,10 +91,56 @@ final class CameraFootageTagTests: XCTestCase {
         _ = await changes.next()
         await authority.release()
         let batch = try await task.value
-        XCTAssertFalse(batch.pieces[0].samples.contains(where: \.isHidden))
-        let count = await authority.queries.count
-        XCTAssertEqual(count, 2)
+        XCTAssertTrue(batch.pieces[0].samples.allSatisfy(\.isHidden))
+        let completedReads = await authority.queries.count
+        XCTAssertEqual(completedReads, 1, "A commit must not discard a coherent completed snapshot")
+        let refreshed = try await source.refreshTags(batch)
+        XCTAssertFalse(refreshed.pieces[0].samples.contains(where: \.isHidden))
+        let refreshedReads = await authority.queries.count
+        XCTAssertEqual(refreshedReads, 2)
         await source.close()
+    }
+
+    func testSourceResetStillDiscardsInFlightSnapshot() async throws {
+        let raw = TagMediaSource(hidden: false)
+        let authority = TagAuthority(instance: instance, hidden: true, blockFirst: true)
+        let updates = AsyncStream<HBNVRTagChange>.makeStream()
+        let source = await source(raw, authority: authority, stream: updates.stream)
+        var changes = await source.tagChanges().makeAsyncIterator()
+        let task = Task { try await source.fetch(.init(requestID: "test", operation: "frames", cameraID: camera,
+            range: .init(start: 100, end: 103))) }
+        try await eventually { await authority.queries.count == 1 }
+        await authority.setHidden(false)
+        updates.continuation.yield(CameraFootageTags.reset(change()))
+        _ = await changes.next()
+        await authority.release()
+        let batch = try await task.value
+        XCTAssertFalse(batch.pieces[0].samples.contains(where: \.isHidden))
+        let reads = await authority.queries.count
+        XCTAssertEqual(reads, 2)
+        await source.close()
+    }
+
+    func testCommitDuringInitialHistoryReadRefreshesAfterMediaArrives() async throws {
+        let raw = TagMediaSource(hidden: false)
+        let authority = TagAuthority(instance: instance, hidden: false, blockFirst: true)
+        let updates = AsyncStream<HBNVRTagChange>.makeStream()
+        let source = await source(raw, authority: authority, stream: updates.stream)
+        let history = CameraHistoryPlayback(clock: { 1 })
+        history.configure(cameraID: camera, transport: source)
+        history.enter(canonicalTime: 940, localHead: 1000, paused: true)
+        try await eventually { await authority.queries.count == 1 }
+        await authority.setHidden(true)
+        updates.continuation.yield(change())
+        // Let the event reach the playback consumer while there is no media
+        // to refresh. Fetch completion must schedule the retained-window read.
+        try await Task.sleep(for: .milliseconds(10))
+        XCTAssertEqual(history.buffer.frameCount, 0)
+        await authority.release()
+        try await eventually { history.location(preferredPiece: nil)?.piece.samples.allSatisfy(\.isHidden) == true }
+        XCTAssertTrue(history.isActive); XCTAssertTrue(history.isPaused)
+        XCTAssertEqual(history.position, 940)
+        history.disconnect()
     }
 
     func testLoadedPausedHistoryRefreshesWithoutFetchingOrReplacingMedia() async throws {
@@ -179,6 +225,23 @@ final class CameraFootageTagTests: XCTestCase {
         await authority.release()
         let late = try await old.value
         XCTAssertTrue(late.pieces[0].samples.allSatisfy(\.isHidden))
+        await source.close()
+    }
+
+    func testDelayedOverlappingSnapshotPreservesNewerKnowledgeWithinItsRange() async throws {
+        let authority = ReorderedTagAuthority(instance: instance)
+        let source = CameraTaggedHistorySource(source: TagMediaSource(hidden: false), updates: AsyncStream { _ in }) {
+            await authority.read($0)
+        }
+        let old = Task { try await source.fetch(.init(requestID: "old", operation: "frames", cameraID: camera,
+            range: .init(start: 100, end: 104))) }
+        try await eventually { await authority.count == 1 }
+        let newer = try await source.fetch(.init(requestID: "new", operation: "frames", cameraID: camera,
+            range: .init(start: 101, end: 103)))
+        XCTAssertTrue(newer.pieces[0].samples.allSatisfy(\.isHidden))
+        await authority.release()
+        let late = try await old.value
+        XCTAssertEqual(late.pieces[0].samples.map(\.isHidden), [false, true, true, false])
         await source.close()
     }
 

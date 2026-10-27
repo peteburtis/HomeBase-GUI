@@ -39,10 +39,12 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
     func receiveFootageTagChange(_ value: HBNVRTagChange) throws {
         try value.validate()
         footageTagsUnsupported = false
+        let invalidatesReads = value.reset || (footageTagInstance != nil && footageTagInstance != value.instanceID)
         let reset = value.reset || footageTagInstance != value.instanceID
             || (footageTagInstance != nil && footageTagRevision < UInt64.max && value.revision > footageTagRevision + 1)
         guard reset || value.revision > footageTagRevision else { return }
-        footageTagInstance = value.instanceID; footageTagRevision = value.revision; footageTagSerial &+= 1
+        footageTagInstance = value.instanceID; footageTagRevision = value.revision
+        if invalidatesReads { footageTagSerial &+= 1 }
         let change = reset ? CameraFootageTags.reset(value) : value
         for observer in footageTagObservers.values where observer.cameraID.map({ CameraFootageTags.affects(change, cameraID: $0) }) ?? true {
             CameraFootageTags.yield(change, to: observer.continuation)
@@ -55,6 +57,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         for observer in footageTagObservers.values { CameraFootageTags.yield(change, to: observer.continuation) }
     }
     func footageTagSnapshot(instanceID: String, query: HBNVRTagQuery) async throws -> HBNVRTagSnapshot? {
+        try Task.checkCancellation()
         if footageTagsUnsupported { return nil }
         try query.validate()
         let deadline = ProcessInfo.processInfo.systemUptime + min(5, requestTimeout)
@@ -70,24 +73,33 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
                 // is healthy. Their short deadline must not tear down every
                 // control subscription and camera stream sharing that socket.
                 let reply = try await sendRequest(request, timeout: remaining, reconnectOnTimeout: false)
+                try Task.checkCancellation()
                 let snapshot = try reply.decodedPayload(as: HBProtocolResponse.self).decodedResult(as: HBNVRTagSnapshot.self)
                 try snapshot.validate()
                 guard snapshot.instanceID == instance, snapshot.cameraID.caseInsensitiveCompare(query.cameraID) == .orderedSame else {
                     throw ClientError.invalidMessage("Footage tag snapshot identity changed")
                 }
-                if serial == footageTagSerial && (footageTagInstance != instance || snapshot.revision >= footageTagRevision) {
+                if serial == footageTagSerial && (footageTagInstance == nil || footageTagInstance == instance) {
+                    // NVR can return a coherent before-image while committing
+                    // tags. A newer range event schedules the next refresh;
+                    // it does not make this completed read invalid.
                     // Remember identity for disconnect invalidation, without
                     // moving the event cursor past other windows' updates.
                     if footageTagInstance == nil { footageTagInstance = snapshot.instanceID }
                     return snapshot
                 }
             } catch let error as HBProtocolError where error.code == HBProtocolErrorCodes.unknownOperation || error.code == "unsupported_operation" {
+                try Task.checkCancellation()
+                guard serial == footageTagSerial && (footageTagInstance == nil || footageTagInstance == instance) else { continue }
                 footageTagsUnsupported = true; return nil
             } catch let error as HBProtocolError where error.code == HBProtocolErrorCodes.permissionDenied {
+                guard serial == footageTagSerial && (footageTagInstance == nil || footageTagInstance == instance) else { continue }
                 // Older daemons classify unknown operations as administrative.
                 // Only explicit capability discovery proves this is legacy;
                 // a real denial from a capable server must remain an error.
                 let reply = try await sendRequest(sessionRequest(operation: HBProtocolOperations.describeProtocol))
+                try Task.checkCancellation()
+                guard serial == footageTagSerial && (footageTagInstance == nil || footageTagInstance == instance) else { continue }
                 let description = try reply.decodedPayload(as: HBProtocolResponse.self).decodedResult(as: HBJSONValue.self)
                 if let operations = description.objectValue?["authorization"]?.objectValue?["userOperations"]?.arrayValue,
                    operations.allSatisfy({ $0.stringValue != nil }),

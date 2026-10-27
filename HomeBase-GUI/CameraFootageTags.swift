@@ -89,6 +89,7 @@ actor CameraTaggedHistorySource: CameraThumbnailFetching, CameraFootageTagRefres
     private var listeners: [UUID: AsyncStream<HBNVRTagChange>.Continuation] = [:]
     private var closed = false
     private var generation: UInt64 = 0
+    private var observedInstance: String?
     // At most 64 validated 64-KiB snapshots, matching the retained batch cap.
     // This is last-known metadata only: no event journal or deferred requests.
     private var knownSnapshots: [HBNVRTagSnapshot] = []
@@ -106,7 +107,10 @@ actor CameraTaggedHistorySource: CameraThumbnailFetching, CameraFootageTagRefres
         }
     }
     private func changed(_ change: HBNVRTagChange) {
-        generation &+= 1
+        // Ordinary tag commits leave in-flight snapshots coherent. Consumers
+        // queue a follow-up refresh; only a source reset invalidates a read.
+        if change.reset || (observedInstance != nil && observedInstance != change.instanceID) { generation &+= 1 }
+        observedInstance = change.instanceID
         for listener in listeners.values { CameraFootageTags.yield(change, to: listener) }
     }
     func tagChanges() -> AsyncStream<HBNVRTagChange> {
