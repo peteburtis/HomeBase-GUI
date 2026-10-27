@@ -18,6 +18,57 @@ final class HomeBaseConnectionRecoveryTests: XCTestCase {
         XCTFail("Condition was not reached")
     }
 
+    func testSlowTagSnapshotTimesOutWithoutReplacingHealthyControlConnection() async throws {
+        let factory = RecoverySocketFactory(), camera = UUID().uuidString, nvr = UUID().uuidString
+        let client = client(factory)
+        try await client.connect()
+        let session = await client.currentSessionIdentifier()
+        let query = HBNVRTagQuery(cameraID: camera, ranges: [.init(start: 100, end: 101)], keys: [CameraVideoTags.hiddenKey])
+        await factory.server.hold(HBProtocolOperations.snapshotNVRTags, on: 0)
+        let snapshot = Task { try await client.footageTagSnapshot(instanceID: nvr, query: query) }
+        await eventually { await factory.server.count(HBProtocolOperations.snapshotNVRTags, on: 0) == 1 }
+        // A metadata read can wait on NVR tag edits while the control connection
+        // continues to carry unrelated requests successfully.
+        try await client.reactivate()
+        do { _ = try await snapshot.value; XCTFail("The tag read must retain its deadline") }
+        catch { XCTAssertEqual((error as? URLError)?.code, .timedOut) }
+        let route = await client.currentControlRoute()
+        XCTAssertEqual(route, .webSocket, "A slow tag read must not disconnect every control/media consumer")
+
+        // A late sequenced response still advances delivery/acknowledgement,
+        // but cannot satisfy or corrupt the next request.
+        try await factory.server.releaseHeldResponses(on: 0)
+        try await client.reactivate()
+        await eventually { await factory.server.count(HBProtocolOperations.acknowledgeSession, on: 0) == 1 }
+        let refreshed = try await client.footageTagSnapshot(instanceID: nvr, query: query)
+        XCTAssertEqual(refreshed?.cameraID, camera)
+        XCTAssertEqual(refreshed?.instanceID, nvr)
+        let currentSession = await client.currentSessionIdentifier()
+        XCTAssertEqual(currentSession, session)
+        XCTAssertEqual(factory.count, 1, "Tag contention must not create a replacement socket")
+        await client.disconnect()
+    }
+
+    func testTransportFailureDuringTagReadStillReconnects() async throws {
+        let factory = RecoverySocketFactory(), client = client(factory)
+        try await client.connect()
+        let query = HBNVRTagQuery(cameraID: UUID().uuidString, ranges: [.init(start: 100, end: 101)], keys: [CameraVideoTags.hiddenKey])
+        let nvr = UUID().uuidString
+        await factory.server.hold(HBProtocolOperations.snapshotNVRTags, on: 0)
+        let snapshot = Task { try await client.footageTagSnapshot(instanceID: nvr, query: query) }
+        await eventually { await factory.server.count(HBProtocolOperations.snapshotNVRTags, on: 0) == 1 }
+        await factory.server.closeSocket(0)
+        do { _ = try await snapshot.value; XCTFail("A failed transport must still fail pending reads") }
+        catch { XCTAssertEqual((error as? URLError)?.code, .cancelled) }
+        let route = await client.currentControlRoute()
+        XCTAssertNil(route)
+        try await client.reactivate()
+        let refreshed = try await client.footageTagSnapshot(instanceID: nvr, query: query)
+        XCTAssertNotNil(refreshed)
+        XCTAssertEqual(factory.count, 2)
+        await client.disconnect()
+    }
+
     func testSnapshotBeforeAnyEventStillInvalidatesRetainedObserversOnReconnect() async throws {
         let factory = RecoverySocketFactory(), camera = UUID().uuidString, nvr = UUID().uuidString
         let client = client(factory)
@@ -264,6 +315,8 @@ private actor RecoveryInbox {
 
 private actor RecoveryServer {
     private var ignored: [Int: Set<String>] = [:]
+    private var heldOperations: [Int: Set<String>] = [:]
+    private var heldResponses: [Int: [HBProtocolEnvelope]] = [:]
     private var rejectedResumes: Set<Int> = []
     private var requests: [(Int, String)] = []
     private let instance = UUID()
@@ -284,6 +337,17 @@ private actor RecoveryServer {
         await inbox.push(.data(try JSONEncoder().encode(event)))
     }
     func ignore(_ operation: String, on socket: Int) { ignored[socket, default: []].insert(operation) }
+    func hold(_ operation: String, on socket: Int) { heldOperations[socket, default: []].insert(operation) }
+    func releaseHeldResponses(on socket: Int) async throws {
+        heldOperations[socket] = nil
+        let responses = heldResponses.removeValue(forKey: socket) ?? []
+        for var response in responses {
+            sequences[socket, default: 0] += 1
+            response.deliverySequence = sequences[socket]
+            await inboxes[socket]?.push(.data(try JSONEncoder().encode(response)))
+        }
+    }
+    func closeSocket(_ socket: Int) async { await inboxes[socket]?.cancel() }
     func rejectResume(on socket: Int) { rejectedResumes.insert(socket) }
     func count(_ operation: String, on socket: Int) -> Int {
         requests.filter { $0.0 == socket && $0.1 == operation }.count
@@ -320,6 +384,9 @@ private actor RecoveryServer {
                     cameraID: value.query.cameraID, spans: []))
             }
         case HBProtocolOperations.ping: body = .successWithoutResult
+        case HBProtocolOperations.acknowledgeSession:
+            let acknowledgement = try request.decodedPayload(as: HBWebSocketSessionAckRequest.self)
+            body = try .success(HBWebSocketSessionAckResult(acknowledgedDeliverySequence: acknowledgement.deliverySequence))
         case HBProtocolOperations.openCameraLiveStream:
             let open = try request.decodedPayload(as: HBCameraLiveOpenRequest.self)
             body = try .success(HBCameraLiveOpenResult(deviceIdentifier: open.deviceIdentifier,
@@ -329,6 +396,10 @@ private actor RecoveryServer {
         }
         var response = try HBProtocolEnvelope.response(to: request, body: body)
         response.sessionID = session
+        if heldOperations[socket]?.contains(request.operation) == true {
+            heldResponses[socket, default: []].append(response)
+            return nil
+        }
         return response
     }
 }

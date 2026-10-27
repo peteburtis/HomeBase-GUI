@@ -66,7 +66,10 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
             do {
                 let remaining = deadline - ProcessInfo.processInfo.systemUptime
                 guard remaining > 0 else { throw URLError(.timedOut) }
-                let reply = try await sendRequest(request, timeout: remaining)
+                // Tag reads can wait on NVR edits while the control connection
+                // is healthy. Their short deadline must not tear down every
+                // control subscription and camera stream sharing that socket.
+                let reply = try await sendRequest(request, timeout: remaining, reconnectOnTimeout: false)
                 let snapshot = try reply.decodedPayload(as: HBProtocolResponse.self).decodedResult(as: HBNVRTagSnapshot.self)
                 try snapshot.validate()
                 guard snapshot.instanceID == instance, snapshot.cameraID.caseInsensitiveCompare(query.cameraID) == .orderedSame else {
@@ -1735,17 +1738,19 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
     }
 
     private func sendRequest(
-        _ request: HBProtocolEnvelope, timeout: TimeInterval? = nil
+        _ request: HBProtocolEnvelope, timeout: TimeInterval? = nil,
+        reconnectOnTimeout: Bool = true
     ) async throws -> HBProtocolEnvelope {
         if let handoverTask { try await handoverTask.value }
         guard let task else { throw ClientError.notConnected }
-        return try await sendRequest(request, using: task, timeout: timeout)
+        return try await sendRequest(request, using: task, timeout: timeout, reconnectOnTimeout: reconnectOnTimeout)
     }
 
     private func sendRequest(
         _ request: HBProtocolEnvelope,
         using task: any HomeBaseControlTransport,
-        timeout: TimeInterval? = nil
+        timeout: TimeInterval? = nil,
+        reconnectOnTimeout: Bool = true
     ) async throws -> HBProtocolEnvelope {
         let encodedRequest = try encoder.encode(request)
         logEncodedControlWriteIfPresent(
@@ -1758,7 +1763,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         let watchdog = Task { [weak self, task] in
             do { try await Task.sleep(for: .seconds(deadline)) } catch { return }
             guard let self else { return }
-            await self.requestTimedOut(requestID, using: task)
+            await self.requestTimedOut(requestID, using: task, reconnect: reconnectOnTimeout)
         }
         defer { watchdog.cancel() }
 
@@ -1806,7 +1811,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         task === transport && pendingResponses[id] != nil
     }
 
-    private func requestTimedOut(_ id: UUID, using checkedTask: any HomeBaseControlTransport) {
+    private func requestTimedOut(_ id: UUID, using checkedTask: any HomeBaseControlTransport, reconnect: Bool) {
         guard let pending = pendingResponses.removeValue(forKey: id) else { return }
         pendingRequests.removeValue(forKey: id)
         pendingRequestOrder.removeAll { $0 == id }
@@ -1814,7 +1819,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         // The deadline belongs to the request, not a physical connection. A
         // lost mutation reply never becomes an automatic fresh mutation.
         pending.resume(throwing: canUseBluetooth ? HomeBaseControlTransportError.requestTimedOut : URLError(.timedOut))
-        if task === checkedTask { recoverControlRoute(after: URLError(.timedOut)) }
+        if reconnect, task === checkedTask { recoverControlRoute(after: URLError(.timedOut)) }
     }
 
     private func logEncodedControlWriteIfPresent(

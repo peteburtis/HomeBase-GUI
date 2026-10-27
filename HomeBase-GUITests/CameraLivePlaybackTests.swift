@@ -258,6 +258,7 @@ final class CameraLivePlaybackTests: XCTestCase {
         renderer.reset()
     }
 
+#if os(iOS)
     func testLivePiPPauseKeepsDecodingAndPlayDisplaysTheCurrentLiveFrame() async throws {
         let clip = try video()
         let renderer = CameraH264Renderer()
@@ -294,6 +295,7 @@ final class CameraLivePlaybackTests: XCTestCase {
         XCTAssertEqual(invalidations, 2)
         renderer.reset()
     }
+#endif
 
     func testLiveImmediatelyBuffersAndPauseKeepsReceiving() {
         var timeline = configured()

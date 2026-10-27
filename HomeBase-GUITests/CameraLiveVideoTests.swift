@@ -471,6 +471,7 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertEqual(controller.state, .idle)
     }
 
+#if os(iOS)
     func testEveryRecordingExportBatchGetsNewPresentationIdentity() {
         let recording = CameraLocalRecording(
             fileURL: FileManager.default.temporaryDirectory
@@ -488,6 +489,7 @@ final class CameraLiveVideoTests: XCTestCase {
         XCTAssertEqual(first.recordings, second.recordings)
         XCTAssertNotEqual(first.id, second.id)
     }
+#endif
 
     func testCompletedExportAllowsRecordingControllerToRearm() async throws {
         let pendingRecording = CameraLocalRecording(

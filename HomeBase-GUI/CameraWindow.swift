@@ -41,7 +41,14 @@ struct CameraWindowRoot: View {
     }
 
     var body: some View {
-        content
+        CameraWindowContent(camera: camera, state: connection.state, cameraName: request.cameraName,
+                            retry: { Task { await connection.reactivate() } }) { camera in
+            CameraFullScreenLiveVideoView(
+                device: camera.device,
+                quality: camera.capability.fullScreenQuality,
+                client: connection.client
+            )
+        }
             .frame(minWidth: 640, minHeight: 420)
             .background(Color.black)
             .cameraAccessScope(isActive: true)
@@ -51,19 +58,50 @@ struct CameraWindowRoot: View {
             }
     }
 
+    private var camera: CameraVideoDevice? {
+        CameraVideoCatalog.cameras(in: connection.topology.devices)
+            .first { $0.id == request.cameraID }
+    }
+}
+
+struct CameraWindowContent<Player: View>: View {
+    let camera: CameraVideoDevice?
+    let state: ServerConnectionModel.State
+    let cameraName: String
+    let retry: () -> Void
+    @ViewBuilder let player: (CameraVideoDevice) -> Player
+
+    var body: some View {
+        // A control reconnect does not end the camera viewing session. Keep
+        // its StateObjects, history cursor, and buffers until discovery removes
+        // this camera or the window itself closes.
+        if let camera {
+            player(camera)
+                .overlay(alignment: .bottom) {
+                    if let connectionStatus {
+                        ConnectionStatusOverlay(presentation: connectionStatus, retry: retry)
+                            .padding(12)
+                    }
+                }
+        } else {
+            unavailableContent
+        }
+    }
+
+    private var connectionStatus: ConnectionStatusPresentation? {
+        switch state {
+        case .connected: nil
+        case .connecting: .pending("Reconnecting…")
+        case .disconnected: .disconnected("Disconnected", systemImage: "network.slash")
+        case .failed(let message): .failed(title: "Connection Failed", message: message)
+        }
+    }
+
     @ViewBuilder
-    private var content: some View {
-        switch connection.state {
+    private var unavailableContent: some View {
+        switch state {
         case .connected:
-            if let camera {
-                CameraFullScreenLiveVideoView(
-                    device: camera.device,
-                    quality: camera.capability.fullScreenQuality,
-                    client: connection.client
-                )
-            } else {
-                unavailableCamera
-            }
+            unavailableCamera
 
         case .failed(let message):
             ContentUnavailableView {
@@ -71,35 +109,26 @@ struct CameraWindowRoot: View {
             } description: {
                 Text(message)
             } actions: {
-                Button("Try Again") {
-                    Task { await connection.reactivate() }
-                }
+                Button("Try Again", action: retry)
             }
 
         case .disconnected, .connecting:
             VStack(spacing: 12) {
                 ProgressView()
-                Text("Connecting to \(request.cameraName)…")
+                Text("Connecting to \(cameraName)…")
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
-    private var camera: CameraVideoDevice? {
-        CameraVideoCatalog.cameras(in: connection.topology.devices)
-            .first { $0.id == request.cameraID }
-    }
-
     private var unavailableCamera: some View {
         ContentUnavailableView {
             Label("Camera Unavailable", systemImage: "video.slash")
         } description: {
-            Text("\(request.cameraName) is no longer advertised by this HomeBase server.")
+            Text("\(cameraName) is no longer advertised by this HomeBase server.")
         } actions: {
-            Button("Refresh") {
-                Task { await connection.refresh() }
-            }
+            Button("Refresh", action: retry)
         }
     }
 }
