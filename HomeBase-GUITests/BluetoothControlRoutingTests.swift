@@ -13,12 +13,13 @@ final class BluetoothControlRoutingTests: XCTestCase {
                 return try await fixture.bluetooth()
             })
     }
-    private func eventually(attempts: Int = 500, _ condition: () async -> Bool) async {
+    private func eventually(attempts: Int = 500, file: StaticString = #filePath, line: UInt = #line,
+                            _ condition: () async -> Bool) async {
         for _ in 0..<attempts {
             if await condition() { return }
             try? await Task.sleep(for: .milliseconds(10))
         }
-        XCTFail("Route did not reach the expected state")
+        XCTFail("Route did not reach the expected state", file: file, line: line)
     }
 
     func testWebSocketAdapterSendsJSONTextFrames() async throws {
@@ -32,13 +33,16 @@ final class BluetoothControlRoutingTests: XCTestCase {
         XCTAssertEqual(response.operation, HBProtocolOperations.openSession)
     }
 
-    func testResponsiveWebSocketWinsWithoutOpeningBluetoothControl() async throws {
+    func testResponsiveWebSocketKeepsBluetoothCarrierWarmWithoutOpeningAnotherSession() async throws {
         let fixture = RoutingFixture()
         let client = makeClient(fixture)
         try await client.connect()
         let route = await client.currentControlRoute()
         XCTAssertEqual(route, .webSocket)
-        XCTAssertEqual(fixture.bluetoothCount, 0)
+        await eventually { fixture.bluetoothCount == 1 }
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(summary.openedRoutes, [.webSocket], "Warming Bluetooth must not create a second logical session")
+        XCTAssertEqual(summary.resumes, 0)
         XCTAssertEqual(fixture.webSocketCount, 1, "Keep the first working network session instead of opening a second socket")
         await client.disconnect()
     }
@@ -74,6 +78,51 @@ final class BluetoothControlRoutingTests: XCTestCase {
         catch { XCTAssertEqual((error as? URLError)?.code, .notConnectedToInternet) }
         let summary = await fixture.server.summary()
         XCTAssertEqual(summary.mutationExecutions, 1)
+        await client.disconnect()
+    }
+
+    func testSessionOpenDeadlineIncludesAStalledSend() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture, timeout: 0.15, bluetoothAvailable: false)
+        await fixture.server.holdNextSessionOpenSend()
+        var result: Result<Void, Error>?
+        let connection = Task {
+            do { try await client.connect(); result = .success(()) }
+            catch { result = .failure(error) }
+        }
+        await eventually { await fixture.server.hasHeldSessionSend }
+        await eventually(attempts: 100) { result != nil }
+        XCTAssertNotNil(result, "The connection deadline must include a send that never returns")
+        await fixture.server.releaseSessionSend()
+        await connection.value
+        switch result {
+        case .failure(let error): XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        default: XCTFail("A stalled session open must time out")
+        }
+        let route = await client.currentControlRoute()
+        XCTAssertNil(route)
+        await client.disconnect()
+    }
+
+    func testStalledReplaySendCannotHoldNewCommandsBehindHandover() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture, timeout: 0.2)
+        try await client.connect()
+        await fixture.server.holdNextBluetoothReplaySend()
+        await fixture.server.loseNextMutationReply()
+        let original = Task { try await client.setControl("test.light", to: .bool(true)) }
+        await eventually { await fixture.server.hasHeldReplaySend }
+        var nextResult: Result<Void, Error>?
+        let nextCommand = Task {
+            do { try await client.setControl("test.light", to: .bool(false)); nextResult = .success(()) }
+            catch { nextResult = .failure(error) }
+        }
+        await eventually(attempts: 100) { nextResult != nil }
+        XCTAssertNotNil(nextResult, "New commands must not wait forever for a stalled replay send")
+        if case .success = nextResult { XCTFail("The broken resumed carrier must not accept a new command") }
+        await fixture.server.releaseReplaySend()
+        await nextCommand.value
+        _ = await original.result
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(summary.mutationExecutions, 1, "A replay may not repeat the uncertain mutation or issue the blocked command")
         await client.disconnect()
     }
 
@@ -261,17 +310,18 @@ final class BluetoothControlRoutingTests: XCTestCase {
         await client.disconnect()
     }
 
-    func testBluetoothResumeRejectionIsNotMaskedByNetworkResumeFailure() async throws {
+    func testExpiredSessionRecoversUsingWarmBluetoothAfterNetworkHealthCheckFails() async throws {
         let fixture = RoutingFixture(), client = makeClient(fixture, timeout: 0.15)
         try await client.connect()
         let original = await client.currentSessionIdentifier()
         await fixture.server.expireCurrentSession()
-        await fixture.server.failNetworkResumes()
         try await client.reactivate()
         let replacement = await client.currentSessionIdentifier()
+        XCTAssertNotNil(replacement)
         XCTAssertNotEqual(replacement, original)
         let summary = await fixture.server.summary()
-        XCTAssertEqual(summary.resumes, 2, "Both routes reject the old session before one fresh open")
+        XCTAssertEqual(summary.resumes, 1, "A warm Bluetooth carrier can reject the expired session without another network resume")
+        XCTAssertEqual(summary.openedRoutes.count, 2, "Recovery opens one replacement session after the expired session is rejected")
         await client.disconnect()
     }
 
@@ -288,7 +338,7 @@ final class BluetoothControlRoutingTests: XCTestCase {
         XCTAssertNil(route)
         let summary = await fixture.server.summary()
         XCTAssertEqual(summary.resumes, 1)
-        XCTAssertEqual(fixture.webSocketCount, 4, "Initial, readiness probe, rejected resume, one fresh attempt")
+        XCTAssertEqual(fixture.webSocketCount, 3, "Initial, rejected resume, one fresh attempt; readiness does not open a probe session")
         await client.disconnect()
     }
 
@@ -307,6 +357,26 @@ final class BluetoothControlRoutingTests: XCTestCase {
         let route = await client.currentControlRoute()
         XCTAssertNil(session)
         XCTAssertNil(route)
+    }
+
+    func testLateCarrierFailureAfterDisconnectDoesNotRestartSession() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture, bluetoothAvailable: false)
+        await fixture.server.holdNextNetworkAttempt()
+        let connection = Task { try await client.connect() }
+        await eventually { await fixture.server.hasHeldNetworkAttempt }
+        await client.disconnect()
+        do { try await connection.value; XCTFail("Disconnect must cancel connection acquisition") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        await fixture.server.setNetworkAvailable(false)
+        await fixture.server.releaseNetworkAttempt()
+        await eventually { await fixture.server.completedNetworkReadiness == 1 }
+        let route = await client.currentControlRoute()
+        let session = await client.currentSessionIdentifier()
+        let summary = await fixture.server.summary()
+        XCTAssertNil(route)
+        XCTAssertNil(session)
+        XCTAssertTrue(summary.openedRoutes.isEmpty)
+        XCTAssertEqual(fixture.webSocketCount, 1, "A stale carrier failure must not create another attempt after disconnect")
     }
 
     func testLiveControlsReloadAndReceiveEventsAfterSessionReplacement() async throws {
@@ -333,18 +403,21 @@ final class BluetoothControlRoutingTests: XCTestCase {
         await client.disconnect()
     }
 
-    func testNearlySimultaneousReadyRoutesCommitOnlyOneResume() async throws {
+    func testConcurrentCarrierRecoveryResumesOnlySelectedRoute() async throws {
         let fixture = RoutingFixture()
+        await fixture.server.setReadinessDelay(.milliseconds(300), route: .bluetooth)
         let client = makeClient(fixture)
         try await client.connect()
         let originalSession = await client.currentSessionIdentifier()
-        await fixture.server.setOpenDelay(.milliseconds(1_000))
+        await fixture.server.setReadinessDelay(.milliseconds(20), route: .webSocket)
         fixture.closeLatestWebSocket()
         await eventually { await fixture.server.summary().resumes == 1 }
         await eventually { await client.currentControlRoute() != nil }
+        await eventually { await fixture.server.readyCount(for: .bluetooth) == 1 }
         let summary = await fixture.server.summary()
         let session = await client.currentSessionIdentifier()
-        XCTAssertEqual(summary.resumes, 1, "Readiness probes must never resume the shared session")
+        XCTAssertEqual(summary.resumes, 1, "Only the selected carrier may resume the shared session")
+        XCTAssertEqual(summary.openedRoutes.count, 1, "Carrier readiness must not allocate probe sessions")
         XCTAssertEqual(session, originalSession)
         try await client.setControl("test.light", to: .bool(false))
         await client.disconnect()
@@ -382,6 +455,77 @@ final class BluetoothControlRoutingTests: XCTestCase {
         XCTAssertEqual(fixture.bluetoothCount, 1)
         await client.disconnect()
     }
+
+    func testWarmBluetoothCarrierIsReusedWhenWebSocketFails() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture)
+        try await client.connect()
+        await eventually { await fixture.server.readyCount(for: .bluetooth) == 1 }
+        let initial = await client.currentSessionIdentifier()
+        await fixture.server.setNetworkAvailable(false)
+        fixture.closeLatestWebSocket()
+        await eventually { await client.currentControlRoute() == .bluetooth }
+        let resumed = await client.currentSessionIdentifier()
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(resumed, initial)
+        XCTAssertEqual(fixture.bluetoothCount, 1, "The standby carrier should be used without reconnecting Bluetooth")
+        XCTAssertEqual(summary.openedRoutes, [.webSocket])
+        XCTAssertEqual(summary.resumes, 1)
+        try await client.setControl("test.light", to: .bool(true))
+        await client.disconnect()
+    }
+
+    func testBluetoothForegroundRecoveryDoesNotWaitForSilentNetworkReadiness() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture)
+        await fixture.server.setNetworkAvailable(false)
+        try await client.connect()
+        let initial = await client.currentSessionIdentifier()
+        await client.setForeground(false)
+        await fixture.server.holdNextNetworkAttempt()
+        await fixture.server.setReadinessDelay(.milliseconds(100), route: .bluetooth)
+        await client.setForeground(true)
+        var recovered = false
+        let recovery = Task {
+            try await client.reactivate()
+            recovered = true
+        }
+        await eventually { await fixture.server.hasHeldNetworkAttempt }
+        await eventually(attempts: 100) { recovered }
+        let route = await client.currentControlRoute()
+        let resumed = await client.currentSessionIdentifier()
+        XCTAssertTrue(recovered, "A usable Bluetooth carrier must not wait for the network attempt or its teardown")
+        XCTAssertEqual(route, .bluetooth)
+        XCTAssertEqual(resumed, initial)
+        // Release the deliberately uncooperative network fake after proving
+        // that its pending readiness did not block session restoration.
+        await fixture.server.releaseNetworkAttempt()
+        try await recovery.value
+        try await client.setControl("test.light", to: .bool(true))
+        await client.disconnect()
+    }
+
+    func testRepeatedBluetoothBackgroundForegroundRestoresSameSession() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture)
+        await fixture.server.setNetworkAvailable(false)
+        let model = ServerConnectionModel(client: client)
+        await model.load()
+        let initial = await client.currentSessionIdentifier()
+        for _ in 0..<3 {
+            await client.setForeground(false)
+            await fixture.server.setReadinessDelay(.milliseconds(50), route: .bluetooth)
+            await client.setForeground(true)
+            await model.reactivate()
+            await eventually { model.state == .connected && model.route == .bluetooth }
+            let resumed = await client.currentSessionIdentifier()
+            XCTAssertEqual(resumed, initial)
+            try await client.setControl("test.light", to: .bool(true))
+        }
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(summary.resumes, 3)
+        XCTAssertEqual(summary.openedRoutes, [.bluetooth])
+        XCTAssertEqual(fixture.bluetoothCount, 4)
+        await client.disconnect()
+    }
+
     func testEmptyHomeReturnsToConnectedAfterHandover() async throws {
         let fixture = RoutingFixture()
         let client = makeClient(fixture)
@@ -407,11 +551,15 @@ final class BluetoothControlRoutingTests: XCTestCase {
         await eventually { if case .failed = model.state { return true }; return false }
         XCTAssertNil(model.route)
 
+        await fixture.server.holdNextNetworkAttempt()
         await fixture.server.setNetworkAvailable(true)
-        await fixture.server.setOpenDelay(.milliseconds(100))
         // A child screen reactivates the shared client without calling model.load.
+        // Hold carrier readiness so the test observes Connecting rather than
+        // relying on polling catching a completed session resume in flight.
         let childRetry = Task { try await client.reactivate() }
+        await eventually { await fixture.server.hasHeldNetworkAttempt }
         await eventually { model.state == .connecting }
+        await fixture.server.releaseNetworkAttempt()
         try await childRetry.value
         await eventually { model.state == .connected && model.route == .webSocket }
         XCTAssertTrue(model.topology.devices.isEmpty, "A valid empty cached topology also recovers")
@@ -443,19 +591,35 @@ final class BluetoothControlRoutingTests: XCTestCase {
         let session = await client.currentSessionIdentifier()
         let subscription = try await client.subscribe(to: .init(identifier: "test", addressableName: "test", displayName: "Test"))
         await fixture.server.setNetworkAvailable(true)
-        let start = ContinuousClock.now
         await client.checkPreferredControlRoute()
         let route = await client.currentControlRoute()
         let resumed = await client.currentSessionIdentifier()
         XCTAssertEqual(route, .webSocket)
         XCTAssertEqual(session, resumed)
-        XCTAssertGreaterThanOrEqual(start.duration(to: .now), .seconds(1))
         let summary = await fixture.server.summary()
         XCTAssertEqual(summary.resumes, 1)
+        XCTAssertEqual(summary.openedRoutes, [.bluetooth], "Returning to WebSocket reuses the session without opening a probe")
         XCTAssertEqual(summary.subscriptions, 1)
         try await client.setControl("test.light", to: .bool(true))
         await client.disconnect()
         _ = subscription
+    }
+
+    func testWebSocketReturnAutomaticallyResumesTheBluetoothSession() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture)
+        await fixture.server.setNetworkAvailable(false)
+        try await client.connect()
+        let original = await client.currentSessionIdentifier()
+        await fixture.server.setNetworkAvailable(true)
+        // No foreground event, control command, or explicit route check is
+        // needed: coordinator readiness must drive the handover itself.
+        await eventually { await client.currentControlRoute() == .webSocket }
+        let resumed = await client.currentSessionIdentifier()
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(resumed, original)
+        XCTAssertEqual(summary.resumes, 1)
+        XCTAssertEqual(summary.openedRoutes, [.bluetooth])
+        await client.disconnect()
     }
 
     func testNetworkReturnWithExpiredBluetoothSessionOpensFreshSession() async throws {
@@ -466,17 +630,22 @@ final class BluetoothControlRoutingTests: XCTestCase {
         await fixture.server.expireCurrentSession()
         await fixture.server.setNetworkAvailable(true)
         await client.checkPreferredControlRoute()
-        let route = await client.currentControlRoute()
         let replacement = await client.currentSessionIdentifier()
-        XCTAssertEqual(route, .webSocket)
         XCTAssertNotNil(replacement)
         XCTAssertNotEqual(replacement, original)
+        // Session replacement may first use the ready Bluetooth carrier while
+        // the rejected WebSocket attachment is rewarming. Preference applies
+        // again when the network carrier becomes ready.
+        await eventually { await client.currentControlRoute() == .webSocket }
+        let preferredSession = await client.currentSessionIdentifier()
+        XCTAssertEqual(preferredSession, replacement)
         let summary = await fixture.server.summary()
-        XCTAssertEqual(summary.resumes, 1)
+        XCTAssertGreaterThanOrEqual(summary.resumes, 1)
+        XCTAssertEqual(summary.openedRoutes.count, 2, "Returning to the preferred carrier must retain the replacement session")
         await client.disconnect()
     }
 
-    func testPeriodicNetworkChecksContinueAfterFreshRecoveryFallsBackToBluetooth() async throws {
+    func testCarrierRetriesContinueAfterFreshRecoveryFallsBackToBluetooth() async throws {
         let fixture = RoutingFixture(), client = makeClient(fixture)
         await fixture.server.setNetworkAvailable(false)
         try await client.connect()
@@ -485,8 +654,8 @@ final class BluetoothControlRoutingTests: XCTestCase {
         await fixture.server.dropNetworkOnNextFreshConnection()
         await fixture.server.setNetworkAvailable(true)
 
-        // Let the real foreground preference timer run. The probe works, but
-        // the network drops as the expired session is replaced over Bluetooth.
+        // Let the coordinator retry the network carrier. The carrier is ready,
+        // but the network drops as the expired session is replaced over Bluetooth.
         await eventually(attempts: 2_500) {
             let session = await client.currentSessionIdentifier()
             let route = await client.currentControlRoute()
@@ -497,7 +666,7 @@ final class BluetoothControlRoutingTests: XCTestCase {
         await client.disconnect()
     }
 
-    func testFailedNetworkProbeLeavesBluetoothSessionUsable() async throws {
+    func testFailedNetworkCarrierLeavesBluetoothSessionUsable() async throws {
         let fixture = RoutingFixture()
         await fixture.server.setNetworkAvailable(false)
         let client = makeClient(fixture)
@@ -651,6 +820,17 @@ private nonisolated final class RoutingSocket: HomeBaseControlSocket, @unchecked
     let transport: RoutingTransport
     var maximumMessageSize: Int { get { 16 * 1_024 * 1_024 } set {} }
     init(server: RoutingServer) { transport = RoutingTransport(route: .webSocket, server: server) }
+    func observeLifecycle(onOpen: @escaping @Sendable () -> Void, onClose: @escaping @Sendable (Error?) -> Void) {
+        Task { [transport] in
+            do {
+                try await transport.waitUntilReady()
+                onOpen()
+                await transport.waitUntilClosed()
+                onClose(nil)
+            }
+            catch { onClose(error) }
+        }
+    }
     func resume() {}
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) { transport.close() }
     func send(_ message: URLSessionWebSocketTask.Message) async throws {
@@ -667,8 +847,22 @@ private nonisolated final class RoutingTransport: HomeBaseControlTransport, @unc
     let route: HomeBaseControlRoute
     let server: RoutingServer
     let inbox = RoutingInbox()
-    init(route: HomeBaseControlRoute, server: RoutingServer) { self.route = route; self.server = server }
+    private let lifecycle = HomeBaseTransportLifecycle()
+    private let readiness: Task<Void, Never>
+    init(route: HomeBaseControlRoute, server: RoutingServer) {
+        self.route = route; self.server = server
+        readiness = Task { [lifecycle] in
+            do {
+                try await server.waitUntilReady(route: route)
+                try Task.checkCancellation()
+                lifecycle.opened()
+            } catch { lifecycle.closed(error) }
+        }
+    }
+    func waitUntilReady() async throws { try await lifecycle.waitUntilReady() }
+    func waitUntilClosed() async { await lifecycle.waitUntilClosed() }
     func send(_ data: Data) async throws {
+        try await waitUntilReady()
         let request = try JSONDecoder().decode(HBProtocolEnvelope.self, from: data)
         if let reply = try await server.reply(to: request, route: route) {
             await inbox.push(try JSONEncoder().encode(reply))
@@ -676,7 +870,11 @@ private nonisolated final class RoutingTransport: HomeBaseControlTransport, @unc
         }
     }
     func receive() async throws -> Data { try await inbox.receive() }
-    func close() { Task { await inbox.close() } }
+    func close() {
+        readiness.cancel()
+        lifecycle.closed()
+        Task { await inbox.close() }
+    }
 }
 
 private actor RoutingInbox {
@@ -693,17 +891,66 @@ private actor RoutingInbox {
 }
 
 private actor RoutingServer {
-    struct Summary: Sendable { let mutationIDs: [UUID]; let mutationExecutions: Int; let resumes: Int; let subscriptions: Int }
+    struct Summary: Sendable {
+        let mutationIDs: [UUID]
+        let mutationExecutions: Int
+        let resumes: Int
+        let subscriptions: Int
+        let openedRoutes: [HomeBaseControlRoute]
+    }
     private let instance = UUID()
     private var networkAvailable = true
     private var openDelay: Duration = .zero
+    private var networkReadinessDelay: Duration = .zero
+    private var bluetoothReadinessDelay: Duration = .milliseconds(10)
+    private var readyNetworkCount = 0
+    private var readyBluetoothCount = 0
+    private(set) var completedNetworkReadiness = 0
+    private var openedRoutes: [HomeBaseControlRoute] = []
     private var holdNetworkAttempt = false
     private var heldNetworkAttempt: CheckedContinuation<Void, Never>?
+    private var holdSessionOpenSend = false
+    private var heldSessionSend: CheckedContinuation<Void, Never>?
+    private var holdBluetoothReplaySend = false
+    private var heldReplaySend: CheckedContinuation<Void, Never>?
+    var hasHeldSessionSend: Bool { heldSessionSend != nil }
+    var hasHeldReplaySend: Bool { heldReplaySend != nil }
+    func holdNextSessionOpenSend() { holdSessionOpenSend = true }
+    func holdNextBluetoothReplaySend() { holdBluetoothReplaySend = true }
+    func releaseSessionSend() {
+        heldSessionSend?.resume()
+        heldSessionSend = nil
+    }
+    func releaseReplaySend() {
+        heldReplaySend?.resume()
+        heldReplaySend = nil
+    }
     var hasHeldNetworkAttempt: Bool { heldNetworkAttempt != nil }
     func holdNextNetworkAttempt() { holdNetworkAttempt = true }
     func releaseNetworkAttempt() {
         heldNetworkAttempt?.resume()
         heldNetworkAttempt = nil
+    }
+    func setReadinessDelay(_ delay: Duration, route: HomeBaseControlRoute) {
+        if route == .webSocket { networkReadinessDelay = delay }
+        else { bluetoothReadinessDelay = delay }
+    }
+    func readyCount(for route: HomeBaseControlRoute) -> Int {
+        route == .webSocket ? readyNetworkCount : readyBluetoothCount
+    }
+    func waitUntilReady(route: HomeBaseControlRoute) async throws {
+        defer { if route == .webSocket { completedNetworkReadiness += 1 } }
+        if route == .webSocket, holdNetworkAttempt {
+            holdNetworkAttempt = false
+            // Intentionally ignores cancellation to exercise independent
+            // carrier lifetimes when a stale system callback arrives late.
+            await withCheckedContinuation { heldNetworkAttempt = $0 }
+        }
+        let delay = route == .webSocket ? networkReadinessDelay : bluetoothReadinessDelay
+        if delay != .zero { try await Task.sleep(for: delay) }
+        if route == .webSocket, !networkAvailable { throw URLError(.notConnectedToInternet) }
+        if route == .webSocket { readyNetworkCount += 1 }
+        else { readyBluetoothCount += 1 }
     }
     private var loseMutation = false
     private var ignoreMutationReplay = false
@@ -721,12 +968,10 @@ private actor RoutingServer {
     private var upgrades = 0
     private var acknowledged: Int64 = 0
     private var deliverySequences: [UUID: Int64] = [:]
-    private var networkResumesFail = false
     private var freshConnectionsFail = false
     private var dropsFreshNetwork = false
     private var holdsFreshConnection = false
     private var rejectedResume = false
-    func failNetworkResumes() { networkResumesFail = true }
     func failFreshConnections() { freshConnectionsFail = true }
     func dropNetworkOnNextFreshConnection() { dropsFreshNetwork = true }
     func holdFreshConnection() { holdsFreshConnection = true }
@@ -751,12 +996,11 @@ private actor RoutingServer {
     func loseNextMutationReply(ignoreReplay: Bool = false, rejectResume: Bool = false) {
         loseMutation = true; ignoreMutationReplay = ignoreReplay; rejectResumes = rejectResume
     }
-    func summary() -> Summary { .init(mutationIDs: mutationIDs, mutationExecutions: receipts.count, resumes: resumes, subscriptions: subscriptions) }
+    func summary() -> Summary {
+        .init(mutationIDs: mutationIDs, mutationExecutions: receipts.count,
+              resumes: resumes, subscriptions: subscriptions, openedRoutes: openedRoutes)
+    }
     func reply(to request: HBProtocolEnvelope, route: HomeBaseControlRoute) async throws -> HBProtocolEnvelope? {
-        if route == .webSocket, holdNetworkAttempt {
-            holdNetworkAttempt = false
-            await withCheckedContinuation { heldNetworkAttempt = $0 }
-        }
         if route == .webSocket, !networkAvailable { throw URLError(.notConnectedToInternet) }
         lastClientID = request.clientID
         var responseSession = request.sessionID
@@ -767,6 +1011,10 @@ private actor RoutingServer {
             // has dropped it and expired its logical session.
             return nil
         case HBProtocolOperations.openSession:
+            if holdSessionOpenSend {
+                holdSessionOpenSend = false
+                await withCheckedContinuation { heldSessionSend = $0 }
+            }
             if rejectedResume, dropsFreshNetwork, route == .webSocket {
                 dropsFreshNetwork = false; networkAvailable = false
                 throw URLError(.networkConnectionLost)
@@ -777,13 +1025,13 @@ private actor RoutingServer {
                 await withCheckedContinuation { heldNetworkAttempt = $0 }
             }
             if route == .webSocket, openDelay != .zero { try await Task.sleep(for: openDelay) }
+            openedRoutes.append(route)
             let id = UUID(); responseSession = id; lastSessionID = id
             body = try .success(HBWebSocketSessionOpened(sessionID: id, resumeToken: "resume", serverInstanceID: instance,
                 authorization: .administrator, limits: .init(resumeWindowSeconds: 60, maximumReplayMessages: 100,
                     maximumReplayBytes: 100_000, maximumRequestRecords: 100)))
         case HBProtocolOperations.resumeSession:
             resumes += 1
-            if route == .webSocket, networkResumesFail { throw URLError(.networkConnectionLost) }
             let resume = try request.decodedPayload(as: HBWebSocketSessionResumeRequest.self)
             responseSession = resume.sessionID; lastSessionID = resume.sessionID
             rejectedResume = rejectResumes || expiredSessions.contains(resume.sessionID)
@@ -796,6 +1044,10 @@ private actor RoutingServer {
         case HBProtocolOperations.setControl:
             mutationIDs.append(request.requestID)
             if holdingNetworkMutations, route == .webSocket { return nil }
+            if route == .bluetooth, holdBluetoothReplaySend, receipts[request.requestID] != nil {
+                holdBluetoothReplaySend = false
+                await withCheckedContinuation { heldReplaySend = $0 }
+            }
             if let cached = receipts[request.requestID] { return ignoreMutationReplay ? nil : cached }
             completedValues.append(try request.decodedPayload(as: HBControlSetRequest.self).value)
             var response = try HBProtocolEnvelope.response(to: request, body: .successWithoutResult)

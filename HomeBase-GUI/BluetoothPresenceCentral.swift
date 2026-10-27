@@ -44,6 +44,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         var identity: CBCharacteristic?
         var recovery: CBCharacteristic?
         var channel: CBL2CAPChannel?
+        var carrierGeneration = UUID()
         var opening = false
         var authenticated = false
         var discovering = false
@@ -89,7 +90,9 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
             try await withCheckedThrowingContinuation { continuation in
                 guard controlWaiters[serverID] == nil else { continuation.resume(throwing: BluetoothPresenceError.busy); return }
                 let timeout = Task { [weak self] in
-                    do { try await Task.sleep(for: .seconds(15)) } catch { return }
+                    // A carrier may still be completing presence setup or its
+                    // bounded retry cooldown. Demand outlives either stage.
+                    do { try await Task.sleep(for: .seconds(60)) } catch { return }
                     self?.cancelControlWaiter(serverID: serverID, id: id, error: URLError(.timedOut))
                 }
                 controlWaiters[serverID] = ControlWaiter(id: id, clientID: clientID, continuation: continuation, timeout: timeout)
@@ -139,10 +142,19 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
     }
 
     private func fulfillControlWaiter(_ link: Link) {
-        guard let waiter = controlWaiters.removeValue(forKey: link.registration.serverID) else { return }
+        guard let waiter = controlWaiters[link.registration.serverID] else { return }
+        // close() wakes actor-side callers before its MainActor detach runs.
+        // Finish that old attachment here if foreground demand gets ahead of
+        // the queued closer; its generation guard will spare the replacement.
+        if link.controlTransport?.isClosed == true { detachControl(link) }
+        // Sending the old detach can itself expose a failed stream. Leave
+        // demand in place for the carrier retry instead of returning a dead one.
+        guard link.authenticated, link.secureChannel != nil else { return }
+        controlWaiters.removeValue(forKey: link.registration.serverID)
         waiter.timeout.cancel()
         guard link.controlTransport == nil else { waiter.continuation.resume(throwing: BluetoothPresenceError.busy); return }
         let generation = UUID()
+        let carrierGeneration = link.carrierGeneration
         link.controlGeneration = generation
         let transport = HomeBaseBluetoothTransport(sender: { [weak self, weak link] data in
             guard let self, let link, link.controlGeneration == generation, link.controlTransport != nil else { throw HomeBaseControlTransportError.closed }
@@ -156,6 +168,14 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         }, closer: { [weak self, weak link] in
             guard let self, let link, link.controlGeneration == generation else { return }
             self.detachControl(link)
+        }, invalidator: { [weak self, weak link] in
+            guard let self, let link, link.carrierGeneration == carrierGeneration,
+                  link.controlGeneration == nil || link.controlGeneration == generation else { return }
+            // A failed session handshake can expose an apparently live but
+            // stale L2CAP/Noise stream. Retire it without touching a newer link
+            // or attachment created while this caller was unwinding.
+            self.failed(link, message: "Bluetooth control disconnected; reconnecting.", retry: true,
+                        reason: "control carrier invalidated")
         })
         link.controlTransport = transport
         waiter.continuation.resume(returning: transport)
@@ -386,7 +406,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         }
         for link in contexts.values {
             cancelReconnect(link)
-            close(link)
+            close(link, preserveControlWaiter: central.state != .unauthorized && central.state != .unsupported)
             link.connection.disconnected()
             link.cancellingConnection = false
         }
@@ -531,8 +551,9 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         if foreground { backgroundTimeExpired = false }
         Self.logger.notice("Application foreground=\(foreground)")
         guard returning else { return }
-        // Once per app transition, not per tab. Refresh the presence handshake
-        // instead of treating a retained Stream object as proof of liveness.
+        // Once per app transition, not per tab. A suspended L2CAP stream is
+        // not proof of liveness, including while WebSocket owns the session
+        // and no application handshake will exercise the Bluetooth standby.
         for link in contexts.values {
             // Renew a previously expired background assertion if needed, but
             // preserve the original retry deadline when re-arming its task.
@@ -580,7 +601,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         log("disconnected", link: link, error: error)
         let interruptedSetup = !link.cancellingConnection && !link.authenticated &&
             (link.discovering || link.opening || link.channel != nil)
-        close(link)
+        close(link, preserveControlWaiter: !link.automaticRetryBlocked)
         link.cancellingConnection = false
         link.connection.disconnected()
         if interruptedSetup { link.retryPolicy.nextDelay(now: recoveryTime) }
@@ -598,7 +619,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         let wasCancelling = link.cancellingConnection
         link.cancellingConnection = false
         link.connection.disconnected()
-        close(link)
+        close(link, preserveControlWaiter: !link.automaticRetryBlocked)
         if !wasCancelling {
             link.retryPolicy.nextDelay(now: recoveryTime)
         }
@@ -809,7 +830,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
 
     private func failed(_ link: Link, message: String, retry: Bool, reason: String = "session failure") {
         log("failed reason=\(reason) automaticRetry=\(retry)", link: link)
-        close(link)
+        close(link, preserveControlWaiter: retry)
         link.automaticRetryBlocked = !retry
         if !retry { cancelReconnect(link) }
         onEvent?(.status(serverID: link.registration.serverID, message: message))
@@ -857,6 +878,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
             }
         }
         link.channel = nil
+        link.carrierGeneration = UUID()
         link.opening = false
         link.discovering = false
         link.authenticated = false

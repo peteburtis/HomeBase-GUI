@@ -4,13 +4,46 @@ import Foundation
 /// A narrow boundary for deterministic dropped/silent-connection tests.
 nonisolated protocol HomeBaseControlSocket: AnyObject, Sendable {
     var maximumMessageSize: Int { get set }
+    func observeLifecycle(onOpen: @escaping @Sendable () -> Void,
+                          onClose: @escaping @Sendable (Error?) -> Void)
     func resume()
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
     func send(_ message: URLSessionWebSocketTask.Message) async throws
     func receive() async throws -> URLSessionWebSocketTask.Message
 }
 
-extension URLSessionWebSocketTask: HomeBaseControlSocket {}
+extension HomeBaseControlSocket {
+    // Existing in-memory sockets have no upgrade exchange. Real URLSession
+    // sockets report readiness from the WebSocket delegate below.
+    nonisolated func observeLifecycle(onOpen: @escaping @Sendable () -> Void,
+                          onClose: @escaping @Sendable (Error?) -> Void) { onOpen() }
+}
+
+extension URLSessionWebSocketTask: HomeBaseControlSocket {
+    nonisolated func observeLifecycle(onOpen: @escaping @Sendable () -> Void,
+                          onClose: @escaping @Sendable (Error?) -> Void) {
+        delegate = HomeBaseWebSocketLifecycleDelegate(onOpen: onOpen, onClose: onClose)
+    }
+}
+
+/// A task retains this delegate. It retains callbacks, never the task itself.
+nonisolated final class HomeBaseWebSocketLifecycleDelegate: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
+    private let onOpen: @Sendable () -> Void
+    private let onClose: @Sendable (Error?) -> Void
+    init(onOpen: @escaping @Sendable () -> Void, onClose: @escaping @Sendable (Error?) -> Void) {
+        self.onOpen = onOpen; self.onClose = onClose
+    }
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+        onOpen()
+    }
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
+                    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        onClose(nil)
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        onClose(error)
+    }
+}
 
 /// Old commands must fail when the server can no longer account for them.
 /// Read-only monitoring can catch this signal and obtain a fresh snapshot.

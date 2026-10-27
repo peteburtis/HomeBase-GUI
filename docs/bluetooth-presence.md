@@ -61,6 +61,8 @@ pending state if the peripheral is disconnected. Valid OS-owned connection
 requests and unexpired setup attempts are retained. Permission dialogs and other
 transient inactivity do not cause refreshes. Pending control callers survive the
 refresh; a previously attached Bluetooth control transport reopens normally.
+This refresh also runs while WebSocket owns the application session, since an
+idle Bluetooth standby has no session exchange to detect a stale L2CAP stream.
 The server's departure grace covers a prompt replacement presence handshake.
 
 GATT/L2CAP/presence setup has one 25-second deadline and a finite UIKit background
@@ -103,11 +105,17 @@ ordinary HomeBase envelopes use the channel. The presence bearer cannot open
 this control channel. A restored background presence link never creates control
 demand on its own.
 
-The WebSocket client remains the sole owner of requests, subscription state,
-and delivery checkpoints. Startup gives a responsive network connection up to
-one second of preference; an immediate network error lets ready Bluetooth
-proceed immediately. Readiness probes race, but only one selected route resumes
-the logical session. During handover, the old reader stops before the checkpoint
+The carrier coordinator prepares WebSocket and Bluetooth independently while
+the app is in the foreground. WebSocket readiness means its upgrade has
+completed; Bluetooth readiness means its authenticated encrypted channel is
+usable. Neither readiness check opens a HomeBase session. A ready WebSocket is
+preferred, and a ready Bluetooth carrier can proceed while WebSocket is still
+connecting. The other carrier remains available as a standby. One carrier's
+failure, cancellation, or delayed cleanup cannot hold up the other carrier.
+
+The session client remains the sole owner of requests, subscription state,
+and delivery checkpoints. Only the selected carrier opens or resumes the
+logical session. During handover, the old reader stops before the checkpoint
 is captured. Pending requests retain their IDs and order and are replayed only
 after that same session successfully resumes. A rejected/expired session fails
 uncertain work instead of repeating it in a new session. All resume paths,
@@ -117,16 +125,21 @@ commands and configuration writes are never repeated in the replacement session.
 Requests built before a handover are also prevented from crossing into a new
 session. Request deadlines remain absolute across route changes.
 
-While the app is in the foreground on Bluetooth, a network-path change or a
-15-second retry checks WebSocket availability. Failback requires a successful
-probe session and another successful response at least one second later. The
-network-path health check has a two-second deadline. A failed probe leaves the
-working Bluetooth session intact. These are foreground control checks; none
-measure presence or wake the background app periodically.
+The coordinator retries unavailable carriers with a bounded delay while they
+are needed. A network-path change or explicit preferred-route check can retry
+WebSocket sooner. When its carrier becomes ready, the session can move back to
+WebSocket without creating a disposable probe session. A failed readiness
+attempt leaves the working Bluetooth session intact. Carrier setup and session
+negotiation have separate finite deadlines, including the initial send. These
+are foreground control checks; none measure presence or wake the background
+app periodically.
 
-Backgrounding or changing away from a control connection detaches its logical
-Bluetooth session while retaining Noise and idle physical presence. A later
-foreground attachment starts with session.open/resume. Attachment IDs fence old
+Backgrounding suspends Bluetooth control demand and invalidates prior recovery
+attempts. Detaching a logical Bluetooth session retains Noise and idle physical
+presence. A later foreground attachment first obtains a ready carrier, then
+starts with session.open/resume. Old attempt completions cannot restore a
+discarded connection or leave a new activation waiting for background work.
+Attachment IDs fence old
 detach events, and old queued deliveries are discarded until the matching new
 attachment response arrives. A fresh physical stream uses a fresh Noise
 handshake. Each negotiation has one finite timeout.
@@ -174,14 +187,16 @@ selected-peripheral restart recovery, fresh-process connection ownership,
 restoration-before-radio-readiness, pending connection deduplication, radio power
 cycling, healthy session preservation, stale callbacks after removal or retry,
 offline deletion, unchanged renames, controller identity rejection, and
-acknowledgement matching. Control tests cover preferred-route selection,
+acknowledgement matching. Control tests cover concurrent carrier setup,
+standby reuse without extra sessions, preferred-route selection,
 same-session recovery, mutation receipt replay and absolute deadlines, ordered
 pending requests, stable failback, preserved subscriptions, credential upgrade,
 attachment generations, bounded mailboxes, and encrypted queue ordering.
-Foreground regressions cover expired retained sockets, expired Bluetooth
-attachments, concurrent parent/child recovery, unavailable fallback, failed
-fresh connections, cancellation during recovery, and live updates after a new
-session.
+Foreground regressions cover repeated Bluetooth background/foreground cycles,
+delayed Bluetooth readiness while network readiness is silent, expired retained
+sockets, expired Bluetooth attachments, concurrent parent/child recovery,
+unavailable fallback, failed fresh connections, cancellation during recovery,
+and live updates after a new session.
 Simulator/build results cannot establish radio range, battery cost, suspended
 L2CAP behavior, or AccessorySetupKit relaunch behavior.
 

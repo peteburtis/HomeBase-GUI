@@ -194,9 +194,13 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
     private let makeBluetoothTransport: (@Sendable () async throws -> any HomeBaseControlTransport)?
     private var foreground = true
     private var connectionIntent: UInt64 = 0
-    private var preferenceID: UUID?
     private var handoverTask: Task<Void, Error>?
-    private var webSocketPreferenceTask: Task<Void, Never>?
+    private var handoverID: UUID?
+    private var carrierCoordinator: HomeBaseCarrierCoordinator?
+    private var carrierObservation: Task<Void, Never>?
+    private var selectedCarrier: HomeBaseCarrierCoordinator.Carrier?
+    private var attachingCarrier: HomeBaseCarrierCoordinator.Carrier?
+    private var hasConnectionDemand = false
     private var pendingRequests: [UUID: HBProtocolEnvelope] = [:]
     private var pendingRequestOrder: [UUID] = []
     private var outboundTask: Task<Void, Never>?
@@ -283,7 +287,9 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         Task { await arbiter?.shutdown() }
         connectionAttempt?.cancel()
         handoverTask?.cancel()
-        webSocketPreferenceTask?.cancel()
+        carrierObservation?.cancel()
+        let carriers = carrierCoordinator
+        Task { await carriers?.shutdown() }
         reactivationAttempt?.cancel()
         pathRecoveryTask?.cancel()
         networkMonitor?.cancel()
@@ -323,8 +329,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
             do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
             guard let self, await self.foreground else { return }
             _ = await self.liveStreamArbiter?.networkPathChanged()
-            if await self.task?.route == .bluetooth { try? await self.returnToWebSocketIfStable() }
-            else { try? await self.reactivate() }
+            await self.checkPreferredControlRoute()
         }
     }
 
@@ -367,6 +372,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
 
     func connect() async throws {
         try Task.checkCancellation()
+        hasConnectionDemand = true
         if networkMonitor == nil {
             networkMonitor = CameraNetworkPathMonitor { [weak self] in Task { await self?.networkPathChanged() } }
         }
@@ -390,6 +396,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         defer {
             if connectionAttemptID == attemptID {
                 connectionAttempt = nil; connectionAttemptID = nil
+                Task { await self.reconcileCarrierSelection() }
             }
         }
         try await attempt.value
@@ -465,7 +472,8 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         let sequence: Int64
     }
     private struct PreparedConnection: Sendable {
-        let transport: any HomeBaseControlTransport
+        let carrier: HomeBaseCarrierCoordinator.Carrier
+        var transport: any HomeBaseControlTransport { carrier.transport }
         let id: UUID
         let token: String
         let instance: UUID
@@ -502,12 +510,13 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
             let interruptsBluetooth = handoverTask != nil || task?.route == .bluetooth || task == nil
             if interruptsBluetooth {
                 connectionIntent &+= 1
-                connectionAttempt?.cancel()
-                handoverTask?.cancel(); handoverTask = nil
+                connectionAttempt?.cancel(); connectionAttempt = nil; connectionAttemptID = nil
+                reactivationAttempt?.cancel(); reactivationAttempt = nil; reactivationAttemptID = nil
+                handoverTask?.cancel(); handoverTask = nil; handoverID = nil
                 failConnection(with: HomeBaseControlTransportError.background)
             }
-            webSocketPreferenceTask?.cancel(); webSocketPreferenceTask = nil; preferenceID = nil
-        } else if task?.route == .bluetooth { scheduleWebSocketPreference() }
+        }
+        await carrierCoordinator?.setForeground(active)
     }
 
     private func establishConnection() async throws {
@@ -517,12 +526,20 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         publishRoute(nil, recovering: true)
         do {
             let candidate = try await prepareRecoveringSession(intent: intent)
-            guard intent == connectionIntent, !Task.isCancelled else { candidate.transport.close(); throw CancellationError() }
+            guard intent == connectionIntent, !Task.isCancelled else { throw CancellationError() }
+            guard await carrierCoordinator?.isCurrent(candidate.carrier) == true else { throw HomeBaseControlTransportError.closed }
+            guard intent == connectionIntent, !Task.isCancelled else { throw CancellationError() }
             adopt(candidate)
             try await cancelAbandonedSubscriptions()
             await upgradeBluetoothIfPossible()
+            guard task != nil else { throw HomeBaseControlTransportError.closed }
         } catch {
-            if intent == connectionIntent { failConnection(with: error) }
+            if intent == connectionIntent {
+                if shouldRebuildSession(after: error) {
+                    hasConnectionDemand = false
+                }
+                failConnection(with: error)
+            }
             if Task.isCancelled { throw CancellationError() }
             throw error
         }
@@ -533,13 +550,23 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
     /// Fail old work before opening it: only observations may restart, never
     /// commands whose outcome in the previous session may be unknown.
     private func prepareRecoveringSession(
-        on transport: (any HomeBaseControlTransport)? = nil,
+        on carrier: HomeBaseCarrierCoordinator.Carrier? = nil,
         intent: UInt64
     ) async throws -> PreparedConnection {
+        try Task.checkCancellation()
+        guard intent == connectionIntent else { throw CancellationError() }
+        let coordinator = await carriers()
+        try Task.checkCancellation()
+        guard intent == connectionIntent else { throw CancellationError() }
+        // An explicit reconnect must make a new attempt instead of returning
+        // a cached failure from the last foreground interval.
+        await coordinator.retryUnavailable(.webSocket)
+        if canUseBluetooth { await coordinator.retryUnavailable(.bluetooth) }
+        try Task.checkCancellation()
+        guard intent == connectionIntent else { throw CancellationError() }
         let snapshot = checkpoint
         do {
-            if let transport { return try await prepare(transport, resuming: snapshot) }
-            return try await preferredConnection(resuming: snapshot)
+            return try await preferredConnection(resuming: snapshot, first: carrier)
         } catch {
             try Task.checkCancellation()
             guard intent == connectionIntent else { throw CancellationError() }
@@ -562,100 +589,123 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         return try await service.controlTransport(serverID: bluetoothServerID, clientID: clientID)
     }
 
-    private struct ReadyConnection: Sendable {
-        let transport: any HomeBaseControlTransport
-        let prepared: PreparedConnection?
-    }
-    private struct RouteReadiness: Sendable {
-        let route: HomeBaseControlRoute
-        let result: Result<ReadyConnection, Error>
+    /// Carrier workers never open an application session. Their lifetime is
+    /// independent of whichever route currently owns our session checkpoint.
+    private func carriers() async -> HomeBaseCarrierCoordinator {
+        if let carrierCoordinator { return carrierCoordinator }
+        let bluetooth: HomeBaseCarrierCoordinator.Factory?
+        if bluetoothServerID != nil || makeBluetoothTransport != nil {
+            bluetooth = { [weak self] in
+                guard let self else { throw ClientError.notConnected }
+                return try await self.bluetoothTransport()
+            }
+        } else { bluetooth = nil }
+        let coordinator = HomeBaseCarrierCoordinator(webSocket: { [weak self] in
+            guard let self else { throw ClientError.notConnected }
+            return try await self.webSocketTransport()
+        }, bluetooth: bluetooth, foreground: foreground)
+        carrierCoordinator = coordinator
+        carrierObservation = Task { [weak self, coordinator] in
+            for await event in await coordinator.updates() {
+                guard !Task.isCancelled else { return }
+                await self?.carrierChanged(event)
+            }
+        }
+        await coordinator.start()
+        return coordinator
     }
 
-    /// Fresh startup keeps the first working network session. During recovery,
-    /// only readiness races: exactly one chosen transport resumes the session.
-    private func preferredConnection(resuming snapshot: SessionCheckpoint?) async throws -> PreparedConnection {
-        if !canUseBluetooth {
+    private func carrierChanged(_ event: HomeBaseCarrierCoordinator.Event) {
+        switch event {
+        case .ready(let carrier): Self.logConnection("carrier ready: \(carrier.route.rawValue)")
+        case .lost(let carrier): Self.logConnection("carrier lost: \(carrier.route.rawValue)")
+        case .failed(let route, let error): Self.logConnection("carrier failed: \(route.rawValue): \(error)")
+        case .suspended(let route): Self.logConnection("carrier suspended: \(route.rawValue)")
+        }
+        guard foreground, hasConnectionDemand else { return }
+        switch event {
+        case .ready:
+            Task { await self.reconcileCarrierSelection() }
+        case .lost(let carrier):
+            if selectedCarrier?.id == carrier.id {
+                recoverControlRoute(after: HomeBaseControlTransportError.closed)
+            }
+        case .failed, .suspended:
+            break
+        }
+    }
+
+    private func reconcileCarrierSelection() async {
+        guard foreground, hasConnectionDemand, connectionAttempt == nil, handoverTask == nil,
+              let coordinator = carrierCoordinator else { return }
+        let network = await coordinator.readyCarrier(for: .webSocket)
+        let bluetooth = await coordinator.readyCarrier(for: .bluetooth)
+        guard foreground, hasConnectionDemand, connectionAttempt == nil, handoverTask == nil else { return }
+        if task == nil, network != nil || bluetooth != nil {
+            // A carrier can recover while a previous session attempt is still
+            // unwinding. Reconcile the current state, not just its ready event.
+            try? await connect()
+        } else if task?.route == .bluetooth, network != nil {
+            try? await returnToWebSocketIfStable()
+        }
+    }
+
+    private func preferredConnection(
+        resuming snapshot: SessionCheckpoint?,
+        first: HomeBaseCarrierCoordinator.Carrier? = nil
+    ) async throws -> PreparedConnection {
+        let coordinator = await carriers()
+        var first = first
+        var attemptedRoute: HomeBaseControlRoute?
+        var networkError: Error?
+        var lastError: Error?
+        for _ in 0..<2 {
+            try Task.checkCancellation()
+            let carrier: HomeBaseCarrierCoordinator.Carrier
             do {
-                return try await prepare(try webSocketTransport(), resuming: snapshot)
+                if let candidate = first { carrier = candidate; first = nil }
+                else { carrier = try await coordinator.acquirePreferred(excluding: attemptedRoute) }
             } catch {
                 try Task.checkCancellation()
-                guard canUseBluetooth, !shouldRebuildSession(after: error) else { throw error }
-                // A child can start recovery before the parent publishes the
-                // foreground transition. If that happened during the network
-                // await, reconsider both routes with the same session checkpoint.
+                throw networkError ?? lastError ?? error
+            }
+            do {
+                try Task.checkCancellation()
+                guard carrier.route != .bluetooth || canUseBluetooth else { throw HomeBaseControlTransportError.background }
+                attachingCarrier = carrier
+                return try await prepare(carrier, resuming: snapshot)
+            } catch {
+                if attachingCarrier?.id == carrier.id { attachingCarrier = nil }
+                // A session rejection retires the attachment, not its healthy
+                // Bluetooth presence carrier. Transport failures invalidate it.
+                let invalidate = !shouldRebuildSession(after: error) && !(error is CancellationError)
+                // The carrier's closure observer may already have retired its
+                // slot. Its own generation guard still permits invalidation.
+                if invalidate { carrier.transport.invalidate() }
+                await coordinator.discard(carrier, invalidate: invalidate)
+                try Task.checkCancellation()
+                if shouldRebuildSession(after: error) { throw error }
+                lastError = error
+                if carrier.route == .webSocket { networkError = error }
+                attemptedRoute = carrier.route
+                if !canUseBluetooth { throw networkError ?? error }
             }
         }
-        let delay = Task { try? await Task.sleep(for: .seconds(1)) }
-        let chosen = try await withThrowingTaskGroup(of: RouteReadiness.self) { group in
-            group.addTask {
-                do {
-                    let probe = try await self.prepare(try await self.webSocketTransport(), resuming: nil)
-                    if snapshot == nil {
-                        // The successful open already is the desired session.
-                        // Reopening adds a second VPN/TCP handshake and can lose
-                        // a healthy connection if the network changes between them.
-                        return RouteReadiness(route: .webSocket, result: .success(.init(transport: probe.transport, prepared: probe)))
-                    }
-                    probe.transport.close()
-                    try Task.checkCancellation()
-                    return RouteReadiness(route: .webSocket, result: .success(.init(transport: try await self.webSocketTransport(), prepared: nil)))
-                } catch {
-                    delay.cancel()
-                    return RouteReadiness(route: .webSocket, result: .failure(error))
-                }
-            }
-            group.addTask {
-                do {
-                    await delay.value
-                    try Task.checkCancellation()
-                    return RouteReadiness(route: .bluetooth, result: .success(.init(transport: try await self.bluetoothTransport(), prepared: nil)))
-                } catch { return RouteReadiness(route: .bluetooth, result: .failure(error)) }
-            }
-            defer { delay.cancel() }
-            var networkError: Error?
-            var bluetoothError: Error?
-            while let attempt = try await group.next() {
-                switch attempt.result {
-                case .success(let ready):
-                    group.cancelAll()
-                    delay.cancel()
-                    // Late successes still own a resource, even after cancellation.
-                    while let late = try await group.next() {
-                        if case .success(let loser) = late.result { loser.transport.close() }
-                    }
-                    return ready
-                case .failure(let error):
-                    if attempt.route == .webSocket { networkError = error }
-                    else { bluetoothError = error }
-                }
-            }
-            try Task.checkCancellation()
-            // An unconfigured fallback must not hide why the preferred network
-            // route failed. Keep the original error type for recovery policy too.
-            throw networkError ?? bluetoothError ?? HomeBaseControlTransportError.unavailable
-        }
-        if let prepared = chosen.prepared { return prepared }
-        do { return try await prepare(chosen.transport, resuming: snapshot) }
-        catch {
-            try Task.checkCancellation()
-            if shouldRebuildSession(after: error) { throw error }
-            if chosen.transport.route == .webSocket {
-                do { return try await prepare(try await bluetoothTransport(), resuming: snapshot) }
-                catch {
-                    try Task.checkCancellation()
-                    // A definitive session rejection on the fallback is more
-                    // useful than the network failure that led us there.
-                    if shouldRebuildSession(after: error) { throw error }
-                    // Keep the original network failure if fallback also fails.
-                }
-                throw error
-            }
-            return try await prepare(try webSocketTransport(), resuming: snapshot)
+        throw networkError ?? lastError ?? HomeBaseControlTransportError.unavailable
+    }
+
+    private func prepare(_ carrier: HomeBaseCarrierCoordinator.Carrier, resuming snapshot: SessionCheckpoint?) async throws -> PreparedConnection {
+        let transport = carrier.transport
+        return try await withHomeBaseConnectionDeadline(seconds: min(15, requestTimeout), cancel: { transport.close() }) {
+            try await self.exchangeSession(on: carrier, resuming: snapshot)
         }
     }
 
-    private func prepare(_ transport: any HomeBaseControlTransport, resuming snapshot: SessionCheckpoint?) async throws -> PreparedConnection {
-        try await withTaskCancellationHandler {
+    private func exchangeSession(on carrier: HomeBaseCarrierCoordinator.Carrier, resuming snapshot: SessionCheckpoint?) async throws -> PreparedConnection {
+        let transport = carrier.transport
+        try Task.checkCancellation()
+        try await transport.waitUntilReady()
+        return try await withTaskCancellationHandler {
             do {
                 let request: HBProtocolEnvelope
                 if let snapshot {
@@ -666,7 +716,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
                     request = HBProtocolEnvelope(messageKind: .request, clientID: clientID, operation: HBProtocolOperations.openSession)
                 }
                 try await transport.send(encoder.encode(request))
-                let data = try await firstMessage(on: transport, timeout: min(15, requestTimeout))
+                let data = try await transport.receive()
                 try Task.checkCancellation()
                 let response = try decoder.decode(HBProtocolEnvelope.self, from: data)
                 try response.validate()
@@ -681,46 +731,30 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
                           resumed.serverInstanceID == snapshot.instance, resumed.latestDeliverySequence >= snapshot.sequence else {
                         throw ClientError.invalidMessage("the resumed session metadata does not match")
                     }
-                    return PreparedConnection(transport: transport, id: snapshot.id, token: snapshot.token,
+                    return PreparedConnection(carrier: carrier, id: snapshot.id, token: snapshot.token,
                                               instance: snapshot.instance, checkpoint: snapshot.sequence)
                 }
                 let opened = try body.decodedResult(as: HBWebSocketSessionOpened.self)
                 guard response.sessionID == opened.sessionID else { throw ClientError.invalidMessage("the session identifier changed") }
-                return PreparedConnection(transport: transport, id: opened.sessionID, token: opened.resumeToken,
+                return PreparedConnection(carrier: carrier, id: opened.sessionID, token: opened.resumeToken,
                                           instance: opened.serverInstanceID, checkpoint: 0)
             } catch let error as HBProtocolError where error.code == HBProtocolErrorCodes.resyncRequired {
-                transport.close()
                 throw ClientError.resynchronizationRequired(error.message)
-            } catch { transport.close(); throw error }
+            }
         } onCancel: { transport.close() }
     }
-    private func firstMessage(on transport: any HomeBaseControlTransport, timeout: TimeInterval) async throws -> Data {
-        try await withThrowingTaskGroup(of: Data.self) { group in
-            group.addTask { try await transport.receive() }
-            group.addTask {
-                try await Task.sleep(for: .seconds(timeout))
-                throw URLError(.timedOut)
-            }
-            defer { group.cancelAll() }
-            do { return try await group.next()! }
-            catch {
-                // Record the winning deadline error before closing the socket;
-                // otherwise its cancelled receive can race and mask timeout.
-                transport.close()
-                throw error
-            }
-        }
-    }
     private func adopt(_ candidate: PreparedConnection) {
+        Self.logConnection("session attached: \(candidate.transport.route.rawValue)")
         connectionGeneration &+= 1
         task = candidate.transport
+        selectedCarrier = candidate.carrier
+        if attachingCarrier?.id == candidate.carrier.id { attachingCarrier = nil }
         sessionID = candidate.id; resumeToken = candidate.token; serverInstanceID = candidate.instance
         acknowledgedDeliverySequence = candidate.checkpoint
         footageTagsUnsupported = false
         invalidateFootageTags()
         startReceiveLoop(using: candidate.transport)
         publishRoute(candidate.transport.route)
-        if candidate.transport.route == .bluetooth { scheduleWebSocketPreference() }
     }
 
     /// Pause the old reader before choosing a resume checkpoint. Requests retain
@@ -728,36 +762,66 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
     private func recoverControlRoute(after error: Error) {
         guard shouldPreserveSession(after: error) else { failConnection(with: error, preservingSession: false); return }
         guard canUseBluetooth, checkpoint != nil else { failConnection(with: error); return }
+        guard handoverTask == nil else {
+            if task != nil { failConnection(with: error) }
+            return
+        }
+        guard connectionAttempt == nil else { failConnection(with: error); return }
+        beginHandover(invalidatingOldCarrier: true)
+    }
+
+    /// There is exactly one owner of session open/resume. Independent carrier
+    /// readiness events can request a handover, never perform one themselves.
+    private func beginHandover(
+        to carrier: HomeBaseCarrierCoordinator.Carrier? = nil,
+        invalidatingOldCarrier: Bool = false
+    ) {
         guard handoverTask == nil else { return }
-        freezeTransport()
+        let oldCarrier = selectedCarrier
+        freezeTransport(invalidate: invalidatingOldCarrier)
         publishRoute(nil, recovering: true)
-        let intent = connectionIntent
-        handoverTask = Task { [weak self] in
-            guard let self else { throw ClientError.notConnected }
+        let intent = connectionIntent, id = UUID()
+        handoverID = id
+        handoverTask = Task {
             do {
-                let candidate = try await self.prepareRecoveringSession(intent: intent)
-                guard await self.connectionIntent == intent, !Task.isCancelled else { candidate.transport.close(); throw CancellationError() }
-                await self.adopt(candidate)
-                try await self.replayPendingRequests()
-                await self.finishHandover()
-                Task { await self.upgradeBluetoothIfPossible() }
+                if let oldCarrier { await carrierCoordinator?.discard(oldCarrier, invalidate: invalidatingOldCarrier) }
+                let candidate = try await prepareRecoveringSession(on: carrier, intent: intent)
+                guard intent == connectionIntent, !Task.isCancelled else { throw CancellationError() }
+                guard await carrierCoordinator?.isCurrent(candidate.carrier) == true else { throw HomeBaseControlTransportError.closed }
+                guard intent == connectionIntent, !Task.isCancelled else { throw CancellationError() }
+                adopt(candidate)
+                try await replayPendingRequests()
+                guard task === candidate.transport else { throw HomeBaseControlTransportError.closed }
+                guard await carrierCoordinator?.isCurrent(candidate.carrier) == true else { throw HomeBaseControlTransportError.closed }
+                guard intent == connectionIntent, !Task.isCancelled else { throw CancellationError() }
+                finishHandover(id)
+                Task { await upgradeBluetoothIfPossible() }
             } catch {
-                if await self.connectionIntent == intent {
-                    await self.finishHandover()
-                    await self.failConnection(with: error)
+                if intent == connectionIntent, handoverID == id {
+                    finishHandover(id)
+                    if shouldRebuildSession(after: error) { hasConnectionDemand = false }
+                    failConnection(with: error)
                 }
                 throw error
             }
         }
     }
-    private func finishHandover() { handoverTask = nil }
-    private func freezeTransport() {
+
+    private func finishHandover(_ id: UUID) {
+        guard handoverID == id else { return }
+        handoverTask = nil; handoverID = nil
+        Task { await self.reconcileCarrierSelection() }
+    }
+
+    private func freezeTransport(invalidate: Bool = false) {
+        let old = task
+        task = nil; selectedCarrier = nil
+        if invalidate { old?.invalidate() } else { old?.close() }
         receiveTask?.cancel(); receiveTask = nil
         acknowledgementTask?.cancel(); acknowledgementTask = nil
         let arbiter = liveStreamArbiter
         let generation = connectionGeneration
         Task { await arbiter?.connectionInterrupted(generation: generation) }
-        let old = task; task = nil; old?.close()
         // Enrollment material is deliberately excluded from cross-route replay.
         for id in webSocketOnlyRequests { pendingRequests.removeValue(forKey: id); pendingResponses.removeValue(forKey: id)?.resume(throwing: HomeBaseControlTransportError.closed) }
         pendingRequestOrder.removeAll { pendingRequests[$0] == nil }
@@ -768,70 +832,35 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         guard let task else { throw ClientError.notConnected }
         for id in pendingRequestOrder {
             guard let request = pendingRequests[id], !webSocketOnlyRequests.contains(id) else { continue }
-            try await task.send(encoder.encode(request))
-        }
-    }
-
-    private func scheduleWebSocketPreference() {
-        guard foreground, webSocketPreferenceTask == nil else { return }
-        let id = UUID()
-        preferenceID = id
-        webSocketPreferenceTask = Task { [weak self] in
-            defer { Task { await self?.finishWebSocketPreference(id) } }
-            while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(15)) } catch { return }
-                guard let self, await self.foreground, await self.task?.route == .bluetooth else { return }
-                do {
-                    try await self.returnToWebSocketIfStable()
-                    // Fresh-session recovery may still have chosen Bluetooth.
-                    // Keep checking until the network actually takes over.
-                    if await self.task?.route != .bluetooth { return }
-                } catch { /* Foreground retry only. */ }
+            let encoded = try encoder.encode(request)
+            try await withHomeBaseConnectionDeadline(seconds: min(15, requestTimeout), cancel: { task.close() }) {
+                try await task.send(encoded)
             }
         }
-    }
-    private func finishWebSocketPreference(_ id: UUID) {
-        if preferenceID == id { webSocketPreferenceTask = nil; preferenceID = nil }
     }
 
     func checkPreferredControlRoute() async {
         guard foreground else { return }
-        if task?.route == .bluetooth { try? await returnToWebSocketIfStable() }
-        else { try? await reactivate() }
+        let coordinator = await carriers()
+        await coordinator.retryUnavailable(.webSocket)
+        if task?.route == .bluetooth {
+            // Leave the healthy session attached while an explicit network
+            // check waits. Normal readiness events require no polling.
+            if let _ = try? await coordinator.acquirePreferred(excluding: .bluetooth) {
+                if let handoverTask { try? await handoverTask.value }
+                else { try? await returnToWebSocketIfStable() }
+            }
+        } else { try? await reactivate() }
     }
 
     private func returnToWebSocketIfStable() async throws {
-        guard foreground, task?.route == .bluetooth, handoverTask == nil else { return }
-        // Prove actual server responsiveness before disturbing the healthy BLE
-        // session. This short-lived probe has no subscriptions or mutations.
-        let probe = try await prepare(try webSocketTransport(), resuming: nil)
-        defer { probe.transport.close() }
-        try await Task.sleep(for: .seconds(1))
-        var ping = HBProtocolEnvelope(messageKind: .request, clientID: clientID, operation: HBProtocolOperations.ping)
-        ping.sessionID = probe.id
-        try await probe.transport.send(encoder.encode(ping))
-        let reply = try decoder.decode(HBProtocolEnvelope.self, from: await firstMessage(on: probe.transport, timeout: min(3, requestTimeout)))
-        guard reply.requestID == ping.requestID, reply.sessionID == probe.id else { throw ClientError.invalidMessage("network probe mismatch") }
-        let body = try reply.decodedPayload(as: HBProtocolResponse.self)
-        try body.validate(); if let error = body.error { throw error }
-        guard body.status == .success, foreground, task?.route == .bluetooth, handoverTask == nil else { return }
-        freezeTransport()
-        let intent = connectionIntent
-        let attempt = Task {
-            do {
-                let candidate = try await prepareRecoveringSession(on: try webSocketTransport(), intent: intent)
-                guard intent == connectionIntent, !Task.isCancelled else { candidate.transport.close(); throw CancellationError() }
-                adopt(candidate)
-                try await replayPendingRequests()
-                finishHandover()
-                Task { await upgradeBluetoothIfPossible() }
-            } catch {
-                if intent == connectionIntent { finishHandover(); recoverControlRoute(after: error) }
-                throw error
-            }
-        }
-        handoverTask = attempt
-        try await attempt.value
+        guard foreground, task?.route == .bluetooth, handoverTask == nil, connectionAttempt == nil,
+              let coordinator = carrierCoordinator,
+              let carrier = await coordinator.readyCarrier(for: .webSocket) else { return }
+        // Recheck after the actor hop: another caller may already be moving it.
+        guard foreground, task?.route == .bluetooth, handoverTask == nil, connectionAttempt == nil else { return }
+        beginHandover(to: carrier)
+        try await handoverTask?.value
     }
 
     private func bluetoothService() async -> BluetoothPresenceService {
@@ -1733,8 +1762,11 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         liveStreamArbiter = nil
         networkMonitor?.cancel(); networkMonitor = nil
         pathRecoveryTask?.cancel(); pathRecoveryTask = nil
-        handoverTask?.cancel(); handoverTask = nil
-        webSocketPreferenceTask?.cancel(); webSocketPreferenceTask = nil
+        hasConnectionDemand = false
+        handoverTask?.cancel(); handoverTask = nil; handoverID = nil
+        carrierObservation?.cancel(); carrierObservation = nil
+        let coordinator = carrierCoordinator
+        carrierCoordinator = nil
         reactivationAttempt?.cancel(); reactivationAttempt = nil; reactivationAttemptID = nil
         connectionAttempt?.cancel()
         connectionAttempt = nil; connectionAttemptID = nil
@@ -1742,6 +1774,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
             with: CancellationError(),
             preservingSession: false
         )
+        await coordinator?.shutdown()
         await arbiter?.shutdown()
     }
 
@@ -2464,8 +2497,16 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         receiveTask = nil
         acknowledgementTask?.cancel()
         acknowledgementTask = nil
+        let carrier = selectedCarrier
+        let attaching = attachingCarrier
+        selectedCarrier = nil
+        attachingCarrier = nil
+        attaching?.transport.close()
         task?.close()
         task = nil
+        let coordinator = carrierCoordinator
+        if let carrier { Task { await coordinator?.discard(carrier) } }
+        if let attaching { Task { await coordinator?.discard(attaching) } }
 
         if willPreserveSession {
             abandonedSubscriptions.formUnion(activeSubscriptions)
