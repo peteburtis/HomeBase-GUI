@@ -110,8 +110,12 @@ proceed immediately. Readiness probes race, but only one selected route resumes
 the logical session. During handover, the old reader stops before the checkpoint
 is captured. Pending requests retain their IDs and order and are replayed only
 after that same session successfully resumes. A rejected/expired session fails
-uncertain work instead of repeating it in a new session. Request deadlines
-remain absolute across route changes.
+uncertain work instead of repeating it in a new session. All resume paths,
+including foreground route recovery and network failback, then automatically
+open a fresh session. Live monitoring reloads its snapshots and subscriptions;
+commands and configuration writes are never repeated in the replacement session.
+Requests built before a handover are also prevented from crossing into a new
+session. Request deadlines remain absolute across route changes.
 
 While the app is in the foreground on Bluetooth, a network-path change or a
 15-second retry checks WebSocket availability. Failback requires a successful
@@ -151,6 +155,10 @@ normal retry action. New reports do not extend the deadline, and pending work
 continues to show its loading state. Background teardown errors stay concealed
 while the app is inactive. Active control screens also report loading while
 waiting for their monitoring task to start or finish cleanup from the prior run.
+An expired session stays in Connecting while the app opens a fresh connection;
+it is not itself a user-facing failure. If that fresh connection fails, its
+actual connection error and retry action are shown. Session recovery details
+remain in diagnostic logs rather than asking the user to rebuild subscriptions.
 
 Screens use `connectionStatusReport` to contribute status and reserve scroll-end
 room, or `connectionStatusClearance` when they only need the spacing. The clearance
@@ -170,6 +178,10 @@ acknowledgement matching. Control tests cover preferred-route selection,
 same-session recovery, mutation receipt replay and absolute deadlines, ordered
 pending requests, stable failback, preserved subscriptions, credential upgrade,
 attachment generations, bounded mailboxes, and encrypted queue ordering.
+Foreground regressions cover expired retained sockets, expired Bluetooth
+attachments, concurrent parent/child recovery, unavailable fallback, failed
+fresh connections, cancellation during recovery, and live updates after a new
+session.
 Simulator/build results cannot establish radio range, battery cost, suspended
 L2CAP behavior, or AccessorySetupKit relaunch behavior.
 

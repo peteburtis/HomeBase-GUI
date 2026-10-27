@@ -148,8 +148,8 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
                 "The HomeBase message stream skipped from sequence \(expected) to \(received)."
             case .subscriptionEnded(let reason):
                 "The HomeBase subscription ended: \(reason)"
-            case .resynchronizationRequired(let reason):
-                "The HomeBase session must be rebuilt: \(reason)"
+            case .resynchronizationRequired:
+                "HomeBase needs to reconnect. Try again."
             }
         }
     }
@@ -501,14 +501,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         guard task == nil else { return }
         publishRoute(nil, recovering: true)
         do {
-            let candidate: PreparedConnection
-            do { candidate = try await preferredConnection(resuming: checkpoint) }
-            catch {
-                guard checkpoint != nil, shouldRebuildSession(after: error) else { throw error }
-                // No pending mutation is transferred to a new logical session.
-                failConnection(with: error, preservingSession: false)
-                candidate = try await preferredConnection(resuming: nil)
-            }
+            let candidate = try await prepareRecoveringSession(intent: intent)
             guard intent == connectionIntent, !Task.isCancelled else { candidate.transport.close(); throw CancellationError() }
             adopt(candidate)
             try await cancelAbandonedSubscriptions()
@@ -517,6 +510,28 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
             if intent == connectionIntent { failConnection(with: error) }
             if Task.isCancelled { throw CancellationError() }
             throw error
+        }
+    }
+
+    /// Expiry is normal after suspension. Every resume path gets one fresh
+    /// connection attempt, including route handover and network failback.
+    /// Fail old work before opening it: only observations may restart, never
+    /// commands whose outcome in the previous session may be unknown.
+    private func prepareRecoveringSession(
+        on transport: (any HomeBaseControlTransport)? = nil,
+        intent: UInt64
+    ) async throws -> PreparedConnection {
+        let snapshot = checkpoint
+        do {
+            if let transport { return try await prepare(transport, resuming: snapshot) }
+            return try await preferredConnection(resuming: snapshot)
+        } catch {
+            try Task.checkCancellation()
+            guard intent == connectionIntent else { throw CancellationError() }
+            guard snapshot != nil, shouldRebuildSession(after: error) else { throw error }
+            Self.logConnection("session resume rejected; opening a fresh session: \(error)")
+            failConnection(with: HomeBaseSessionResetError(), preservingSession: false, recovering: true)
+            return try await preferredConnection(resuming: nil)
         }
     }
 
@@ -613,6 +628,9 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
                 do { return try await prepare(try await bluetoothTransport(), resuming: snapshot) }
                 catch {
                     try Task.checkCancellation()
+                    // A definitive session rejection on the fallback is more
+                    // useful than the network failure that led us there.
+                    if shouldRebuildSession(after: error) { throw error }
                     // Keep the original network failure if fallback also fails.
                 }
                 throw error
@@ -655,6 +673,9 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
                 guard response.sessionID == opened.sessionID else { throw ClientError.invalidMessage("the session identifier changed") }
                 return PreparedConnection(transport: transport, id: opened.sessionID, token: opened.resumeToken,
                                           instance: opened.serverInstanceID, checkpoint: 0)
+            } catch let error as HBProtocolError where error.code == HBProtocolErrorCodes.resyncRequired {
+                transport.close()
+                throw ClientError.resynchronizationRequired(error.message)
             } catch { transport.close(); throw error }
         } onCancel: { transport.close() }
     }
@@ -699,7 +720,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         handoverTask = Task { [weak self] in
             guard let self else { throw ClientError.notConnected }
             do {
-                let candidate = try await self.preferredConnection(resuming: self.checkpoint)
+                let candidate = try await self.prepareRecoveringSession(intent: intent)
                 guard await self.connectionIntent == intent, !Task.isCancelled else { candidate.transport.close(); throw CancellationError() }
                 await self.adopt(candidate)
                 try await self.replayPendingRequests()
@@ -745,7 +766,12 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(15)) } catch { return }
                 guard let self, await self.foreground, await self.task?.route == .bluetooth else { return }
-                do { try await self.returnToWebSocketIfStable(); return } catch { /* Foreground retry only. */ }
+                do {
+                    try await self.returnToWebSocketIfStable()
+                    // Fresh-session recovery may still have chosen Bluetooth.
+                    // Keep checking until the network actually takes over.
+                    if await self.task?.route != .bluetooth { return }
+                } catch { /* Foreground retry only. */ }
             }
         }
     }
@@ -778,7 +804,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         let intent = connectionIntent
         let attempt = Task {
             do {
-                let candidate = try await prepare(try webSocketTransport(), resuming: checkpoint)
+                let candidate = try await prepareRecoveringSession(on: try webSocketTransport(), intent: intent)
                 guard intent == connectionIntent, !Task.isCancelled else { candidate.transport.close(); throw CancellationError() }
                 adopt(candidate)
                 try await replayPendingRequests()
@@ -1739,6 +1765,9 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
     ) async throws -> HBProtocolEnvelope {
         if let handoverTask { try await handoverTask.value }
         guard let task else { throw ClientError.notConnected }
+        // A request can have been constructed before an awaited handover
+        // replaced the logical session. Never send it into the new session.
+        guard request.sessionID == sessionID else { throw HomeBaseSessionResetError() }
         return try await sendRequest(request, using: task, timeout: timeout)
     }
 
@@ -2401,7 +2430,8 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
 
     private func failConnection(
         with error: Error,
-        preservingSession requestedPreservation: Bool? = nil
+        preservingSession requestedPreservation: Bool? = nil,
+        recovering: Bool = false
     ) {
         let arbiter = liveStreamArbiter
         let generation = connectionGeneration
@@ -2441,7 +2471,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         pendingRequestOrder.removeAll()
         outboundTask?.cancel(); outboundTask = nil
         webSocketOnlyRequests.removeAll()
-        publishRoute(nil, error: error)
+        publishRoute(nil, recovering: recovering, error: recovering ? nil : error)
         for continuation in pending {
             continuation.resume(throwing: error)
         }

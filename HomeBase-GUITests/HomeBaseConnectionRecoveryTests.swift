@@ -18,6 +18,50 @@ final class HomeBaseConnectionRecoveryTests: XCTestCase {
         XCTFail("Condition was not reached")
     }
 
+    func testResynchronizationMessageDoesNotExposeProtocolDiagnostics() {
+        let error = HomeBaseWebSocketClient.ClientError.resynchronizationRequired(
+            "The WebSocket session cannot be resumed; rebuild client state from fresh subscriptions.")
+        XCTAssertEqual(error.localizedDescription, "HomeBase needs to reconnect. Try again.")
+    }
+
+    func testObservationRecoveryCleansUpBeforeReloadAndSurfacesFreshConnectionFailure() async {
+        var attempts = 0
+        var cleanedUp = false
+        do {
+            try await HomeBaseObservationRecovery.run(onSessionReset: { cleanedUp = true }) {
+                attempts += 1
+                if attempts == 1 { throw HomeBaseSessionResetError() }
+                XCTAssertTrue(cleanedUp, "Old monitoring must be cleaned up before requesting a fresh snapshot")
+                throw URLError(.cannotConnectToHost)
+            }
+            XCTFail("An unavailable fresh connection must be reported")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .cannotConnectToHost)
+        }
+        XCTAssertEqual(attempts, 2, "Ordinary failures must not create an observation retry loop")
+    }
+
+    func testObservationCancellationDuringResetCleanupDoesNotReload() async {
+        let cleanup = expectation(description: "Old observation is cleaning up")
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        defer { continuation.finish() }
+        var attempts = 0
+        let observing = Task {
+            try await HomeBaseObservationRecovery.run(onSessionReset: {
+                cleanup.fulfill()
+                for await _ in stream {}
+            }) {
+                attempts += 1
+                throw HomeBaseSessionResetError()
+            }
+        }
+        await fulfillment(of: [cleanup], timeout: 1)
+        observing.cancel()
+        do { try await observing.value; XCTFail("A departed screen must stop monitoring") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(attempts, 1)
+    }
+
     func testSnapshotBeforeAnyEventStillInvalidatesRetainedObserversOnReconnect() async throws {
         let factory = RecoverySocketFactory(), camera = UUID().uuidString, nvr = UUID().uuidString
         let client = client(factory)

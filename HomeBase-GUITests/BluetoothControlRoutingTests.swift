@@ -13,8 +13,8 @@ final class BluetoothControlRoutingTests: XCTestCase {
                 return try await fixture.bluetooth()
             })
     }
-    private func eventually(_ condition: () async -> Bool) async {
-        for _ in 0..<500 {
+    private func eventually(attempts: Int = 500, _ condition: () async -> Bool) async {
+        for _ in 0..<attempts {
             if await condition() { return }
             try? await Task.sleep(for: .milliseconds(10))
         }
@@ -178,10 +178,158 @@ final class BluetoothControlRoutingTests: XCTestCase {
         try await client.connect()
         await fixture.server.loseNextMutationReply(rejectResume: true)
         do { try await client.setControl("test.light", to: .bool(true)); XCTFail("Expired session must fail its pending work") }
-        catch { }
+        catch {
+            XCTAssertTrue(error is HomeBaseSessionResetError)
+            XCTAssertEqual(error.localizedDescription,
+                "The connection was interrupted. Check the current state before trying again.")
+        }
+        await eventually { await client.currentControlRoute() == .bluetooth }
         let summary = await fixture.server.summary()
         XCTAssertEqual(summary.mutationExecutions, 1)
         XCTAssertEqual(summary.mutationIDs.count, 1)
+        await client.disconnect()
+    }
+
+    func testForegroundWithExpiredSessionRecoversWithoutAnotherForegroundOrRetry() async throws {
+        // Paired servers enable route recovery even when Bluetooth is not in
+        // range. Exercise both that case and an available Bluetooth fallback.
+        for bluetoothAvailable in [false, true] {
+            let fixture = RoutingFixture()
+            let client = makeClient(fixture, timeout: 0.15, bluetoothAvailable: bluetoothAvailable)
+            let model = ServerConnectionModel(client: client)
+            await model.load()
+            XCTAssertEqual(model.state, .connected)
+            let original = await client.currentSessionIdentifier()
+            await client.setForeground(false)
+            await fixture.server.expireCurrentSession()
+            await client.setForeground(true)
+            var states: [HomeBaseControlConnectionState] = []
+            let observation = Task {
+                for await state in await client.controlConnectionStates() { states.append(state) }
+            }
+            defer { observation.cancel() }
+
+            async let parent: Void = model.reactivate()
+            async let child: Void = client.reactivate()
+            await parent
+            try await child
+
+            XCTAssertEqual(model.state, .connected)
+            let replacement = await client.currentSessionIdentifier()
+            XCTAssertNotNil(replacement)
+            XCTAssertNotEqual(replacement, original)
+            let route = await client.currentControlRoute()
+            XCTAssertEqual(route, .webSocket)
+            let summary = await fixture.server.summary()
+            XCTAssertEqual(summary.resumes, 1)
+            XCTAssertEqual(summary.mutationExecutions, 0)
+            XCTAssertFalse(states.contains { $0.error != nil }, "Expected expiry must stay in recovery, without a failed badge")
+            await client.disconnect()
+        }
+    }
+
+    func testExpiredSessionRecoversOverBluetoothWhenNetworkIsUnavailable() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture, timeout: 0.15)
+        try await client.connect()
+        let original = await client.currentSessionIdentifier()
+        await client.setForeground(false)
+        await fixture.server.expireCurrentSession()
+        await fixture.server.setNetworkAvailable(false)
+        await client.setForeground(true)
+        try await client.reactivate()
+        let route = await client.currentControlRoute()
+        let replacement = await client.currentSessionIdentifier()
+        XCTAssertEqual(route, .bluetooth)
+        XCTAssertNotNil(replacement)
+        XCTAssertNotEqual(replacement, original)
+        await client.disconnect()
+    }
+
+    func testExpiredDetachedBluetoothSessionStartsFreshOnForeground() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture)
+        await fixture.server.setNetworkAvailable(false)
+        try await client.connect()
+        let original = await client.currentSessionIdentifier()
+        await client.setForeground(false)
+        await fixture.server.expireCurrentSession()
+        await client.setForeground(true)
+        try await client.reactivate()
+        let route = await client.currentControlRoute()
+        let replacement = await client.currentSessionIdentifier()
+        XCTAssertEqual(route, .bluetooth)
+        XCTAssertNotEqual(replacement, original)
+        await client.disconnect()
+    }
+
+    func testBluetoothResumeRejectionIsNotMaskedByNetworkResumeFailure() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture, timeout: 0.15)
+        try await client.connect()
+        let original = await client.currentSessionIdentifier()
+        await fixture.server.expireCurrentSession()
+        await fixture.server.failNetworkResumes()
+        try await client.reactivate()
+        let replacement = await client.currentSessionIdentifier()
+        XCTAssertNotEqual(replacement, original)
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(summary.resumes, 2, "Both routes reject the old session before one fresh open")
+        await client.disconnect()
+    }
+
+    func testFailedFreshConnectionReportsActualFailureAndStopsRetrying() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture, timeout: 0.15, bluetoothAvailable: false)
+        try await client.connect()
+        await fixture.server.expireCurrentSession()
+        await fixture.server.failFreshConnections()
+        do { try await client.reactivate(); XCTFail("The fresh connection must fail") }
+        catch { XCTAssertEqual((error as? URLError)?.code, .cannotConnectToHost) }
+        let session = await client.currentSessionIdentifier()
+        let route = await client.currentControlRoute()
+        XCTAssertNil(session)
+        XCTAssertNil(route)
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(summary.resumes, 1)
+        XCTAssertEqual(fixture.webSocketCount, 4, "Initial, readiness probe, rejected resume, one fresh attempt")
+        await client.disconnect()
+    }
+
+    func testDisconnectDuringFreshRecoveryDoesNotResurrectConnection() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture, timeout: 0.15)
+        try await client.connect()
+        await fixture.server.expireCurrentSession()
+        await fixture.server.holdFreshConnection()
+        let recovery = Task { try await client.reactivate() }
+        await eventually { await fixture.server.hasHeldNetworkAttempt }
+        await client.disconnect()
+        await fixture.server.releaseNetworkAttempt()
+        do { try await recovery.value; XCTFail("Disconnect must cancel the fresh attempt") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let session = await client.currentSessionIdentifier()
+        let route = await client.currentControlRoute()
+        XCTAssertNil(session)
+        XCTAssertNil(route)
+    }
+
+    func testLiveControlsReloadAndReceiveEventsAfterSessionReplacement() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture)
+        let model = LiveDeviceControlsModel(device: .init(identifier: "test", addressableName: "test", displayName: "Test"), client: client)
+        let monitoring = Task { await model.run(reactivating: true) }
+        defer { monitoring.cancel() }
+        await eventually { model.state == .live }
+        await fixture.server.expireCurrentSession()
+        await fixture.server.setNetworkAvailable(false)
+        fixture.closeLatestWebSocket()
+        await eventually {
+            let summary = await fixture.server.summary()
+            return summary.subscriptions == 2 && model.state == .live
+        }
+        let subscriptionID = await fixture.server.latestSubscriptionID()
+        let identifier = try XCTUnwrap(subscriptionID)
+        try await fixture.sendControlEvent(subscriptionID: identifier)
+        await eventually { model.controls.first?.value == .bool(true) }
+        let route = await client.currentControlRoute()
+        XCTAssertEqual(route, .bluetooth)
+        monitoring.cancel()
+        await monitoring.value
         await client.disconnect()
     }
 
@@ -308,6 +456,45 @@ final class BluetoothControlRoutingTests: XCTestCase {
         try await client.setControl("test.light", to: .bool(true))
         await client.disconnect()
         _ = subscription
+    }
+
+    func testNetworkReturnWithExpiredBluetoothSessionOpensFreshSession() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture)
+        await fixture.server.setNetworkAvailable(false)
+        try await client.connect()
+        let original = await client.currentSessionIdentifier()
+        await fixture.server.expireCurrentSession()
+        await fixture.server.setNetworkAvailable(true)
+        await client.checkPreferredControlRoute()
+        let route = await client.currentControlRoute()
+        let replacement = await client.currentSessionIdentifier()
+        XCTAssertEqual(route, .webSocket)
+        XCTAssertNotNil(replacement)
+        XCTAssertNotEqual(replacement, original)
+        let summary = await fixture.server.summary()
+        XCTAssertEqual(summary.resumes, 1)
+        await client.disconnect()
+    }
+
+    func testPeriodicNetworkChecksContinueAfterFreshRecoveryFallsBackToBluetooth() async throws {
+        let fixture = RoutingFixture(), client = makeClient(fixture)
+        await fixture.server.setNetworkAvailable(false)
+        try await client.connect()
+        let original = await client.currentSessionIdentifier()
+        await fixture.server.expireCurrentSession()
+        await fixture.server.dropNetworkOnNextFreshConnection()
+        await fixture.server.setNetworkAvailable(true)
+
+        // Let the real foreground preference timer run. The probe works, but
+        // the network drops as the expired session is replaced over Bluetooth.
+        await eventually(attempts: 2_500) {
+            let session = await client.currentSessionIdentifier()
+            let route = await client.currentControlRoute()
+            return session != nil && session != original && route == .bluetooth
+        }
+        await fixture.server.setNetworkAvailable(true)
+        await eventually(attempts: 2_500) { await client.currentControlRoute() == .webSocket }
+        await client.disconnect()
     }
 
     func testFailedNetworkProbeLeavesBluetoothSessionUsable() async throws {
@@ -533,7 +720,20 @@ private actor RoutingServer {
     private var credential: HBBluetoothCnCCredential?
     private var upgrades = 0
     private var acknowledged: Int64 = 0
-    private var deliverySequence: Int64 = 0
+    private var deliverySequences: [UUID: Int64] = [:]
+    private var networkResumesFail = false
+    private var freshConnectionsFail = false
+    private var dropsFreshNetwork = false
+    private var holdsFreshConnection = false
+    private var rejectedResume = false
+    func failNetworkResumes() { networkResumesFail = true }
+    func failFreshConnections() { freshConnectionsFail = true }
+    func dropNetworkOnNextFreshConnection() { dropsFreshNetwork = true }
+    func holdFreshConnection() { holdsFreshConnection = true }
+    private var lastSubscriptionID: UUID?
+    func latestSubscriptionID() -> UUID? { lastSubscriptionID }
+    private let control = HBControlWatchStreamControl(control: "test:Power", deviceIdentifier: "test",
+        controlIdentifier: "Power", displayName: "Power", kind: "BinarySwitch")
     private var replaySubscription: UUID?
     func replayEventOnNextResume(_ id: UUID) { replaySubscription = id }
     func extraMessages(after request: HBProtocolEnvelope) throws -> [HBProtocolEnvelope] {
@@ -544,6 +744,8 @@ private actor RoutingServer {
     func setCredential(_ value: HBBluetoothCnCCredential) { credential = value }
     func upgradeSummary() -> (Int, Int64) { (upgrades, acknowledged) }
     private var lastSessionID = UUID()
+    private var expiredSessions: Set<UUID> = []
+    func expireCurrentSession() { expiredSessions.insert(lastSessionID) }
     func setNetworkAvailable(_ value: Bool) { networkAvailable = value }
     func setOpenDelay(_ value: Duration) { openDelay = value }
     func loseNextMutationReply(ignoreReplay: Bool = false, rejectResume: Bool = false) {
@@ -560,7 +762,20 @@ private actor RoutingServer {
         var responseSession = request.sessionID
         let body: HBProtocolResponse
         switch request.operation {
+        case HBProtocolOperations.ping where request.sessionID.map(expiredSessions.contains) == true:
+            // An app can retain a socket while suspended long after the server
+            // has dropped it and expired its logical session.
+            return nil
         case HBProtocolOperations.openSession:
+            if rejectedResume, dropsFreshNetwork, route == .webSocket {
+                dropsFreshNetwork = false; networkAvailable = false
+                throw URLError(.networkConnectionLost)
+            }
+            if rejectedResume, freshConnectionsFail { throw URLError(.cannotConnectToHost) }
+            if rejectedResume, holdsFreshConnection {
+                holdsFreshConnection = false
+                await withCheckedContinuation { heldNetworkAttempt = $0 }
+            }
             if route == .webSocket, openDelay != .zero { try await Task.sleep(for: openDelay) }
             let id = UUID(); responseSession = id; lastSessionID = id
             body = try .success(HBWebSocketSessionOpened(sessionID: id, resumeToken: "resume", serverInstanceID: instance,
@@ -568,9 +783,14 @@ private actor RoutingServer {
                     maximumReplayBytes: 100_000, maximumRequestRecords: 100)))
         case HBProtocolOperations.resumeSession:
             resumes += 1
+            if route == .webSocket, networkResumesFail { throw URLError(.networkConnectionLost) }
             let resume = try request.decodedPayload(as: HBWebSocketSessionResumeRequest.self)
             responseSession = resume.sessionID; lastSessionID = resume.sessionID
-            body = rejectResumes ? .failure(.init(code: HBProtocolErrorCodes.resyncRequired, message: "expired")) :
+            rejectedResume = rejectResumes || expiredSessions.contains(resume.sessionID)
+            body = rejectedResume ? .failure(.init(
+                code: HBProtocolErrorCodes.resyncRequired,
+                message: "The WebSocket session cannot be resumed; rebuild client state from fresh subscriptions.",
+                details: .object(["reason": .string("session_expired")]))) :
                 try .success(HBWebSocketSessionResumed(sessionID: resume.sessionID, serverInstanceID: instance,
                     replayedMessageCount: 0, latestDeliverySequence: resume.acknowledgedDeliverySequence))
         case HBProtocolOperations.setControl:
@@ -585,9 +805,17 @@ private actor RoutingServer {
             return response
         case HBProtocolOperations.listTopology:
             body = try .success(HBTopologyListResult(devices: [], rooms: [], groups: []))
+        case HBProtocolOperations.listDevices:
+            body = try .success(HBDeviceListResult(devices: [HBDeviceDescriptor(identifier: "test",
+                addressableName: "test", displayName: "Test", moduleName: "test",
+                controls: [.init(identifier: "Power", name: "Power", kind: "BinarySwitch", metadata: ["readable": true])])]))
         case HBProtocolOperations.streamControls:
             subscriptions += 1
-            body = try .success(HBControlWatchStreamAccepted(subscriptionID: UUID(), controls: []))
+            let identifier = UUID(); lastSubscriptionID = identifier
+            body = try .success(HBControlWatchStreamAccepted(subscriptionID: identifier, controls: [control]))
+        case HBProtocolOperations.cancelSubscription:
+            let cancel = try request.decodedPayload(as: HBSubscriptionCancelRequest.self)
+            body = try .success(HBSubscriptionCancelResult(subscriptionID: cancel.subscriptionID))
         case HBProtocolOperations.executeModuleCommand:
             let command = try request.decodedPayload(as: HBModuleCommandRequest.self)
             guard command.moduleName == HBBluetoothProtocol.moduleName, command.path == ["cnc", "enroll"], let credential else {
@@ -603,15 +831,19 @@ private actor RoutingServer {
         }
         var result = try HBProtocolEnvelope.response(to: request, body: body)
         result.sessionID = responseSession
-        if request.operation == HBProtocolOperations.executeModuleCommand { deliverySequence += 1; result.deliverySequence = deliverySequence }
+        if request.operation == HBProtocolOperations.executeModuleCommand || request.operation == HBProtocolOperations.listDevices,
+           let responseSession {
+            deliverySequences[responseSession, default: 0] += 1
+            result.deliverySequence = deliverySequences[responseSession]
+        }
         return result
     }
     func event(subscriptionID: UUID) throws -> HBProtocolEnvelope {
         var envelope = HBProtocolEnvelope(messageKind: .event, clientID: lastClientID, operation: HBProtocolOperations.streamControls,
-            payload: try HBJSONValue(encoding: HBControlWatchStreamEvent(subscriptionID: subscriptionID, sequence: 1, kind: .change, value: .bool(true))),
+            payload: try HBJSONValue(encoding: HBControlWatchStreamEvent(subscriptionID: subscriptionID, sequence: 1, kind: .change, control: control, value: .bool(true))),
             sessionID: lastSessionID, subscriptionID: subscriptionID)
-        deliverySequence += 1
-        envelope.deliverySequence = deliverySequence
+        deliverySequences[lastSessionID, default: 0] += 1
+        envelope.deliverySequence = deliverySequences[lastSessionID]
         return envelope
     }
 }
