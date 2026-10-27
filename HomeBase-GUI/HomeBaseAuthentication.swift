@@ -1,17 +1,33 @@
 import Foundation
 import CryptoKit
 import HomeBaseProtocol
+import OSLog
 import Security
 
+nonisolated enum HomeBaseKeychainOperation: String, Sendable {
+    case load = "SecItemCopyMatching"
+    case add = "SecItemAdd"
+    case update = "SecItemUpdate"
+    case delete = "SecItemDelete"
+}
+
 nonisolated enum HomeBaseAuthenticationError: Error, LocalizedError {
-    case invalidPairingURL, missingIdentity, invalidIdentity, invalidResponse, keychain(OSStatus), keyUnavailable
+    case invalidPairingURL, missingIdentity, invalidIdentity, invalidResponse, keyUnavailable
+    case keychain(OSStatus, operation: HomeBaseKeychainOperation? = nil)
     var errorDescription: String? {
         switch self {
         case .invalidPairingURL: "Enter the complete HomeBase pairing URL printed below its QR code."
         case .missingIdentity: "Pair this device with HomeBase to create its credentials."
         case .invalidIdentity: "The saved HomeBase identity cannot be used. Pair this device again."
         case .invalidResponse: "HomeBase authentication failed because the response did not match this connection."
-        case .keychain: "HomeBase credentials could not be accessed securely. Unlock this device and try again."
+        case .keychain(let status, let operation):
+            "HomeBase credentials could not be accessed securely. " +
+            (status == errSecMissingEntitlement
+                ? "This build is missing a required Keychain entitlement. Check the app’s signing configuration."
+                : status == errSecInteractionNotAllowed
+                    ? "Unlock this device and try again."
+                    : "The Keychain operation failed.") +
+            " (\(operation?.rawValue ?? "Keychain"), OSStatus \(status))"
         case .keyUnavailable: "The HomeBase signing key is unavailable. Unlock this device and try again."
         }
     }
@@ -33,7 +49,8 @@ nonisolated struct HomeBaseClientIdentity: Equatable, Sendable {
 }
 
 /// All sensitive state, including a pending single-use invitation, is committed
-/// in one device-only Keychain item before enrollment sends its first request.
+/// in one Keychain item before enrollment sends its first request. macOS uses
+/// the default login Keychain; other platforms use device-only Data Protection.
 nonisolated struct HomeBaseIdentityRecord: Codable, Equatable, Sendable {
     enum KeyKind: String, Codable, Sendable { case secureEnclave, software }
     var version = 1
@@ -59,12 +76,29 @@ nonisolated protocol HomeBaseIdentityPersisting: Sendable {
 
 nonisolated struct HomeBaseKeychainIdentityPersistence: HomeBaseIdentityPersisting {
     let service = "io.pjb.HomeBase-GUI.user-identity.v1"
+    private static let logger = Logger(subsystem: "io.pjb.HomeBase-GUI", category: "Authentication")
+
+    private func failure(_ status: OSStatus, operation: HomeBaseKeychainOperation) -> HomeBaseAuthenticationError {
+        // Log only fixed operation names and Security's status text, never the
+        // query, account, record, invitation, or underlying credential data.
+        let message = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown Security error"
+        Self.logger.error("\(operation.rawValue, privacy: .public) failed: OSStatus \(status, privacy: .public) (\(message, privacy: .public))")
+        return .keychain(status, operation: operation)
+    }
     private func query(_ serverID: UUID) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword,
+        let attributes: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: service,
-         kSecAttrAccount as String: serverID.uuidString.lowercased(),
-         kSecAttrSynchronizable as String: false,
-         kSecUseDataProtectionKeychain as String: true]
+         kSecAttrAccount as String: serverID.uuidString.lowercased()]
+#if os(macOS)
+        // SecItem defaults to the file-based Keychain on native macOS. Use its
+        // normal app ACL rather than Data Protection access-group entitlements.
+        return attributes
+#else
+        return attributes.merging([
+            kSecAttrSynchronizable as String: false,
+            kSecUseDataProtectionKeychain as String: true
+        ]) { _, value in value }
+#endif
     }
     func load(serverID: UUID) throws -> Data? {
         var query = query(serverID)
@@ -73,22 +107,27 @@ nonisolated struct HomeBaseKeychainIdentityPersistence: HomeBaseIdentityPersisti
         var value: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &value)
         if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = value as? Data else { throw HomeBaseAuthenticationError.keychain(status) }
+        guard status == errSecSuccess else { throw failure(status, operation: .load) }
+        guard let data = value as? Data else { throw HomeBaseAuthenticationError.invalidIdentity }
         return data
     }
     func save(_ data: Data, serverID: UUID) throws {
         let base = query(serverID)
+#if os(macOS)
+        let values: [String: Any] = [kSecValueData as String: data]
+#else
         let values: [String: Any] = [kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
+#endif
         let status = SecItemAdd(base.merging(values) { _, value in value } as CFDictionary, nil)
         if status == errSecDuplicateItem {
             let updated = SecItemUpdate(base as CFDictionary, values as CFDictionary)
-            guard updated == errSecSuccess else { throw HomeBaseAuthenticationError.keychain(updated) }
-        } else if status != errSecSuccess { throw HomeBaseAuthenticationError.keychain(status) }
+            guard updated == errSecSuccess else { throw failure(updated, operation: .update) }
+        } else if status != errSecSuccess { throw failure(status, operation: .add) }
     }
     func delete(serverID: UUID) throws {
         let status = SecItemDelete(query(serverID) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else { throw HomeBaseAuthenticationError.keychain(status) }
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw failure(status, operation: .delete) }
     }
 }
 

@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import HomeBaseProtocol
+import LocalAuthentication
 import Security
 import XCTest
 @testable import HomeBase_GUI
@@ -91,12 +92,125 @@ final class HomeBaseAuthenticationTests: XCTestCase {
               creationToken: HBBase64URL.encode(Data(repeating: 9, count: 32)))
     }
 
-    func testKeychainIdentityUsesAfterFirstUnlockDeviceOnlyAndAtomicUpdate() throws {
+    func testKeychainMissingIdentityLoadsAsNil() throws {
+        XCTAssertNil(try HomeBaseKeychainIdentityPersistence().load(serverID: UUID()))
+    }
+
+    func testKeychainErrorIdentifiesOperationAndDoesNotMisdiagnoseEntitlementsAsLocked() {
+        let missingEntitlement = HomeBaseAuthenticationError.keychain(errSecMissingEntitlement, operation: .load).localizedDescription
+        XCTAssertTrue(missingEntitlement.contains("SecItemCopyMatching"))
+        XCTAssertTrue(missingEntitlement.contains("-34018"))
+        XCTAssertFalse(missingEntitlement.contains("Unlock"))
+        let locked = HomeBaseAuthenticationError.keychain(errSecInteractionNotAllowed, operation: .update).localizedDescription
+        XCTAssertTrue(locked.contains("SecItemUpdate"))
+        XCTAssertTrue(locked.contains("Unlock"))
+    }
+
+    /// Explicit opt-in, using a private file rather than putting an invitation
+    /// in test arguments or logs. Retains the paired server and its identity so
+    /// the normal app can reconnect after the test host exits.
+    @MainActor
+    func testLiveServerPairingAndReconnect() async throws {
+        guard let path = ProcessInfo.processInfo.environment["HB_AUTH_PAIRING_FILE"] else {
+            throw XCTSkip("Set HB_AUTH_PAIRING_FILE to explicitly authorize live pairing")
+        }
+        let url = try String(contentsOfFile: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let invitation = HomeBasePairingCode.invitation(from: url) else {
+            throw HomeBaseAuthenticationError.invalidPairingURL
+        }
+        let servers = PairedServerStore()
+        // Separate, explicit opt-in for a user-authorized replacement invitation
+        // after a live test's invitation expired. Never replace the identity.
+        if ProcessInfo.processInfo.environment["HB_AUTH_REFRESH_PENDING_INVITATION"] == "1",
+           let existing = servers.servers.first(where: { $0.endpoint == invitation.endpoint }),
+           var pending = try await HomeBaseAuthenticationStore.shared.record(serverID: existing.id),
+           pending.userID == nil, pending.controllerID == nil,
+           pending.pendingEndpoint == invitation.endpoint {
+            let original = pending
+            pending.creationToken = invitation.creationToken
+            try HomeBaseKeychainIdentityPersistence().save(JSONEncoder().encode(pending), serverID: existing.id)
+            var verified = try await HomeBaseAuthenticationStore.shared.record(serverID: existing.id)
+            verified?.creationToken = original.creationToken
+            XCTAssertTrue(verified == original, "Refreshing the invitation must preserve every other identity field")
+            print("Refreshed the pending invitation; retained the complete existing identity")
+        }
+        let server = try await servers.add(invitation)
+        let initial = try await HomeBaseAuthenticationStore.shared.record(serverID: server.id)
+        guard let initial else { throw HomeBaseAuthenticationError.missingIdentity }
+        print("Live authentication starting: pending = \(initial.userID == nil), Secure Enclave = \(initial.keyKind == .secureEnclave)")
+        if SecureEnclave.isAvailable {
+            XCTAssertTrue(initial.keyKind == .secureEnclave, "Hardware must use the Secure Enclave")
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            let key = try SecureEnclave.P256.Signing.PrivateKey(
+                dataRepresentation: initial.privateKeyRepresentation, authenticationContext: context)
+            let message = Data("noninteractive signing probe".utf8)
+            let signature = try key.signature(for: message)
+            XCTAssertTrue(key.publicKey.isValidSignature(signature, for: message))
+        }
+        // Exercise authentication separately so a session/carrier error cannot
+        // hide a server enrollment rejection behind a cancellation error.
+        let authenticationTransport = HomeBaseWebSocketTransport(socket: try HomeBaseNetworkWebSocket(endpoint: server.endpoint))
+        do {
+            _ = try await withHomeBaseConnectionDeadline(seconds: 15, cancel: { authenticationTransport.close() }) {
+                let binding = try await authenticationTransport.channelBinding()
+                return try await HomeBaseClientAuthenticator.authenticate(serverID: server.id, binding: binding) { request in
+                    try await authenticationTransport.send(JSONEncoder().encode(request))
+                    return try JSONDecoder().decode(HBProtocolEnvelope.self, from: await authenticationTransport.receive())
+                }
+            }
+        } catch {
+            authenticationTransport.close()
+            throw error
+        }
+        authenticationTransport.close()
+        print("Live authentication exchange succeeded")
+        var previousIdentity: HomeBaseClientIdentity?
+        for _ in 0..<2 {
+            let client = HomeBaseWebSocketClient(endpoint: server.endpoint, clientID: server.id, bluetoothServerID: server.id)
+            do {
+                try await client.connect()
+                _ = try await client.listTopology()
+                // A fresh store reloads the persisted identity and signing key.
+                let reloaded = HomeBaseAuthenticationStore()
+                let identity = try await reloaded.identity(serverID: server.id)
+                XCTAssertTrue(identity.publicKey == initial.publicKey, "Pairing and reconnect must preserve the key")
+                if let previousIdentity {
+                    XCTAssertTrue(identity == previousIdentity, "Reconnect must preserve the enrolled identity")
+                }
+                previousIdentity = identity
+                let signature = try await reloaded.sign(serverID: server.id, transcript: Data("background signing probe".utf8))
+                XCTAssertEqual(signature.count, 64)
+                let persisted = try await reloaded.record(serverID: server.id)
+                XCTAssertTrue(persisted?.creationToken == nil, "The consumed invitation must be cleared")
+                XCTAssertTrue(persisted?.enrollmentID == initial.enrollmentID, "The enrollment ID must be retained")
+            } catch {
+                await client.disconnect()
+                throw error
+            }
+            await client.disconnect()
+        }
+        print("Live authentication passed: initially pending = \(initial.userID == nil), Secure Enclave = \(initial.keyKind == .secureEnclave); fresh-client reconnect, persisted key reuse, topology read, and noninteractive signing")
+    }
+
+    func testKeychainIdentityUsesPlatformStorageAndAtomicUpdate() throws {
         let id = UUID(), persistence = HomeBaseKeychainIdentityPersistence()
-        defer { try? persistence.delete(serverID: id) }
         try persistence.save(Data("pending".utf8), serverID: id)
+        defer { try? persistence.delete(serverID: id) }
         try persistence.save(Data("enrolled".utf8), serverID: id)
         XCTAssertEqual(try persistence.load(serverID: id), Data("enrolled".utf8))
+#if os(macOS)
+        // Look up this test-owned item through the file-based API to prove it
+        // lives in the default Keychain, without reading any credential bytes.
+        var keychain: SecKeychain?
+        XCTAssertEqual(SecKeychainCopyDefault(&keychain), errSecSuccess)
+        let account = id.uuidString.lowercased()
+        var item: SecKeychainItem?
+        XCTAssertEqual(SecKeychainFindGenericPassword(keychain,
+            UInt32(persistence.service.utf8.count), persistence.service,
+            UInt32(account.utf8.count), account, nil, nil, &item), errSecSuccess)
+        XCTAssertNotNil(item)
+#else
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: persistence.service,
             kSecAttrAccount as String: id.uuidString.lowercased(),
@@ -108,6 +222,7 @@ final class HomeBaseAuthenticationTests: XCTestCase {
         XCTAssertEqual(attributes[kSecAttrAccessible as String] as? String,
                        kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String)
         XCTAssertEqual(attributes[kSecAttrSynchronizable as String] as? Bool, false)
+#endif
     }
 
     func testPairingURLRequiresCanonicalFingerprintAndSingleUseToken() throws {
