@@ -25,6 +25,10 @@ struct ServerDetailView: View {
     @State private var isShowingCamera = false
     @State private var homeDetailSelection: TopologyDetailDestination?
 
+    private var cameraTabNeedsAccess: Bool {
+        selectedTab == .cameras && connection.route == .webSocket
+    }
+
     init(
         server: PairedServer,
         showServers: @escaping () -> Void
@@ -128,7 +132,9 @@ struct ServerDetailView: View {
                 .tag(Tab.triggers)
         }
         .cameraAccessScope(
-            isActive: selectedTab == .cameras,
+            // Bluetooth and pending routes cannot show video. Request access
+            // when the network returns if Cameras is still selected.
+            isActive: cameraTabNeedsAccess,
             isPresentingCamera: isShowingCamera
         )
         .onChange(of: cameras.isEmpty) { _, isEmpty in
@@ -143,8 +149,8 @@ struct ServerDetailView: View {
         .onChange(of: viewerIsMinimized) { _, minimized in
             if minimized && selectedTab == .cameras { selectedTab = .home }
         }
-        .onChange(of: selectedTab) { _, tab in
-            if tab == .cameras { cameraViewer?.restore() }
+        .onChange(of: cameraTabNeedsAccess) { _, needsAccess in
+            if needsAccess { cameraViewer?.restore() }
         }
 #endif
         .connectionStatusHost(connectionStatusController)
