@@ -428,41 +428,48 @@ private final class TriggerOverviewModel: ObservableObject {
         var ownedSubscriptionID: UUID?
 
         do {
-            if reactivating {
-                try await client.reactivate()
-            } else {
-                try await client.connect()
-            }
+            try await HomeBaseObservationRecovery.run(onSessionReset: {
+                if let ownedSubscriptionID { await stopSubscription(ownedSubscriptionID) }
+                ownedSubscriptionID = nil
+            }) {
+                guard runGeneration == generation else { throw CancellationError() }
+                state = .loading
+                if reactivating {
+                    try await client.reactivate()
+                } else {
+                    try await client.connect()
+                }
 
-            let subscription = try await client.subscribeToTriggers(
-                scope: .triggers,
-                detail: .conditions,
-                triggerNames: [triggerName]
-            )
-            ownedSubscriptionID = subscription.identifier
-            if Task.isCancelled || runGeneration != generation {
-                try? await client.cancelSubscription(subscription.identifier)
-                throw CancellationError()
-            }
-            guard let initial = subscription.triggers.first else {
-                throw TriggerConfigurationLoadingError(
-                    message: "HomeBase did not return the selected trigger."
+                let subscription = try await client.subscribeToTriggers(
+                    scope: .triggers,
+                    detail: .conditions,
+                    triggerNames: [triggerName]
                 )
-            }
-            subscriptionID = subscription.identifier
-            triggerState = initial
-            state = .live
-            beginLoadingConfiguration(generation: generation)
+                ownedSubscriptionID = subscription.identifier
+                if Task.isCancelled || runGeneration != generation {
+                    try? await client.cancelSubscription(subscription.identifier)
+                    throw CancellationError()
+                }
+                guard let initial = subscription.triggers.first else {
+                    throw TriggerConfigurationLoadingError(
+                        message: "HomeBase did not return the selected trigger."
+                    )
+                }
+                subscriptionID = subscription.identifier
+                triggerState = initial
+                state = .live
+                beginLoadingConfiguration(generation: generation)
 
-            for try await event in subscription.events {
-                try Task.checkCancellation()
-                apply(event)
-            }
+                for try await event in subscription.events {
+                    try Task.checkCancellation()
+                    apply(event)
+                }
 
-            if Task.isCancelled, runGeneration == generation {
-                state = .idle
-            } else if runGeneration == generation, state == .live {
-                state = .failed("The live subscription ended.")
+                if Task.isCancelled, runGeneration == generation {
+                    state = .idle
+                } else if runGeneration == generation, state == .live {
+                    state = .failed("The live subscription ended.")
+                }
             }
         } catch is CancellationError {
             if runGeneration == generation {

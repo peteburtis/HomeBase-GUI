@@ -12,6 +12,35 @@ nonisolated protocol HomeBaseControlSocket: AnyObject, Sendable {
 
 extension URLSessionWebSocketTask: HomeBaseControlSocket {}
 
+/// Old commands must fail when the server can no longer account for them.
+/// Read-only monitoring can catch this signal and obtain a fresh snapshot.
+nonisolated struct HomeBaseSessionResetError: LocalizedError {
+    var errorDescription: String? {
+        "The connection was interrupted. Check the current state before trying again."
+    }
+}
+
+@MainActor
+enum HomeBaseObservationRecovery {
+    /// Scope this to observations, never actions or configuration writes. A
+    /// failed fresh connection throws its actual error and ends the retry.
+    static func run(
+        onSessionReset: () async -> Void,
+        operation: () async throws -> Void
+    ) async throws {
+        while true {
+            try Task.checkCancellation()
+            do {
+                try await operation()
+                return
+            } catch is HomeBaseSessionResetError {
+                try Task.checkCancellation()
+                await onSessionReset()
+            }
+        }
+    }
+}
+
 /// Advisory notifications only: an available interface does not prove that a
 /// VPN route or HomeBase is reachable. Actual attempts and deadlines decide.
 nonisolated final class CameraNetworkPathMonitor: @unchecked Sendable {

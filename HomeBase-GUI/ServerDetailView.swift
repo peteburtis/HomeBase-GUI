@@ -419,16 +419,18 @@ final class ServerConnectionModel: ObservableObject {
         state = .connecting
 
         do {
-            if reactivating {
-                try await client.reactivate()
-            } else {
-                try await client.connect()
+            try await HomeBaseObservationRecovery.run(onSessionReset: {}) {
+                if reactivating {
+                    try await client.reactivate()
+                } else {
+                    try await client.connect()
+                }
+                let topology = try await client.listTopology()
+                try Task.checkCancellation()
+                self.topology = topology
+                hasLoadedTopology = true
+                state = .connected
             }
-            let topology = try await client.listTopology()
-            try Task.checkCancellation()
-            self.topology = topology
-            hasLoadedTopology = true
-            state = .connected
         } catch is CancellationError {
             state = previousState
         } catch {
@@ -443,8 +445,10 @@ final class ServerConnectionModel: ObservableObject {
         }
 
         do {
-            try await client.reactivate()
-            topology = try await client.listTopology()
+            try await HomeBaseObservationRecovery.run(onSessionReset: {}) {
+                try await client.reactivate()
+                topology = try await client.listTopology()
+            }
         } catch {
             state = .failed(error.localizedDescription)
         }

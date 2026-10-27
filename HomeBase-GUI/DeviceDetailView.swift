@@ -411,83 +411,88 @@ final class LiveDeviceControlsModel: ObservableObject {
         state = .loading
 
         do {
-            if reactivating {
-                try await client.reactivate()
-            } else {
-                try await client.connect()
-            }
-            let metadata = try await client.deviceDetailsWithMetadata(for: device)
-            let details = metadata.details
-            try Task.checkCancellation()
-            deviceMetadata = metadata.metadata
-            suggestedControlOrder = SuggestedControlDisplayOrder(
-                metadata: details.metadata
-            )
-            detailsByIdentifier = Dictionary(
-                uniqueKeysWithValues: details.controls.map {
-                    ($0.identifier.lowercased(), $0)
-                }
-            )
-
-            // A virtual group can describe controls even when none of its
-            // standard controls are currently readable. The stream API
-            // correctly rejects that selector because it expands to no
-            // controls; present it as an ordinary empty state instead of a
-            // monitoring failure. Compatibility controls remain available on
-            // the Advanced screen, whose subscription explicitly includes
-            // them.
-            guard Self.hasPotentiallyReadableStandardControl(
-                in: details.controls
-            ) else {
-                install([])
-                state = .live
-                // Even an empty control list still owns a metadata observer.
-                // Keep its lifetime scoped to this monitoring session.
-                for try await values in metadata.events {
-                    try Task.checkCancellation()
-                    deviceMetadata = values
-                }
-                if Task.isCancelled { state = .idle }
+            try await HomeBaseObservationRecovery.run(onSessionReset: {
                 await stopSubscription()
-                return
-            }
-
-            metadataTask = Task { [weak self] in
-                do {
-                    for try await values in metadata.events {
-                        guard !Task.isCancelled else { return }
-                        self?.deviceMetadata = values
-                    }
-                } catch {} // Control subscription owns connection-error presentation.
-            }
-
-            // Interactive controls present the engine's authoritative target.
-            // This makes writes through a derived peer (for example,
-            // BinarySwitch -> MultilevelSwitch) update every widget in the
-            // device immediately, without pretending that provider feedback
-            // has already arrived. The Advanced screen remains observed-state
-            // based for physical diagnostics.
-            let subscription = try await client.subscribe(
-                to: device,
-                projection: .model
-            )
-            if Task.isCancelled {
-                try? await client.cancelSubscription(
-                    subscription.identifier
-                )
-                throw CancellationError()
-            }
-            subscriptionID = subscription.identifier
-            install(subscription.controls)
-            state = .live
-
-            for try await event in subscription.events {
+            }) {
+                state = .loading
+                if reactivating {
+                    try await client.reactivate()
+                } else {
+                    try await client.connect()
+                }
+                let metadata = try await client.deviceDetailsWithMetadata(for: device)
+                let details = metadata.details
                 try Task.checkCancellation()
-                apply(event)
-            }
+                deviceMetadata = metadata.metadata
+                suggestedControlOrder = SuggestedControlDisplayOrder(
+                    metadata: details.metadata
+                )
+                detailsByIdentifier = Dictionary(
+                    uniqueKeysWithValues: details.controls.map {
+                        ($0.identifier.lowercased(), $0)
+                    }
+                )
 
-            if !Task.isCancelled, state == .live {
-                state = .failed("The live subscription ended.")
+                // A virtual group can describe controls even when none of its
+                // standard controls are currently readable. The stream API
+                // correctly rejects that selector because it expands to no
+                // controls; present it as an ordinary empty state instead of a
+                // monitoring failure. Compatibility controls remain available on
+                // the Advanced screen, whose subscription explicitly includes
+                // them.
+                guard Self.hasPotentiallyReadableStandardControl(
+                    in: details.controls
+                ) else {
+                    install([])
+                    state = .live
+                    // Even an empty control list still owns a metadata observer.
+                    // Keep its lifetime scoped to this monitoring session.
+                    for try await values in metadata.events {
+                        try Task.checkCancellation()
+                        deviceMetadata = values
+                    }
+                    if Task.isCancelled { state = .idle }
+                    await stopSubscription()
+                    return
+                }
+
+                metadataTask = Task { [weak self] in
+                    do {
+                        for try await values in metadata.events {
+                            guard !Task.isCancelled else { return }
+                            self?.deviceMetadata = values
+                        }
+                    } catch {} // Control subscription owns connection-error presentation.
+                }
+
+                // Interactive controls present the engine's authoritative target.
+                // This makes writes through a derived peer (for example,
+                // BinarySwitch -> MultilevelSwitch) update every widget in the
+                // device immediately, without pretending that provider feedback
+                // has already arrived. The Advanced screen remains observed-state
+                // based for physical diagnostics.
+                let subscription = try await client.subscribe(
+                    to: device,
+                    projection: .model
+                )
+                if Task.isCancelled {
+                    try? await client.cancelSubscription(
+                        subscription.identifier
+                    )
+                    throw CancellationError()
+                }
+                subscriptionID = subscription.identifier
+                install(subscription.controls)
+                state = .live
+
+                for try await event in subscription.events {
+                    try Task.checkCancellation()
+                    apply(event)
+                }
+
+                if !Task.isCancelled, state == .live {
+                    state = .failed("The live subscription ended.")
+                }
             }
         } catch is CancellationError {
             state = .idle

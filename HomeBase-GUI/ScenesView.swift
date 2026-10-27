@@ -463,35 +463,40 @@ private final class ServerScenesModel: ObservableObject {
         actionError = nil
 
         do {
-            if reactivating {
-                try await client.reactivate()
-            } else {
-                try await client.connect()
-            }
+            try await HomeBaseObservationRecovery.run(onSessionReset: {
+                await stopSubscription()
+            }) {
+                state = .loading
+                if reactivating {
+                    try await client.reactivate()
+                } else {
+                    try await client.connect()
+                }
 
-            let subscription = try await client.subscribeToScenes()
-            if Task.isCancelled {
-                try? await client.cancelSubscription(
-                    subscription.identifier
-                )
-                throw CancellationError()
-            }
-            subscriptionID = subscription.identifier
-            let sceneDefinitions = (try? await client.listScenes()) ?? []
-            try Task.checkCancellation()
-            installDefinitions(sceneDefinitions)
-            install(subscription.scenes)
-            state = .live
-
-            for try await event in subscription.events {
+                let subscription = try await client.subscribeToScenes()
+                if Task.isCancelled {
+                    try? await client.cancelSubscription(
+                        subscription.identifier
+                    )
+                    throw CancellationError()
+                }
+                subscriptionID = subscription.identifier
+                let sceneDefinitions = (try? await client.listScenes()) ?? []
                 try Task.checkCancellation()
-                apply(event)
-            }
+                installDefinitions(sceneDefinitions)
+                install(subscription.scenes)
+                state = .live
 
-            if Task.isCancelled {
-                state = .idle
-            } else if state == .live {
-                state = .failed("The live subscription ended.")
+                for try await event in subscription.events {
+                    try Task.checkCancellation()
+                    apply(event)
+                }
+
+                if Task.isCancelled {
+                    state = .idle
+                } else if state == .live {
+                    state = .failed("The live subscription ended.")
+                }
             }
         } catch is CancellationError {
             state = .idle

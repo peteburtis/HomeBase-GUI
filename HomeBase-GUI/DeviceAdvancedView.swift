@@ -888,46 +888,51 @@ private final class DeviceAdvancedModel: ObservableObject {
         state = .loading
 
         do {
-            if reactivating {
-                try await client.reactivate()
-            } else {
-                try await client.connect()
-            }
-            let details = try await client.deviceDetails(for: device)
-            try Task.checkCancellation()
-            deviceDetails = details
-            suggestedControlOrder = SuggestedControlDisplayOrder(
-                metadata: details.metadata
-            )
-
-            let controlSubscription = try await client.subscribe(
-                to: device,
-                includeCompatibility: true,
-                projection: .observed
-            )
-            if Task.isCancelled {
-                try? await client.cancelSubscription(
-                    controlSubscription.identifier
-                )
-                throw CancellationError()
-            }
-            controlSubscriptionID = controlSubscription.identifier
-            install(
-                details.controls,
-                streamedControls: controlSubscription.controls
-            )
-
-            await startStackMonitoringIfAvailable(in: details.controls)
-            try Task.checkCancellation()
-            state = .live
-
-            for try await event in controlSubscription.events {
+            try await HomeBaseObservationRecovery.run(onSessionReset: {
+                await stopSubscriptions()
+            }) {
+                state = .loading
+                if reactivating {
+                    try await client.reactivate()
+                } else {
+                    try await client.connect()
+                }
+                let details = try await client.deviceDetails(for: device)
                 try Task.checkCancellation()
-                applyControlEvent(event)
-            }
+                deviceDetails = details
+                suggestedControlOrder = SuggestedControlDisplayOrder(
+                    metadata: details.metadata
+                )
 
-            if !Task.isCancelled, state == .live {
-                state = .failed("The live control subscription ended.")
+                let controlSubscription = try await client.subscribe(
+                    to: device,
+                    includeCompatibility: true,
+                    projection: .observed
+                )
+                if Task.isCancelled {
+                    try? await client.cancelSubscription(
+                        controlSubscription.identifier
+                    )
+                    throw CancellationError()
+                }
+                controlSubscriptionID = controlSubscription.identifier
+                install(
+                    details.controls,
+                    streamedControls: controlSubscription.controls
+                )
+
+                await startStackMonitoringIfAvailable(in: details.controls)
+                try Task.checkCancellation()
+                state = .live
+
+                for try await event in controlSubscription.events {
+                    try Task.checkCancellation()
+                    applyControlEvent(event)
+                }
+
+                if !Task.isCancelled, state == .live {
+                    state = .failed("The live control subscription ended.")
+                }
             }
         } catch is CancellationError {
             state = .idle
