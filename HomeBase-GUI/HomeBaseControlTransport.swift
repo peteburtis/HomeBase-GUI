@@ -42,6 +42,9 @@ nonisolated enum HomeBaseControlRoute: String, Sendable, Equatable {
 /// HomeBaseWebSocketClient, independent of the physical connection.
 nonisolated protocol HomeBaseControlTransport: AnyObject, Sendable {
     var route: HomeBaseControlRoute { get }
+    var isUserAuthenticated: Bool { get }
+    func channelBinding() async throws -> HBChannelBinding
+    func markUserAuthenticated()
     func waitUntilReady() async throws
     func waitUntilClosed() async
     func send(_ data: Data) async throws
@@ -51,6 +54,9 @@ nonisolated protocol HomeBaseControlTransport: AnyObject, Sendable {
 }
 
 extension HomeBaseControlTransport {
+    nonisolated var isUserAuthenticated: Bool { false }
+    nonisolated func channelBinding() async throws -> HBChannelBinding { throw HomeBaseAuthenticationError.invalidResponse }
+    nonisolated func markUserAuthenticated() {}
     // In-memory transports are ready when constructed. Production adapters
     // override both methods with their carrier's actual lifecycle.
     nonisolated func waitUntilReady() async throws { try Task.checkCancellation() }
@@ -132,9 +138,20 @@ nonisolated final class HomeBaseWebSocketTransport: HomeBaseControlTransport, @u
     let route = HomeBaseControlRoute.webSocket
     private let socket: any HomeBaseControlSocket
     private let lifecycle = HomeBaseTransportLifecycle()
+    private let authenticationLock = NSLock()
+    private var authenticated = false
+    var isUserAuthenticated: Bool { authenticationLock.withLock { authenticated } }
+    func markUserAuthenticated() {
+        (socket as? HomeBaseNetworkWebSocket)?.authenticated()
+        authenticationLock.withLock { authenticated = true }
+    }
+    func channelBinding() async throws -> HBChannelBinding {
+        guard let socket = socket as? HomeBaseNetworkWebSocket else { throw HomeBaseAuthenticationError.invalidResponse }
+        return try await socket.channelBinding()
+    }
     init(socket: any HomeBaseControlSocket) {
         self.socket = socket
-        socket.maximumMessageSize = 16 * 1_024 * 1_024
+        socket.maximumMessageSize = socket is HomeBaseNetworkWebSocket ? 16 * 1_024 : 16 * 1_024 * 1_024
         socket.observeLifecycle(onOpen: { [lifecycle] in lifecycle.opened() },
                                 onClose: { [lifecycle] error in lifecycle.closed(error ?? HomeBaseControlTransportError.closed) })
         socket.resume()
@@ -183,6 +200,9 @@ nonisolated enum HomeBaseControlTransportError: LocalizedError {
 /// the client actor without installing another stream reader or radio timer.
 nonisolated final class HomeBaseBluetoothTransport: HomeBaseControlTransport, @unchecked Sendable {
     let route = HomeBaseControlRoute.bluetooth
+    // Central creates this adapter only after Noise confirmation and the
+    // shared user's signing proof have both succeeded on the physical stream.
+    let isUserAuthenticated = true
     let identifier = UUID()
     private let lock = NSLock()
     private var queue: [Data] = []

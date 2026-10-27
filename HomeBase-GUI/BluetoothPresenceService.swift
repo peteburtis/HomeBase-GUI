@@ -20,9 +20,8 @@ struct BluetoothPresenceRegistration: Codable, Equatable, Identifiable {
     var controllerID: UUID?
     var serverRemovalComplete = false
     var accessoryRemovalComplete = false
-    // Optional for compatibility with enrollments saved before automatic cleanup.
-    var cancelsPendingOfferOnly: Bool? = nil
-    // Optional fields preserve existing presence-only enrollments during upgrade.
+    var cancelsPendingOfferOnly = false
+    // Cached transport grant always belongs to the enrolled HomeBase user.
     var cncCredential: HBBluetoothCnCCredential? = nil
     var cncClientID: UUID? = nil
 
@@ -36,12 +35,14 @@ protocol BluetoothPresenceStoring {
 }
 
 /// Background reconnection must work after first unlock without prompting for
-/// biometrics. Tokens stay in this device's Keychain, never in defaults or logs.
+/// biometrics. Transport credentials stay in this device's Keychain, never in defaults or logs.
 final class BluetoothPresenceKeychainStore: BluetoothPresenceStoring {
     private let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "io.pjb.HomeBase-GUI.bluetooth-presence",
-        kSecAttrAccount as String: "registrations"
+        kSecAttrService as String: "io.pjb.HomeBase-GUI.bluetooth-presence.v2",
+        kSecAttrAccount as String: "registrations",
+        kSecAttrSynchronizable as String: false,
+        kSecUseDataProtectionKeychain as String: true
     ]
 
     func load() throws -> [BluetoothPresenceRegistration] {
@@ -59,7 +60,8 @@ final class BluetoothPresenceKeychainStore: BluetoothPresenceStoring {
 
     func save(_ registrations: [BluetoothPresenceRegistration]) throws {
         let data = try JSONEncoder().encode(registrations)
-        let attributes: [String: Any] = [kSecValueData as String: data]
+        let attributes: [String: Any] = [kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
         var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
             var addition = query
@@ -162,7 +164,7 @@ final class BluetoothPresenceService: ObservableObject {
         guard !loaded else { return }
         do {
             let saved = try store.load()
-            // Without a persisted peripheral, no enrollment token could have
+            // Without a persisted peripheral, no Bluetooth user proof could have
             // been transmitted. A previous discovery attempt has nothing to resume.
             let restored = saved.map { item in
                 item.phase == .pending && item.peripheralID == nil ? cancelledDiscovery(item) : item
@@ -228,7 +230,7 @@ final class BluetoothPresenceService: ObservableObject {
     }
 
     func controlUpgradeFailed(serverID: UUID, error: Error) {
-        messages[serverID] = "Bluetooth presence remains available. Control upgrade will retry on the next network connection: \(error.localizedDescription)"
+        messages[serverID] = "Bluetooth credential refresh will retry on the next network connection: \(error.localizedDescription)"
     }
 
     func controlTransport(serverID: UUID, clientID: UUID) async throws -> any HomeBaseControlTransport {
@@ -308,6 +310,8 @@ final class BluetoothPresenceService: ObservableObject {
             }) else { throw BluetoothPresenceError.removalPending }
             item.offer = offer
             item.controllerID = offer.controllerID
+            item.cncCredential = offer.credential
+            item.cncClientID = offer.clientID
             try replace(item)
             transport?.synchronize(registrations.filter { !locallyDisabled.contains($0.serverID) })
             messages[serverID] = "Choose your HomeBase controller."
@@ -315,7 +319,7 @@ final class BluetoothPresenceService: ObservableObject {
             try transport?.showPicker(for: item)
         } catch {
             // Once a peripheral was selected, a lost reply may conceal a
-            // redeemed token. Only unselected discovery can be discarded.
+            // accepted user proof. Only unselected discovery can be discarded.
             let message = error.localizedDescription
             commandClients.removeValue(forKey: serverID)
             if cancelUnselectedPairing(serverID: serverID) {
@@ -479,7 +483,7 @@ final class BluetoothPresenceService: ObservableObject {
             commandClients.removeValue(forKey: serverID)
             item.peripheralID = peripheralID
             do {
-                try replace(item) // Persist before transmitting the enrollment token.
+                try replace(item) // Persist before proving this user over the encrypted Bluetooth channel.
                 transport?.synchronize(registrations.filter { !locallyDisabled.contains($0.serverID) })
             } catch { errorMessage = BluetoothPresenceError.persistence.localizedDescription }
         case .opened(let serverID):

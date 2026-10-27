@@ -281,7 +281,7 @@ final class CameraViewerPresentationTests: XCTestCase {
     }
 
     private func fixture() throws -> (HomeBaseWebSocketClient, CameraVideoDevice) {
-        let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
+        let endpoint = try XCTUnwrap(HomeBaseEndpoint(host: "127.0.0.1", port: 1))
         return (HomeBaseWebSocketClient(endpoint: endpoint),
                 try XCTUnwrap(CameraVideoCatalog.cameras(in: [], includesArtificial: true).first))
     }

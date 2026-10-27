@@ -8,51 +8,39 @@ import SwiftUI
 struct ManualServerEntryView: View {
     @Environment(\.dismiss) private var dismiss
 
-    let onEndpoint: (HomeBaseEndpoint) -> Void
+    let onEndpoint: (HomeBasePairingInvitation) -> Void
 
-    @State private var host = ""
-    @State private var port = String(HomeBaseEndpoint.defaultPort)
+    @State private var pairingURL = ""
     @FocusState private var focusedField: Field?
 
     private enum Field: Hashable {
-        case host
-        case port
+        case pairingURL
     }
 
-    private var endpoint: HomeBaseEndpoint? {
-        guard let port = Int(port) else { return nil }
-        return HomeBaseEndpoint(host: host, port: port)
-    }
+    private var endpoint: HomeBasePairingInvitation? { HomeBasePairingCode.invitation(from: pairingURL) }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("IP Address or Hostname", text: $host)
-                        .focused($focusedField, equals: .host)
-                        .submitLabel(.next)
-                        .onSubmit {
-                            focusedField = .port
-                        }
+                    TextField("Pairing URL", text: $pairingURL)
+                        .focused($focusedField, equals: .pairingURL)
+                        .autocorrectionDisabled()
+                        .privacySensitive()
+                        .submitLabel(.done)
+                        .onSubmit(addServer)
 #if os(iOS)
                         .textInputAutocapitalization(.never)
                         .keyboardType(.URL)
 #endif
 
-                    TextField("Port", text: $port)
-                        .focused($focusedField, equals: .port)
-                        .submitLabel(.done)
-                        .onSubmit(addServer)
-#if os(iOS)
-                        .keyboardType(.numberPad)
-#endif
                 } header: {
                     Text("HomeBase Server")
                 } footer: {
-                    Text("Enter the server's LAN address. The default HomeBase WebSocket port is \(HomeBaseEndpoint.defaultPort).")
+                    Text("Paste the complete pairing URL printed below the HomeBase QR code.")
                 }
             }
-            .navigationTitle("Enter Server Address")
+            .navigationTitle("Enter Pairing URL")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel", role: .cancel) {
@@ -67,7 +55,7 @@ struct ManualServerEntryView: View {
             }
         }
         .onAppear {
-            focusedField = .host
+            focusedField = .pairingURL
         }
     }
 

@@ -1134,7 +1134,9 @@ live buffer between two cameras and switches back through playing NVR history.
 
 `CameraLivePlaybackSmokeTests` is skipped by default. To explicitly consume live
 video, set the test process's `HB_LIVE_PLAYBACK_SMOKE_URL` to the server's pairing
-URL, e.g. `homebasews://127.0.0.1:10503`. With `xcodebuild`, use the
+URL, including its `#fp=…&token=…` fragment. Use a dedicated invitation: the
+first run creates one test user and saves its device-only signing key in the
+test host Keychain; later cases and runs reuse that identity. With `xcodebuild`, use the
 `TEST_RUNNER_HB_LIVE_PLAYBACK_SMOKE_URL` environment variable. It checks every
 advertised H.264 camera through the real GUI connection/model/renderer, closes
 its own leases, and does not alter camera settings or save any video.

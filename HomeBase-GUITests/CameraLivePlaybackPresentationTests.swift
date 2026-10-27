@@ -53,7 +53,7 @@ final class CameraLivePlaybackPresentationTests: XCTestCase {
     }
 
     func testFullScreenFocusZoomsAndRestoresMountedPanesWithoutRestartingResources() async throws {
-        let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
+        let endpoint = try XCTUnwrap(HomeBaseEndpoint(host: "127.0.0.1", port: 1))
         let client = HomeBaseWebSocketClient(endpoint: endpoint)
         let cameras = CameraVideoCatalog.cameras(in: [], includesArtificial: true)
         let initial = CameraGroupSession(camera: cameras[0], client: client)

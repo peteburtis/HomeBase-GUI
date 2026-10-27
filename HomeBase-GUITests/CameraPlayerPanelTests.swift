@@ -77,7 +77,7 @@ final class CameraPlayerPanelTests: XCTestCase {
 
 #if os(iOS)
     func testMountedCapsuleMorphsAndOpeningSlidersDoesNotWriteCameraControls() async throws {
-        let client = HomeBaseWebSocketClient(endpoint: try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1")))
+        let client = HomeBaseWebSocketClient(endpoint: try XCTUnwrap(HomeBaseEndpoint(host: "127.0.0.1", port: 1)))
         let model = LiveDeviceControlsModel(device: nil, client: client)
         var writes = 0
         model.installWriteRouting(value: { _, _, _ in writes += 1 }, canonical: { _, _ in writes += 1 })

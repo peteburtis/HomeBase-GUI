@@ -2,7 +2,8 @@
 
 From a connected server's Settings, choose **Bluetooth Presence → Pair This
 iPhone** and select its HomeBase accessory. The existing WebSocket CnC session
-issues an opaque enrollment credential; there is no second account or PIN.
+provisions a random Noise transport credential owned by the user already enrolled
+through the QR/pairing URL. Bluetooth uses that same user signing key.
 After enrollment, Bluetooth presence operates independently of the selected
 server, Settings screen, Wi-Fi, and VPN. The foreground app can also use an
 encrypted Bluetooth control channel when its preferred network connection is
@@ -10,12 +11,13 @@ unavailable. Video and recordings still require a network connection.
 
 The iPhone is the BLE central. The Mac advertises the shared HomeBase service,
 a readable controller identity, and a recovery-notification characteristic.
-AccessorySetupKit authorizes access to the accessory. Before sending a token,
-the phone checks the GATT identity against the controller ID obtained over CnC.
-It then subscribes to recovery, opens the current L2CAP PSM, and sends one
-`bluetooth.presence.open` request using the existing HomeBase envelope and a
-bounded four-byte-length frame. The acknowledgement must match the request,
-controller, and phone registration. Future capabilities can reuse this framing.
+AccessorySetupKit authorizes access to the accessory. The phone checks the GATT
+identity against the controller ID obtained through authenticated pinned TLS.
+It subscribes to recovery and opens the current L2CAP PSM. The first framed
+`bluetooth.cnc.open` exchange establishes Noise encryption, followed by encrypted
+key confirmation and shared `auth.begin` / `auth.prove` messages. The signature
+binds the enrolled user to the locally computed final Noise handshake hash.
+Only a successful proof marks presence. No reusable plaintext bearer is sent.
 
 After the presence handshake the channel remains idle unless the foreground
 app needs Bluetooth controls. There are no application presence heartbeats or
@@ -25,15 +27,17 @@ radio interference, and actual departure can all make a phone unreachable;
 the Boolean means reachable nearby, not proof that a person left the building.
 
 `BluetoothPresenceService` owns enrollment independently of views. Intent,
-token, controller ID, and selected peripheral are saved transactionally in the
-device-only Keychain before the token is sent. After a peripheral is selected,
+Noise credential, user ID, client ID, controller ID, and selected peripheral are
+saved transactionally in device-only Keychain before the handshake starts. The
+existing user signing key is usable after first unlock without biometric prompts.
+Unavailable keys fail closed and retry. After a peripheral is selected,
 pending enrollment survives a lost acknowledgement or process exit. Dismissing,
 timing out, or failing discovery before selection cancels that attempt and
 returns Settings to **Pair This iPhone**. An unselected attempt found at launch
 is canceled too. Its offer is invalidated immediately over connected CnC; if
 that connection is unavailable, a hidden durable cleanup record retries on
 reconnection after verifying the controller identity. A new attempt waits for
-that cleanup rather than reusing the canceled token. CoreBluetooth restoration is initialized
+that cleanup rather than reusing the canceled credential. CoreBluetooth restoration is initialized
 by the existing application delegate at launch. A freshly retrieved peripheral
 always establishes this app's local connection, even when iOS already shows the
 accessory as connected. A genuinely restored connection retains its ownership,
@@ -51,7 +55,7 @@ Retry and setup deadlines use `ContinuousClock`, which advances across device
 sleep. Once a connection request is submitted, CoreBluetooth owns the indefinite
 out-of-range wait. A short successful session does not reset the backoff; a
 connection that lasted at least a minute does. Identity and authentication
-rejection remain terminal until an explicit Reconnect, with no token sent to an
+rejection remain terminal until an explicit Reconnect, without starting Noise with an
 unexpected controller.
 
 The enrollment service observes application lifecycle once, independently of
@@ -90,20 +94,20 @@ the GUI does not start a Bluetooth manager there.
 
 ## Encrypted control fallback
 
-An existing paired phone automatically obtains an independent random 32-byte
-control credential through `bluetooth-control cnc enroll` on its working
-WebSocket session. New presence enrollment triggers the same upgrade when it
-finishes. The credential, key ID, controller ID, registration ID, and persistent
-client ID remain in the device-only Keychain. The WebSocket credential response
-is acknowledged before that logical session can resume over Bluetooth. Viewing
-Settings does not enroll a new phone or change remote configuration.
+Bluetooth provisioning requires an authenticated WebSocket session and binds
+that logical session to the registration. The offer includes the same Noise
+credential for presence and controls; `bluetooth-control cnc enroll` may reread
+that credential only for its owning user and client. The response is acknowledged
+before the logical session resumes over Bluetooth. Viewing Settings does not
+enroll a new phone or change remote configuration.
 
-The phone proves the new credential with
-`Noise_NNpsk0_25519_ChaChaPoly_SHA256`, bound to the controller, registration, and
-key IDs. The client confirmation is the first encrypted record. Only then can
-ordinary HomeBase envelopes use the channel. The presence bearer cannot open
-this control channel. A restored background presence link never creates control
-demand on its own.
+The phone establishes `Noise_NNpsk0_25519_ChaChaPoly_SHA256`, bound to the
+controller, registration, and key IDs. Encrypted confirmation precedes the user
+proof. A copied Noise secret cannot establish presence or open a control session
+without the device signing key. A restored background link performs these proofs
+but never creates control demand on its own. User revocation invalidates the
+registration and all active/resumable channels. Identifier is descriptive user
+metadata (`userDescription`); it is never used as the user UUID or credential.
 
 The carrier coordinator prepares WebSocket and Bluetooth independently while
 the app is in the foreground. WebSocket readiness means its upgrade has
@@ -190,7 +194,7 @@ offline deletion, unchanged renames, controller identity rejection, and
 acknowledgement matching. Control tests cover concurrent carrier setup,
 standby reuse without extra sessions, preferred-route selection,
 same-session recovery, mutation receipt replay and absolute deadlines, ordered
-pending requests, stable failback, preserved subscriptions, credential upgrade,
+pending requests, stable failback, preserved subscriptions, user authentication,
 attachment generations, bounded mailboxes, and encrypted queue ordering.
 Foreground regressions cover repeated Bluetooth background/foreground cycles,
 delayed Bluetooth readiness while network readiness is silent, expired retained
@@ -216,18 +220,21 @@ Before relying on this for automations, test on a physical Mac and iPhone:
 6. Dismiss or time out discovery before selection; verify Settings returns to
    Pair This iPhone, including after relaunch with CnC offline. Interrupt setup
    after accessory selection and server acknowledgement; relaunch and resume,
-   ensuring no duplicate phone controls and preservation of the selected token.
+   ensuring no duplicate phone controls and preservation of the selected credential.
 7. Select a different nearby HomeBase controller during setup. Verify identity
-   mismatch is shown and no registration token is sent to that controller.
+   mismatch is shown and no Noise handshake is sent to that controller.
 8. With WebSocket available, leave and return while presence is disconnected,
    then foreground the app without force-quitting. Confirm presence recovers;
    repeat with only Bluetooth available and with several setup failures. Check
    that retries continue after the old attempt limit and capture both devices'
    `BluetoothPresence` logs if recovery stalls.
 
-Presence retains its prototype bearer-token enrollment rooted in the existing
-CnC connection. The separate control upgrade never accepts that bearer
-as authority for ordinary CnC commands.
+Both applications require a fresh install and user enrollment for this protocol.
+Old pairing records and plaintext presence requests are unsupported. Physical
+acceptance must include reconnect while locked after first unlock, reboot before
+first unlock, app suspension, transport handover, and user revocation while idle.
+Historical observations below describe earlier builds and do not establish that
+these authentication behaviors have passed device testing.
 
 ## Physical-device observations (2026-10-25)
 

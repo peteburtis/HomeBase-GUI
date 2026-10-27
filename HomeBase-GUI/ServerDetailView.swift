@@ -379,8 +379,8 @@ final class ServerConnectionModel: ObservableObject {
         self.init(client: HomeBaseWebSocketClient(endpoint: server.endpoint, clientID: server.id, bluetoothServerID: server.id))
     }
 
-    convenience init(endpoint: HomeBaseEndpoint) {
-        self.init(client: HomeBaseWebSocketClient(endpoint: endpoint))
+    convenience init(endpoint: HomeBaseEndpoint, serverID: UUID) {
+        self.init(client: HomeBaseWebSocketClient(endpoint: endpoint, clientID: serverID, bluetoothServerID: serverID))
     }
 
     init(client: HomeBaseWebSocketClient) {

@@ -64,6 +64,9 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         var cncHandshake: HBBluetoothCnCClientHandshake?
         var cncHandshakeRequestID: UUID?
         var cncTimeout: Task<Void, Never>?
+        var authenticationTask: Task<Void, Never>?
+        var authenticationRequestID: UUID?
+        var authenticationReply: CheckedContinuation<HBProtocolEnvelope, Error>?
         var cncClientID: UUID?
         var secureChannel: HBBluetoothCnCChannel?
         var controlTransport: HomeBaseBluetoothTransport?
@@ -117,28 +120,73 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
 
     private func beginControlIfRequested(_ link: Link) {
         guard let waiter = controlWaiters[link.registration.serverID], link.authenticated,
-              link.cncHandshake == nil else { return }
-        do {
-            guard let credential = link.registration.cncCredential, link.registration.cncClientID == waiter.clientID else {
-                throw HomeBaseControlTransportError.unavailable
+              link.secureChannel != nil else { return }
+        guard link.cncClientID == waiter.clientID else {
+            cancelControlWaiter(serverID: link.registration.serverID, id: waiter.id,
+                error: HomeBaseControlTransportError.invalidMessage)
+            return
+        }
+        fulfillControlWaiter(link)
+    }
+
+    private func beginUserAuthentication(_ link: Link) throws {
+        guard let channel = link.secureChannel, let offer = link.registration.offer,
+              link.authenticationTask == nil else { throw BluetoothPresenceError.invalidReply }
+        let binding = try HBChannelBinding(type: "noise-handshake-hash", value: channel.channelBinding)
+        let peripheralID = link.peripheral.identifier
+        let generation = link.carrierGeneration
+        let serverID = link.registration.serverID
+        link.authenticationTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let identity = try await HomeBaseAuthenticationStore.shared.identity(serverID: serverID)
+                guard identity.userID == offer.userID, identity.clientID == offer.clientID,
+                      identity.controllerID == offer.controllerID else { throw HomeBaseAuthenticationError.invalidIdentity }
+                let result = try await HomeBaseClientAuthenticator.authenticate(serverID: serverID, binding: binding) { [weak self] request in
+                    guard let self else { throw HomeBaseControlTransportError.closed }
+                    return try await self.exchangeAuthentication(request, peripheralID: peripheralID, generation: generation)
+                }
+                guard !Task.isCancelled, let link = self.contexts[peripheralID],
+                      link.carrierGeneration == generation, result.userID == offer.userID else { return }
+                try channel.setResourcePolicy(.init())
+                link.authenticationTask = nil
+                link.authenticated = true
+                link.retryPolicy.connected(now: self.recoveryTime)
+                self.cancelReconnect(link)
+                link.timeout?.cancel(); link.timeout = nil
+                link.setupDeadline = nil
+                self.endSetupActivity(link)
+                self.log("presence user authenticated", link: link)
+                self.onEvent?(.opened(serverID: serverID))
+                self.beginControlIfRequested(link)
+            } catch {
+                guard !Task.isCancelled, let link = self.contexts[peripheralID],
+                      link.carrierGeneration == generation else { return }
+                link.authenticationTask = nil
+                let retry: Bool
+                if case HomeBaseAuthenticationError.keychain = error { retry = true }
+                else if case HomeBaseAuthenticationError.keyUnavailable = error { retry = true }
+                else { retry = false }
+                self.failed(link, message: error.localizedDescription, retry: retry, reason: "user authentication")
             }
-            if link.secureChannel != nil {
-                guard link.cncClientID == waiter.clientID else { throw HomeBaseControlTransportError.invalidMessage }
-                fulfillControlWaiter(link)
-                return
+        }
+    }
+
+    private func exchangeAuthentication(_ request: HBProtocolEnvelope, peripheralID: UUID,
+                                        generation: UUID) async throws -> HBProtocolEnvelope {
+        guard let link = contexts[peripheralID], link.carrierGeneration == generation,
+              link.authenticationReply == nil, !link.authenticated else {
+            throw HomeBaseControlTransportError.closed
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            link.authenticationRequestID = request.requestID
+            link.authenticationReply = continuation
+            do { try queueControlMessage(JSONEncoder().encode(request), link: link) }
+            catch {
+                link.authenticationReply = nil; link.authenticationRequestID = nil
+                continuation.resume(throwing: error)
             }
-            let handshake = try HBBluetoothCnCClientHandshake(credential: credential)
-            let request = try HBProtocolEnvelope.request(operation: HBBluetoothCnCProtocol.openOperation,
-                clientID: waiter.clientID, payload: handshake.request)
-            link.cncHandshake = handshake; link.cncHandshakeRequestID = request.requestID; link.cncClientID = waiter.clientID
-            link.output.append(try HBBluetoothFrameCodec.frame(payload: JSONEncoder().encode(request)))
-            link.cncTimeout = Task { [weak self, weak link] in
-                do { try await Task.sleep(for: .seconds(15)) } catch { return }
-                guard let self, let link, link.cncHandshake != nil else { return }
-                self.failed(link, message: "Bluetooth control negotiation timed out.", retry: true)
-            }
-            drain(link)
-        } catch { cancelControlWaiter(serverID: link.registration.serverID, id: waiter.id, error: error) }
+        }
     }
 
     private func fulfillControlWaiter(_ link: Link) {
@@ -219,7 +267,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
             link.secureChannel = channel; link.outgoing = BluetoothCnCOutboundQueue(channel: channel); link.cncHandshake = nil; link.cncHandshakeRequestID = nil
             link.cncTimeout?.cancel(); link.cncTimeout = nil
             link.output.append(try HBBluetoothFrameCodec.frame(payload: channel.makeConfirmation()))
-            fulfillControlWaiter(link)
+            try beginUserAuthentication(link)
             drain(link)
             return
         }
@@ -228,6 +276,14 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
             let envelope = try JSONDecoder().decode(HBProtocolEnvelope.self, from: data)
             try envelope.validate()
             guard envelope.clientID == link.cncClientID else { throw HomeBaseControlTransportError.invalidMessage }
+            if !link.authenticated {
+                guard let reply = link.authenticationReply,
+                      envelope.requestID == link.authenticationRequestID,
+                      envelope.messageKind == .response else { throw BluetoothPresenceError.invalidReply }
+                link.authenticationReply = nil; link.authenticationRequestID = nil
+                reply.resume(returning: envelope)
+                return
+            }
             switch link.attachment.receive(envelope) {
             case .discard: break
             case .detached:
@@ -290,7 +346,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         }
         pickerRegistration = registration
         activateAccessorySession()
-        // A saved selection can resume after the server redeemed the token but
+        // A saved selection can resume after the server authenticated the user but
         // the phone died before recording its acknowledgement.
         if registration.peripheralID != nil {
             pickerRegistration = nil
@@ -705,7 +761,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
             log("opening L2CAP", link: link)
             peripheral.openL2CAPChannel(identity.psm)
         } catch {
-            // Identity mismatch is terminal for this selection. No token leaves
+            // Identity mismatch is terminal for this selection. No credential leaves
             // the phone before this verification succeeds.
             failed(link, message: error.localizedDescription, retry: false, reason: "identity validation")
         }
@@ -724,6 +780,9 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
         }
         do {
             link.output = try handshake.framedRequest()
+            link.cncHandshake = handshake.noise
+            link.cncHandshakeRequestID = handshake.request.requestID
+            link.cncClientID = handshake.offer.clientID
             link.channel = channel
             for stream in [channel.inputStream as Stream, channel.outputStream as Stream] {
                 stream.delegate = self
@@ -781,18 +840,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
             }
             do {
                 for payload in try link.decoder.append(Data(bytes.prefix(count))) {
-                    if link.authenticated { try receiveControl(payload, link: link); continue }
-                    guard let handshake = link.handshake else { throw BluetoothPresenceError.invalidReply }
-                    try handshake.accept(payload)
-                    link.authenticated = true
-                    link.retryPolicy.connected(now: recoveryTime)
-                    cancelReconnect(link)
-                    link.timeout?.cancel(); link.timeout = nil
-                    link.setupDeadline = nil
-                    endSetupActivity(link)
-                    log("presence authenticated", link: link)
-                    onEvent?(.opened(serverID: link.registration.serverID))
-                    beginControlIfRequested(link)
+                    try receiveControl(payload, link: link)
                 }
             } catch {
                 log("protocol or authentication rejected", link: link, error: error)
@@ -863,6 +911,10 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
             cancelControlWaiter(serverID: link.registration.serverID, id: waiter.id, error: HomeBaseControlTransportError.closed)
         }
         link.cncTimeout?.cancel(); link.cncTimeout = nil
+        link.authenticationTask?.cancel(); link.authenticationTask = nil
+        let authenticationReply = link.authenticationReply
+        link.authenticationReply = nil; link.authenticationRequestID = nil
+        authenticationReply?.resume(throwing: HomeBaseControlTransportError.closed)
         link.controlTransport?.finish(); link.controlTransport = nil; link.controlGeneration = nil
         link.attachment.reset(); link.secureChannel = nil; link.cncHandshake = nil
         link.cncHandshakeRequestID = nil; link.cncClientID = nil; link.outgoing = nil
@@ -897,7 +949,7 @@ final class BluetoothPresenceCentral: NSObject, BluetoothPresenceTransporting,
     }
 
     private func log(_ event: String, link: Link, error: Error? = nil) {
-        // Correlation IDs and framework error codes only: never tokens, keys,
+        // Correlation IDs and framework error codes only: never credentials, keys,
         // peer-provided error text, or command/response contents.
         let error = error as NSError?
         Self.logger.notice("\(event, privacy: .public) registration=\(link.registration.registrationID.uuidString, privacy: .public) peripheral=\(link.peripheral.identifier.uuidString, privacy: .public) state=\(link.peripheral.state.rawValue) local=\(link.connection.isLocallyConnected) pending=\(link.connection.connectionPending) cancelling=\(link.cancellingConnection) discovering=\(link.discovering) opening=\(link.opening) authenticated=\(link.authenticated) blocked=\(link.automaticRetryBlocked) errorDomain=\(error?.domain ?? "none", privacy: .public) errorCode=\(error?.code ?? 0)")
@@ -984,16 +1036,20 @@ struct BluetoothPresenceHandshake {
     let request: HBProtocolEnvelope
     let offer: HBBluetoothPairingOffer
     let maximumMessageBytes: Int
+    let noise: HBBluetoothCnCClientHandshake
 
     init(identity: HBBluetoothControllerIdentity, offer: HBBluetoothPairingOffer) throws {
         try identity.validate(expectedControllerID: offer.controllerID)
-        try offer.validate() // Already redeemed tokens remain valid after offer expiry.
+        try offer.validate() // Expiry applies only until the server registers this user/device.
+        guard identity.capabilities.contains(HBBluetoothCnCProtocol.capability) else {
+            throw BluetoothPresenceError.invalidReply
+        }
         self.offer = offer
         maximumMessageBytes = identity.maximumMessageBytes
-        request = try HBProtocolEnvelope.request(operation: HBBluetoothProtocol.presenceOpenOperation,
-            clientID: offer.registrationID,
-            payload: HBBluetoothPresenceOpenRequest(controllerID: offer.controllerID,
-                registrationID: offer.registrationID, token: offer.token))
+        noise = try HBBluetoothCnCClientHandshake(credential: offer.credential,
+            resourcePolicy: .init(maximumMessageBytes: 8_192, maximumBufferedBytes: 8_192, maximumConcurrentMessages: 1))
+        request = try HBProtocolEnvelope.request(operation: HBBluetoothCnCProtocol.openOperation,
+            clientID: offer.clientID, payload: noise.request)
     }
 
     func framedRequest() throws -> Data {
@@ -1002,7 +1058,7 @@ struct BluetoothPresenceHandshake {
         return try HBBluetoothFrameCodec.frame(payload: data)
     }
 
-    func accept(_ payload: Data) throws {
+    func accept(_ payload: Data) throws -> HBBluetoothCnCChannel {
         guard payload.count <= maximumMessageBytes else { throw BluetoothPresenceError.invalidReply }
         let reply = try JSONDecoder().decode(HBProtocolEnvelope.self, from: payload)
         try reply.validate()
@@ -1013,7 +1069,6 @@ struct BluetoothPresenceHandshake {
         }
         let body = try reply.decodedPayload(as: HBProtocolResponse.self)
         try body.validate()
-        let result = try body.decodedResult(as: HBBluetoothPresenceOpenResult.self)
-        try result.validate(expectedControllerID: offer.controllerID, expectedRegistrationID: offer.registrationID)
+        return try noise.finish(body.decodedResult(as: HBBluetoothCnCOpenResult.self))
     }
 }

@@ -9,15 +9,15 @@ import AppKit
 @testable import HomeBase_GUI
 
 /// Explicit opt-in: consumes live camera video but never changes camera controls,
-/// recording intent, pairing, or server configuration, and never saves footage.
+/// recording intent or server configuration, and never saves footage. A dedicated
+/// pairing invitation creates/reuses the test identity before access.
 @MainActor
 final class CameraLivePlaybackSmokeTests: XCTestCase {
     func testStreamArbiterQualityHandoffKeepsPlayingThroughRealServer() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_LIVE_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+        guard let url = ProcessInfo.processInfo.environment["HB_LIVE_PLAYBACK_SMOKE_URL"] else {
             throw XCTSkip("Explicit live camera smoke opt-in required")
         }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         try await client.connect()
         guard let camera = CameraVideoCatalog.cameras(in: try await client.listTopology().devices)
             .first(where: { $0.capability.qualities.contains(.low) && $0.capability.qualities.contains(.high) }) else {
@@ -67,11 +67,10 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
     }
 
     func testRealCameraFastPlaybackCatchesUpAtOneTimesWithoutGoingLive() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_LIVE_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+        guard let url = ProcessInfo.processInfo.environment["HB_LIVE_PLAYBACK_SMOKE_URL"] else {
             throw XCTSkip("Explicit live camera smoke opt-in required")
         }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         try await client.connect()
         guard let camera = CameraVideoCatalog.cameras(in: try await client.listTopology().devices).first else {
             await client.disconnect(); throw XCTSkip("A live camera is required")
@@ -108,11 +107,10 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
 
 #if os(macOS)
     func testMountedPreviewsReleaseStreamsWhileFullScreenPlayerStaysLive() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_LIVE_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+        guard let url = ProcessInfo.processInfo.environment["HB_LIVE_PLAYBACK_SMOKE_URL"] else {
             throw XCTSkip("Explicit camera smoke opt-in required")
         }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         try await client.connect()
         let cameras = Array(CameraVideoCatalog.cameras(in: try await client.listTopology().devices).prefix(2))
         guard let fullScreenCamera = cameras.first else {
@@ -197,11 +195,10 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
     }
 
     func testMountedPlaybackBackgroundsAndReconnectsWithoutResumingHistory() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"] else {
             throw XCTSkip("Explicit camera smoke opt-in required")
         }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         try await client.connect()
         let cameras = CameraVideoCatalog.cameras(in: try await client.listTopology().devices).filter {
             CameraPlaybackHistoryAvailability.isAvailable(in: $0.device.metadata)
@@ -279,11 +276,10 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
     }
 
     func testMountedCameraPaneKeepsLiveLeaseAcrossMultipleLayoutChanges() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"] else {
             throw XCTSkip("Explicit camera smoke opt-in required")
         }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         try await client.connect()
         let cameras = CameraVideoCatalog.cameras(in: try await client.listTopology().devices)
         guard cameras.count >= 2 else { await client.disconnect(); throw XCTSkip("Two cameras required") }
@@ -348,11 +344,10 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
 #endif
 
     func testMultipleCamerasLiveBufferedAndHistoryThroughRealServer() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"] else {
             throw XCTSkip("Explicit history smoke opt-in required")
         }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         let group = CameraGroupPlayback(client: client)
         var streams: [(CameraLiveVideoModel, Task<Void, Never>)] = []
         do {
@@ -421,11 +416,10 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
     }
 
     func testCameraSwitchPreservesLiveBufferTimeAndHistoryPauseThroughRealServer() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"] else {
             throw XCTSkip("Explicit history smoke opt-in required")
         }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         try await client.connect()
         do {
             let cameras = try await client.listTopology().devices.filter {
@@ -495,11 +489,10 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
     }
 
     func testCalendarJumpBeforeLiveFramesAndEmptyDateThroughRealWebSocket() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"] else {
             throw XCTSkip("Explicit history smoke opt-in required")
         }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         try await client.connect()
         do {
             let cameras = try await client.listTopology().devices.filter {
@@ -548,11 +541,10 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
     }
 
     func testNeighborsBeyondEndOfArchiveThroughRealWebSocket() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"] else {
             throw XCTSkip("Explicit history smoke opt-in required")
         }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         try await client.connect()
         let transport = await client.makeHistoryTransport()
         do {
@@ -581,9 +573,8 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
     }
 
     func testNVRRecentFramesDecodeFromRealWebSocket() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else { throw XCTSkip("Explicit history smoke opt-in required") }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"] else { throw XCTSkip("Explicit history smoke opt-in required") }
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         try await client.connect()
         do {
             let cameras = try await client.listTopology().devices.compactMap {
@@ -619,11 +610,10 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
     }
 
     func testNVRHistoryThroughDedicatedWebSocketAndLiveHandoff() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"] else {
             throw XCTSkip("Supply HB_HISTORY_PLAYBACK_SMOKE_URL to read NVR recordings explicitly.")
         }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         try await client.connect()
         do {
             let topology = try await client.listTopology()
@@ -677,11 +667,10 @@ final class CameraLivePlaybackSmokeTests: XCTestCase {
     }
 
     func testLiveCameraPauseSeekAndReturnToLive() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_LIVE_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+        guard let url = ProcessInfo.processInfo.environment["HB_LIVE_PLAYBACK_SMOKE_URL"] else {
             throw XCTSkip("Supply HB_LIVE_PLAYBACK_SMOKE_URL to access live cameras explicitly.")
         }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         do {
             try await client.connect()
             let topology = try await client.listTopology()

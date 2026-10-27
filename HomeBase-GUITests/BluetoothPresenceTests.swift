@@ -23,7 +23,7 @@ final class BluetoothPresenceTests: XCTestCase {
         await fixture.pair()
         XCTAssertEqual(fixture.store.saves.count, 2)
         XCTAssertNil(fixture.store.saves[0].first?.offer)
-        XCTAssertEqual(fixture.store.saves[1].first?.offer?.token, "fixture-token")
+        XCTAssertEqual(fixture.store.saves[1].first?.offer?.credential.secret, Data(repeating: 7, count: 32))
         XCTAssertEqual(fixture.transport.pickers.count, 1)
         let peripheral = UUID()
         fixture.transport.onEvent?(.selected(serverID: fixture.serverID, peripheralID: peripheral))
@@ -199,7 +199,7 @@ final class BluetoothPresenceTests: XCTestCase {
         fixture.transport.onEvent?(.cancelled(serverID: fixture.serverID, registrationID: identifier, message: "Late picker error"))
         await fixture.service.connected(serverID: fixture.serverID, client: fixture.commands)
         XCTAssertEqual(fixture.service.settingsRegistration(for: fixture.serverID)?.phase, .pending)
-        XCTAssertEqual(fixture.service.registration(for: fixture.serverID)?.offer?.token, "fixture-token")
+        XCTAssertEqual(fixture.service.registration(for: fixture.serverID)?.offer?.credential.secret, Data(repeating: 7, count: 32))
         XCTAssertTrue(fixture.commands.cancellations.isEmpty)
         XCTAssertNil(fixture.service.errorMessage)
     }
@@ -226,7 +226,7 @@ final class BluetoothPresenceTests: XCTestCase {
         let restoredTransport = Transport()
         let restored = BluetoothPresenceService(store: fixture.store, transport: restoredTransport)
         restored.start()
-        XCTAssertEqual(restoredTransport.synchronized.last?.first?.offer?.token, "fixture-token")
+        XCTAssertEqual(restoredTransport.synchronized.last?.first?.offer?.credential.secret, Data(repeating: 7, count: 32))
         await restored.pair(serverID: fixture.serverID, name: "My iPhone", client: fixture.commands)
         XCTAssertEqual(fixture.commands.begins, 1, "A lost Bluetooth acknowledgement must not rotate an already redeemed token")
     }
@@ -264,16 +264,17 @@ final class BluetoothPresenceTests: XCTestCase {
         fixture.store.items = [BluetoothPresenceRegistration(serverID: fixture.serverID,
             registrationID: identifier, name: "My iPhone", phase: .pending,
             offer: HBBluetoothPairingOffer(controllerID: fixture.commands.controllerID, registrationID: identifier,
-                token: "expired-token", controllerName: "HomeBase", expiresAt: Date().timeIntervalSince1970 - 1),
+                userID: fixture.commands.userID, clientID: fixture.commands.clientID,
+                credential: fixture.commands.credential(registrationID: identifier, byte: 3), controllerName: "HomeBase", expiresAt: Date().timeIntervalSince1970 - 1),
             peripheralID: peripheralID)]
         await fixture.pair()
         XCTAssertEqual(fixture.commands.begins, 1)
         XCTAssertEqual(fixture.service.registration(for: fixture.serverID)?.registrationID, identifier)
         XCTAssertEqual(fixture.service.registration(for: fixture.serverID)?.peripheralID, peripheralID)
-        XCTAssertEqual(fixture.service.registration(for: fixture.serverID)?.offer?.token, "fixture-token")
+        XCTAssertEqual(fixture.service.registration(for: fixture.serverID)?.offer?.credential.secret, Data(repeating: 7, count: 32))
     }
 
-    func testExpiredOfferWithLostAcknowledgementPreservesRedeemedToken() async {
+    func testExpiredOfferWithLostAcknowledgementPreservesProvisionedCredential() async {
         let fixture = Fixture()
         let identifier = UUID()
         fixture.commands.registered = [HBBluetoothRegisteredController(registrationID: identifier,
@@ -281,11 +282,12 @@ final class BluetoothPresenceTests: XCTestCase {
         fixture.store.items = [BluetoothPresenceRegistration(serverID: fixture.serverID,
             registrationID: identifier, name: "My iPhone", phase: .pending,
             offer: HBBluetoothPairingOffer(controllerID: fixture.commands.controllerID, registrationID: identifier,
-                token: "redeemed-token", controllerName: "HomeBase", expiresAt: Date().timeIntervalSince1970 - 1),
+                userID: fixture.commands.userID, clientID: fixture.commands.clientID,
+                credential: fixture.commands.credential(registrationID: identifier, byte: 9), controllerName: "HomeBase", expiresAt: Date().timeIntervalSince1970 - 1),
             peripheralID: UUID())]
         await fixture.pair()
         XCTAssertEqual(fixture.commands.begins, 0)
-        XCTAssertEqual(fixture.service.registration(for: fixture.serverID)?.offer?.token, "redeemed-token")
+        XCTAssertEqual(fixture.service.registration(for: fixture.serverID)?.offer?.credential.secret, Data(repeating: 9, count: 32))
     }
 
     func testLateSelectedAndOpenedEventsCannotResurrectRemovedRegistration() async {
@@ -316,17 +318,21 @@ final class BluetoothPresenceTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         var removed: [UUID] = []
-        let servers = PairedServerStore(defaults: defaults, didRemoveServer: { removed.append($0) })
-        let first = servers.add(try XCTUnwrap(HomeBaseEndpoint(host: "first.local", port: 10503)))
-        let second = servers.add(try XCTUnwrap(HomeBaseEndpoint(host: "second.local", port: 10503)))
+        let authentication = HomeBaseAuthenticationStore(persistence: BluetoothTestIdentityPersistence(), useSecureEnclave: false)
+        let servers = PairedServerStore(defaults: defaults, didRemoveServer: { removed.append($0) }, authenticationStore: authentication)
+        let first = try await servers.add(HomeBasePairingInvitation(endpoint: XCTUnwrap(HomeBaseEndpoint(host: "first.local", port: 10503,
+            serverFingerprint: Data(repeating: 1, count: 32))), creationToken: HBBase64URL.encode(Data(repeating: 2, count: 32))))
+        let second = try await servers.add(HomeBasePairingInvitation(endpoint: XCTUnwrap(HomeBaseEndpoint(host: "second.local", port: 10503,
+            serverFingerprint: Data(repeating: 3, count: 32))), creationToken: HBBase64URL.encode(Data(repeating: 4, count: 32))))
         servers.select(second)
         XCTAssertTrue(removed.isEmpty, "Navigation must not disable Bluetooth")
         servers.remove(at: IndexSet(integer: 0))
+        for _ in 0..<100 where removed.isEmpty { await Task.yield() }
         XCTAssertEqual(removed, [first.id])
         XCTAssertEqual(servers.selectedServerID, second.id)
     }
 
-    func testPersistenceFailureStopsTrackingWithoutSendingEnrollmentToken() async {
+    func testPersistenceFailureStopsTrackingBeforeBluetoothProvisioning() async {
         let fixture = Fixture()
         fixture.store.failSave = true
         await fixture.pair()
@@ -549,18 +555,20 @@ final class BluetoothPresenceTests: XCTestCase {
         let fixture = Fixture()
         let offer = fixture.commands.offer(registrationID: UUID())
         let handshake = try BluetoothPresenceHandshake(identity: HBBluetoothControllerIdentity(
-            controllerID: offer.controllerID, displayName: "HomeBase", psm: 128), offer: offer)
+            controllerID: offer.controllerID, displayName: "HomeBase", psm: 128,
+            capabilities: HBBluetoothProtocol.capabilities + [HBBluetoothCnCProtocol.capability]), offer: offer)
         let requestData = try handshake.framedRequest()
         var decoder = HBBluetoothFrameDecoder()
         XCTAssertTrue(try decoder.append(requestData.prefix(3)).isEmpty)
         let request = try JSONDecoder().decode(HBProtocolEnvelope.self,
             from: XCTUnwrap(try decoder.append(requestData.dropFirst(3)).first))
-        XCTAssertEqual(request.operation, HBBluetoothProtocol.presenceOpenOperation)
-        let payload = try request.decodedPayload(as: HBBluetoothPresenceOpenRequest.self)
-        XCTAssertEqual(payload.token, offer.token)
-        var reply = try HBProtocolEnvelope.response(to: request, body: .success(
-            HBBluetoothPresenceOpenResult(controllerID: offer.controllerID,
-                registrationID: offer.registrationID, departureGraceSeconds: 10)))
+        XCTAssertEqual(request.operation, HBBluetoothCnCProtocol.openOperation)
+        let payload = try request.decodedPayload(as: HBBluetoothCnCOpenRequest.self)
+        XCTAssertEqual(payload.registrationID, offer.registrationID)
+        XCTAssertEqual(payload.handshake.count, 48)
+        XCTAssertFalse(String(decoding: requestData, as: UTF8.self).contains(offer.credential.secret.base64EncodedString()))
+        let accepted = try HBBluetoothCnCServerHandshake.accept(payload, credential: offer.credential)
+        var reply = try HBProtocolEnvelope.response(to: request, body: .success(accepted.result))
         XCTAssertNoThrow(try handshake.accept(JSONEncoder().encode(reply)))
         reply.requestID = UUID()
         XCTAssertThrowsError(try handshake.accept(JSONEncoder().encode(reply)))
@@ -570,10 +578,11 @@ final class BluetoothPresenceTests: XCTestCase {
         let fixture = Fixture()
         let offer = fixture.commands.offer(registrationID: UUID())
         let handshake = try BluetoothPresenceHandshake(identity: HBBluetoothControllerIdentity(
-            controllerID: offer.controllerID, displayName: "HomeBase", psm: 128), offer: offer)
+            controllerID: offer.controllerID, displayName: "HomeBase", psm: 128,
+            capabilities: HBBluetoothProtocol.capabilities + [HBBluetoothCnCProtocol.capability]), offer: offer)
         let reply = try HBProtocolEnvelope.response(to: handshake.request, body: .success(
-            HBBluetoothPresenceOpenResult(controllerID: offer.controllerID,
-                registrationID: UUID(), departureGraceSeconds: 10)))
+            HBBluetoothCnCOpenResult(controllerID: offer.controllerID,
+                registrationID: UUID(), keyID: offer.credential.keyID, handshake: Data(repeating: 1, count: 48))))
         XCTAssertThrowsError(try handshake.accept(JSONEncoder().encode(reply)))
     }
 
@@ -616,6 +625,9 @@ final class BluetoothPresenceTests: XCTestCase {
     @MainActor
     private final class Commands: BluetoothPresenceCommanding {
         let controllerID: UUID
+        let userID = UUID()
+        let clientID = UUID()
+        let keyID = UUID()
         init(controllerID: UUID = UUID()) { self.controllerID = controllerID }
         var begins = 0
         var renames = 0
@@ -630,9 +642,13 @@ final class BluetoothPresenceTests: XCTestCase {
         var failCancellation = false
         var cancellations: [UUID] = []
         var registered: [HBBluetoothRegisteredController] = []
+        func credential(registrationID: UUID, byte: UInt8 = 7) -> HBBluetoothCnCCredential {
+            .init(controllerID: controllerID, registrationID: registrationID, keyID: keyID,
+                  secret: Data(repeating: byte, count: 32))
+        }
         func offer(registrationID: UUID) -> HBBluetoothPairingOffer {
             HBBluetoothPairingOffer(controllerID: controllerID, registrationID: registrationID,
-                token: "fixture-token", controllerName: "HomeBase", expiresAt: Date().timeIntervalSince1970 + 600)
+                userID: userID, clientID: clientID, credential: credential(registrationID: registrationID), controllerName: "HomeBase", expiresAt: Date().timeIntervalSince1970 + 600)
         }
         func bluetoothStatus() async throws -> HBBluetoothControlStatus {
             onStatus?()
@@ -662,4 +678,12 @@ final class BluetoothPresenceTests: XCTestCase {
             try onRename?()
         }
     }
+}
+
+nonisolated private final class BluetoothTestIdentityPersistence: HomeBaseIdentityPersisting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [UUID: Data] = [:]
+    func load(serverID: UUID) throws -> Data? { lock.withLock { values[serverID] } }
+    func save(_ data: Data, serverID: UUID) throws { lock.withLock { values[serverID] = data } }
+    func delete(serverID: UUID) throws { lock.withLock { _ = values.removeValue(forKey: serverID) } }
 }

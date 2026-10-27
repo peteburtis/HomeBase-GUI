@@ -204,7 +204,7 @@ final class CameraExternalDisplayTests: XCTestCase {
     }
 
     private func makeGroup(count: Int = 1) throws -> CameraGroupPlayback {
-        let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
+        let endpoint = try XCTUnwrap(HomeBaseEndpoint(host: "127.0.0.1", port: 1))
         let client = HomeBaseWebSocketClient(endpoint: endpoint)
         let cameras = CameraVideoCatalog.cameras(in: [], includesArtificial: true)
         let first = CameraGroupSession(camera: try XCTUnwrap(cameras.first), client: client)

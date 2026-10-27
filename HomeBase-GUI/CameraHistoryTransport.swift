@@ -42,19 +42,6 @@ nonisolated protocol CameraHistorySocket: Sendable {
     func close()
 }
 
-private nonisolated final class CameraHistoryURLSocket: CameraHistorySocket, @unchecked Sendable {
-    let task: URLSessionWebSocketTask
-    init(url: URL, session: URLSession) {
-        task = session.webSocketTask(with: url, protocols: ["homebase.v2"])
-        task.maximumMessageSize = 65_536
-        task.resume()
-    }
-    func send(_ message: URLSessionWebSocketTask.Message) async throws { try await task.send(message) }
-    func receive() async throws -> URLSessionWebSocketTask.Message { try await task.receive() }
-    func close() { task.cancel(with: .goingAway, reason: nil) }
-    deinit { close() }
-}
-
 /// Owns a fresh logical session on a separate physical WebSocket. Control-session
 /// resume tokens, acknowledgements and subscriptions never enter media mode.
 actor CameraHistoryTransport: CameraHistoryFetching {
@@ -79,6 +66,8 @@ actor CameraHistoryTransport: CameraHistoryFetching {
     private struct Alive: Decodable { let type: String; let requestID: String }
     private let makeSocket: @Sendable () throws -> any CameraHistorySocket
     private let clientID: UUID
+    private let authenticationServerID: UUID?
+    private let serverFingerprint: Data?
     private let requestTimeout: Double
     private var connection: Connection?
     private var opening: Task<Connection, Error>?
@@ -87,18 +76,22 @@ actor CameraHistoryTransport: CameraHistoryFetching {
     private var busy = false
     private var closed = false
 
-    init(endpoint: HomeBaseEndpoint, clientID: UUID, session: URLSession) {
+    init(endpoint: HomeBaseEndpoint, clientID: UUID, serverID: UUID?) {
         self.clientID = clientID
+        authenticationServerID = serverID
+        serverFingerprint = endpoint.serverFingerprint
         requestTimeout = 45
         makeSocket = {
-            guard let url = endpoint.webSocketURL else { throw CameraHistoryError.unavailable }
-            return CameraHistoryURLSocket(url: url, session: session)
+            guard serverID != nil else { throw HomeBaseAuthenticationError.missingIdentity }
+            return try HomeBaseNetworkWebSocket(endpoint: endpoint, maximumMessageSize: 65_536)
         }
     }
 
     init(clientID: UUID = UUID(), requestTimeout: Double = 45,
          makeSocket: @escaping @Sendable () throws -> any CameraHistorySocket) {
         self.clientID = clientID; self.requestTimeout = requestTimeout; self.makeSocket = makeSocket
+        authenticationServerID = nil
+        serverFingerprint = nil
     }
 
     func start() {
@@ -250,7 +243,7 @@ actor CameraHistoryTransport: CameraHistoryFetching {
         guard !closed else { throw CancellationError() }
         if let connection { return connection }
         if let opening { return try await opening.value }
-        let task = Task { [makeSocket, clientID] in
+        let task = Task { [makeSocket, clientID, authenticationServerID, serverFingerprint] in
             let socket = try makeSocket()
             let watchdog = Task {
                 do { try await Task.sleep(for: .seconds(10)); socket.close() } catch {}
@@ -258,6 +251,26 @@ actor CameraHistoryTransport: CameraHistoryFetching {
             defer { watchdog.cancel() }
             do {
                 return try await withTaskCancellationHandler {
+                    if let authenticationServerID {
+                        guard let record = try await HomeBaseAuthenticationStore.shared.record(serverID: authenticationServerID),
+                              record.serverFingerprint == serverFingerprint else {
+                            throw HomeBaseAuthenticationError.invalidIdentity
+                        }
+                        guard let secureSocket = socket as? HomeBaseNetworkWebSocket else {
+                            throw HomeBaseAuthenticationError.invalidResponse
+                        }
+                        let binding = try await secureSocket.channelBinding()
+                        _ = try await HomeBaseClientAuthenticator.authenticate(serverID: authenticationServerID, binding: binding) {
+                            let data = try JSONEncoder().encode($0)
+                            guard data.count <= 16 * 1_024 else { throw HomeBaseAuthenticationError.invalidResponse }
+                            try await socket.send(.string(String(decoding: data, as: UTF8.self)))
+                            guard case .string(let text) = try await socket.receive(), text.utf8.count <= 16 * 1_024 else {
+                                throw HomeBaseAuthenticationError.invalidResponse
+                            }
+                            return try JSONDecoder().decode(HBProtocolEnvelope.self, from: Data(text.utf8))
+                        }
+                        secureSocket.authenticated()
+                    }
                     let open = HBProtocolEnvelope(messageKind: .request, clientID: clientID,
                                                   operation: HBProtocolOperations.openSession)
                     let response = try await Self.exchange(open, on: socket)

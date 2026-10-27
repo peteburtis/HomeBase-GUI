@@ -12,7 +12,7 @@ final class PairingEndpointTests: XCTestCase {
 
         XCTAssertEqual(endpoint.host, "192.168.1.42")
         XCTAssertEqual(endpoint.port, 10_503)
-        XCTAssertEqual(endpoint.webSocketURL?.absoluteString, "ws://192.168.1.42:10503/")
+        XCTAssertEqual(endpoint.webSocketURL?.absoluteString, "wss://192.168.1.42:10503/")
     }
 
     func testManualEndpointTrimsHostnameAndAllowsCustomPort() throws {

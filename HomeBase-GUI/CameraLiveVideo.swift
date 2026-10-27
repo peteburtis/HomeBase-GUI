@@ -199,15 +199,21 @@ nonisolated final class HomeBaseMediaConnection: @unchecked Sendable {
     private var lastSequence: UInt64?
     private var hello: Data?
     private var finished = false
+    private let authenticationServerID: UUID
+    private let serverFingerprint: Data
+    private var authenticationTask: Task<Void, Never>?
 
-    init(host: String, port: UInt16) throws {
+    init(host: String, port: UInt16, serverID: UUID, serverFingerprint: Data) throws {
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else {
             throw ConnectionError.invalidPort
         }
+        authenticationServerID = serverID
+        self.serverFingerprint = serverFingerprint
+        let parameters = NWParameters(tls: try HBTLS.makeClientOptions(serverFingerprint: serverFingerprint, queue: queue), tcp: .init())
         connection = NWConnection(
             host: NWEndpoint.Host(host),
             port: endpointPort,
-            using: .tcp
+            using: parameters
         )
     }
 
@@ -258,7 +264,7 @@ nonisolated final class HomeBaseMediaConnection: @unchecked Sendable {
         guard !finished else { return }
         switch state {
         case .ready:
-            sendHello()
+            authenticate()
         case .waiting(let error):
             // Before redemption, Network.framework may recover this attempt.
             // The arbiter's warm-up deadline bounds that wait. A redeemed
@@ -270,6 +276,56 @@ nonisolated final class HomeBaseMediaConnection: @unchecked Sendable {
             finish()
         default:
             break
+        }
+    }
+
+    private func authenticate() {
+        guard authenticationTask == nil else { return }
+        authenticationTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let identity = try await HomeBaseAuthenticationStore.shared.identity(serverID: authenticationServerID)
+                guard identity.serverFingerprint == serverFingerprint else { throw HomeBaseAuthenticationError.invalidIdentity }
+                let binding = try HBTLS.channelBinding(for: connection)
+                _ = try await HomeBaseClientAuthenticator.authenticate(serverID: authenticationServerID, binding: binding) { [self] request in
+                    let payload = try JSONEncoder().encode(request)
+                    guard !payload.isEmpty, payload.count <= 16 * 1_024 else { throw HomeBaseAuthenticationError.invalidResponse }
+                    var size = UInt32(payload.count).bigEndian
+                    var frame = withUnsafeBytes(of: &size) { Data($0) }; frame.append(payload)
+                    try await self.sendAuthentication(frame)
+                    let header = try await self.receiveAuthentication(count: 4)
+                    let length = header.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+                    guard length > 0, length <= 16 * 1_024 else { throw HomeBaseAuthenticationError.invalidResponse }
+                    let reply = try await self.receiveAuthentication(count: Int(length))
+                    return try JSONDecoder().decode(HBProtocolEnvelope.self, from: reply)
+                }
+                try Task.checkCancellation()
+                queue.async { [weak self] in
+                    guard let self, !self.finished else { return }
+                    self.sendHello()
+                }
+            } catch {
+                queue.async { [weak self] in self?.finish(throwing: error) }
+            }
+        }
+    }
+
+    private func sendAuthentication(_ data: Data) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            connection.send(content: data, completion: .contentProcessed { error in
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume() }
+            })
+        }
+    }
+
+    private func receiveAuthentication(count: Int) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            connection.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, complete, error in
+                if let error { continuation.resume(throwing: error) }
+                else if let data, data.count == count { continuation.resume(returning: data) }
+                else { continuation.resume(throwing: HomeBaseAuthenticationError.invalidResponse) }
+            }
         }
     }
 
@@ -364,6 +420,8 @@ nonisolated final class HomeBaseMediaConnection: @unchecked Sendable {
     private func finish(throwing error: Error? = nil) {
         guard !finished else { return }
         finished = true
+        authenticationTask?.cancel()
+        authenticationTask = nil
         connection.stateUpdateHandler = nil
         connection.cancel()
         if let error {

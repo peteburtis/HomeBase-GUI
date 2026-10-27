@@ -182,8 +182,8 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
 
     private let endpoint: HomeBaseEndpoint
     private let clientID: UUID
-    private let urlSession: URLSession
-    private let makeControlSocket: @Sendable (URL) -> any HomeBaseControlSocket
+    private let makeControlSocket: (@Sendable (URL) -> any HomeBaseControlSocket)?
+    private let authenticationServerID: UUID?
     private let requestTimeout: TimeInterval
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -263,7 +263,6 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
     init(
         endpoint: HomeBaseEndpoint,
         clientID: UUID = UUID(),
-        urlSession: URLSession = .shared,
         requestTimeout: TimeInterval = 30,
         makeControlSocket: (@Sendable (URL) -> any HomeBaseControlSocket)? = nil,
         bluetoothServerID: UUID? = nil,
@@ -271,15 +270,13 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         makeBluetoothTransport: (@Sendable () async throws -> any HomeBaseControlTransport)? = nil
     ) {
         self.bluetoothServerID = bluetoothServerID
+        self.authenticationServerID = makeControlSocket == nil ? bluetoothServerID : nil
         self.suppliedBluetoothService = bluetoothService
         self.makeBluetoothTransport = makeBluetoothTransport
         self.endpoint = endpoint
         self.clientID = clientID
-        self.urlSession = urlSession
         self.requestTimeout = requestTimeout
-        self.makeControlSocket = makeControlSocket ?? { url in
-            urlSession.webSocketTask(with: url, protocols: [Self.webSocketSubprotocol])
-        }
+        self.makeControlSocket = makeControlSocket
     }
 
     deinit {
@@ -302,7 +299,7 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         if task?.route == .bluetooth {
             return CameraHistoryTransport(clientID: clientID, makeSocket: { throw HomeBaseControlTransportError.networkRequired })
         }
-        return CameraHistoryTransport(endpoint: endpoint, clientID: clientID, session: urlSession)
+        return CameraHistoryTransport(endpoint: endpoint, clientID: clientID, serverID: authenticationServerID)
     }
 
     /// Consumers survive transient control-connection losses. Each upstream
@@ -343,7 +340,11 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         var connection: HomeBaseMediaConnection?
         do {
             try Task.checkCancellation()
-            let media = try HomeBaseMediaConnection(host: lease.mediaHost, port: lease.opened.mediaPort)
+            guard let authenticationServerID, let fingerprint = endpoint.serverFingerprint else {
+                throw HomeBaseAuthenticationError.missingIdentity
+            }
+            let media = try HomeBaseMediaConnection(host: lease.mediaHost, port: lease.opened.mediaPort,
+                serverID: authenticationServerID, serverFingerprint: fingerprint)
             connection = media
             let frames = try media.frames(ticket: lease.opened.ticket)
             return CameraStreamUpstream(frames: frames, close: { [weak self] in
@@ -577,9 +578,13 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         }
     }
 
-    private func webSocketTransport() throws -> any HomeBaseControlTransport {
+    private func webSocketTransport() async throws -> any HomeBaseControlTransport {
         guard let url = endpoint.webSocketURL else { throw ClientError.invalidEndpoint }
-        return HomeBaseWebSocketTransport(socket: makeControlSocket(url))
+        if let makeControlSocket { return HomeBaseWebSocketTransport(socket: makeControlSocket(url)) }
+        guard let authenticationServerID,
+              let record = try await HomeBaseAuthenticationStore.shared.record(serverID: authenticationServerID),
+              record.serverFingerprint == endpoint.serverFingerprint else { throw HomeBaseAuthenticationError.missingIdentity }
+        return HomeBaseWebSocketTransport(socket: try HomeBaseNetworkWebSocket(endpoint: endpoint))
     }
     private func bluetoothTransport() async throws -> any HomeBaseControlTransport {
         guard canUseBluetooth else { throw HomeBaseControlTransportError.background }
@@ -707,6 +712,18 @@ actor HomeBaseWebSocketClient: BluetoothPresenceCommanding {
         try await transport.waitUntilReady()
         return try await withTaskCancellationHandler {
             do {
+                if let authenticationServerID, !transport.isUserAuthenticated {
+                    let binding = try await transport.channelBinding()
+                    _ = try await HomeBaseClientAuthenticator.authenticate(serverID: authenticationServerID, binding: binding) { envelope in
+                        let request = try JSONEncoder().encode(envelope)
+                        guard request.count <= 16 * 1_024 else { throw HomeBaseAuthenticationError.invalidResponse }
+                        try await transport.send(request)
+                        let response = try await transport.receive()
+                        guard response.count <= 16 * 1_024 else { throw HomeBaseAuthenticationError.invalidResponse }
+                        return try JSONDecoder().decode(HBProtocolEnvelope.self, from: response)
+                    }
+                    transport.markUserAuthenticated()
+                }
                 let request: HBProtocolEnvelope
                 if let snapshot {
                     request = try HBProtocolEnvelope.request(operation: HBProtocolOperations.resumeSession, clientID: clientID,

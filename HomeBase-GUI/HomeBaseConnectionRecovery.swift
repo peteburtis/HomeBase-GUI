@@ -13,36 +13,10 @@ nonisolated protocol HomeBaseControlSocket: AnyObject, Sendable {
 }
 
 extension HomeBaseControlSocket {
-    // Existing in-memory sockets have no upgrade exchange. Real URLSession
-    // sockets report readiness from the WebSocket delegate below.
+    // In-memory sockets have no upgrade exchange. The production Network
+    // adapter reports readiness after TLS and the WebSocket upgrade complete.
     nonisolated func observeLifecycle(onOpen: @escaping @Sendable () -> Void,
                           onClose: @escaping @Sendable (Error?) -> Void) { onOpen() }
-}
-
-extension URLSessionWebSocketTask: HomeBaseControlSocket {
-    nonisolated func observeLifecycle(onOpen: @escaping @Sendable () -> Void,
-                          onClose: @escaping @Sendable (Error?) -> Void) {
-        delegate = HomeBaseWebSocketLifecycleDelegate(onOpen: onOpen, onClose: onClose)
-    }
-}
-
-/// A task retains this delegate. It retains callbacks, never the task itself.
-nonisolated final class HomeBaseWebSocketLifecycleDelegate: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
-    private let onOpen: @Sendable () -> Void
-    private let onClose: @Sendable (Error?) -> Void
-    init(onOpen: @escaping @Sendable () -> Void, onClose: @escaping @Sendable (Error?) -> Void) {
-        self.onOpen = onOpen; self.onClose = onClose
-    }
-    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
-        onOpen()
-    }
-    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
-                    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-        onClose(nil)
-    }
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        onClose(error)
-    }
 }
 
 /// Old commands must fail when the server can no longer account for them.

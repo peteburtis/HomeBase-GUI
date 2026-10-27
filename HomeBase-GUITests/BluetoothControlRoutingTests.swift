@@ -701,12 +701,12 @@ final class BluetoothControlRoutingTests: XCTestCase {
         await client.disconnect()
     }
 
-    func testExistingPresencePairingAutomaticallyUpgradesAndAcknowledgesSecretOverWebSocket() async throws {
+    func testCurrentPairingRefreshesCredentialAndAcknowledgesSecretOverWebSocket() async throws {
         let serverID = UUID(), registrationID = UUID(), controllerID = UUID()
         let credential = HBBluetoothCnCCredential(controllerID: controllerID, registrationID: registrationID,
             keyID: UUID(), secret: Data(repeating: 7, count: 32))
         let store = CredentialStore(items: [.init(serverID: serverID, registrationID: registrationID, name: "Phone",
-            phase: .paired, offer: .init(controllerID: controllerID, registrationID: registrationID, token: "presence-only-token",
+            phase: .paired, offer: .init(controllerID: controllerID, registrationID: registrationID, userID: UUID(), clientID: serverID, credential: credential,
                 controllerName: "HomeBase", expiresAt: 0), peripheralID: UUID(), controllerID: controllerID)])
         let service = BluetoothPresenceService(store: store, transport: CredentialPresenceTransport())
         let fixture = RoutingFixture()
@@ -717,7 +717,7 @@ final class BluetoothControlRoutingTests: XCTestCase {
         try await client.connect()
         XCTAssertEqual(store.items.first?.cncCredential, credential)
         XCTAssertEqual(store.items.first?.cncClientID, serverID)
-        XCTAssertEqual(store.items.first?.offer?.token, "presence-only-token")
+        XCTAssertEqual(store.items.first?.offer?.credential, credential)
         let summary = await fixture.server.upgradeSummary()
         XCTAssertEqual(summary.0, 1)
         XCTAssertEqual(summary.1, 1, "The credential delivery must be acknowledged before fallback can resume its session")
@@ -732,7 +732,7 @@ final class BluetoothControlRoutingTests: XCTestCase {
         let credential = HBBluetoothCnCCredential(controllerID: controllerID, registrationID: registrationID,
             keyID: UUID(), secret: Data(repeating: 9, count: 32))
         let store = CredentialStore(items: [.init(serverID: serverID, registrationID: registrationID, name: "Phone",
-            phase: .paired, offer: .init(controllerID: controllerID, registrationID: registrationID, token: "presence-token",
+            phase: .paired, offer: .init(controllerID: controllerID, registrationID: registrationID, userID: UUID(), clientID: serverID, credential: credential,
                 controllerName: "HomeBase", expiresAt: 0), peripheralID: UUID(), controllerID: controllerID)])
         let service = BluetoothPresenceService(store: store, transport: CredentialPresenceTransport())
         let fixture = RoutingFixture()
@@ -760,15 +760,17 @@ final class BluetoothControlRoutingTests: XCTestCase {
 
     func testCredentialCannotBeSavedForAnotherControllerOrRegistration() async throws {
         let serverID = UUID(), registrationID = UUID(), controllerID = UUID()
+        let credential = HBBluetoothCnCCredential(controllerID: controllerID, registrationID: registrationID,
+            keyID: UUID(), secret: Data(repeating: 7, count: 32))
         let store = CredentialStore(items: [.init(serverID: serverID, registrationID: registrationID, name: "Phone", phase: .paired,
-            offer: .init(controllerID: controllerID, registrationID: registrationID, token: "presence", controllerName: "HomeBase", expiresAt: 0),
+            offer: .init(controllerID: controllerID, registrationID: registrationID, userID: UUID(), clientID: serverID, credential: credential, controllerName: "HomeBase", expiresAt: 0),
             peripheralID: UUID(), controllerID: controllerID)])
         let service = BluetoothPresenceService(store: store, transport: CredentialPresenceTransport())
         service.start()
         let wrong = HBBluetoothCnCCredential(controllerID: UUID(), registrationID: registrationID, keyID: UUID(), secret: Data(repeating: 1, count: 32))
         XCTAssertThrowsError(try service.saveControlCredential(wrong, serverID: serverID, clientID: serverID))
         XCTAssertNil(store.items.first?.cncCredential)
-        do { _ = try await service.controlTransport(serverID: serverID, clientID: serverID); XCTFail("Presence bearer alone must not authorize CnC") } catch { }
+        do { _ = try await service.controlTransport(serverID: serverID, clientID: serverID); XCTFail("A missing cached transport credential must not authorize CnC") } catch { }
     }
 
     func testAttachmentDiscardsOldQueuedMessagesUntilMatchingResumeResponse() async throws {

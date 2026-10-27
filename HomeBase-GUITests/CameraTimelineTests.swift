@@ -439,9 +439,8 @@ final class CameraTimelineTests: XCTestCase {
     }
 
     func testRealThumbnailAPIAndPlaybackRemainIndependent() async throws {
-        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"],
-              let endpoint = HomeBasePairingCode.endpoint(from: url) else { throw XCTSkip("Explicit history smoke opt-in required") }
-        let client = HomeBaseWebSocketClient(endpoint: endpoint)
+        guard let url = ProcessInfo.processInfo.environment["HB_HISTORY_PLAYBACK_SMOKE_URL"] else { throw XCTSkip("Explicit history smoke opt-in required") }
+        let client = try await HomeBaseSmokeAuthentication.client(pairingURL: url)
         try await client.connect()
         let preview = await client.makeHistoryTransport()
         let playback = await client.makeHistoryTransport()

@@ -9,7 +9,6 @@
 /* Begin PBXBuildFile section */
 		C7A000000000000000000003 /* AWSS3 in Frameworks */ = {isa = PBXBuildFile; productRef = C7A000000000000000000002 /* AWSS3 */; };
 		E2CD710130269489002FCE2D /* HomeBaseProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = E2CD710330269489002FCE2D /* HomeBaseProtocol */; };
-		F0F122010000000000000007 /* HomeBaseProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = E2CD710330269489002FCE2D /* HomeBaseProtocol */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -67,7 +66,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				F0F122010000000000000007 /* HomeBaseProtocol in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -137,7 +135,6 @@
 			);
 			name = "HomeBase-GUITests";
 			packageProductDependencies = (
-				E2CD710330269489002FCE2D /* HomeBaseProtocol */,
 			);
 			productName = "HomeBase-GUITests";
 			productReference = F0F122010000000000000001 /* HomeBase-GUITests.xctest */;

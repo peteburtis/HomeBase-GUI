@@ -388,7 +388,7 @@ final class CameraAccessLifecycleTests: XCTestCase {
                 let lifecycle = CameraAccessLifecycle(session: access)
                 lifecycle.setActive(true, owner: UUID())
                 await settle(access)
-                let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
+                let endpoint = try XCTUnwrap(HomeBaseEndpoint(host: "127.0.0.1", port: 1))
                 let client = HomeBaseWebSocketClient(endpoint: endpoint)
                 let cameras = CameraVideoCatalog.cameras(in: [], includesArtificial: true)
                 let group = CameraGroupPlayback(client: client,
@@ -466,7 +466,7 @@ final class CameraAccessLifecycleTests: XCTestCase {
         let lifecycle = CameraAccessLifecycle(session: access)
         lifecycle.setActive(true, owner: UUID())
         await settle(access)
-        let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
+        let endpoint = try XCTUnwrap(HomeBaseEndpoint(host: "127.0.0.1", port: 1))
         let client = HomeBaseWebSocketClient(endpoint: endpoint)
         let camera = try XCTUnwrap(CameraVideoCatalog.cameras(in: [], includesArtificial: true).first)
         let group = CameraGroupPlayback(client: client, initialSession: CameraGroupSession(camera: camera, client: client))
@@ -492,7 +492,7 @@ final class CameraAccessLifecycleTests: XCTestCase {
         let lifecycle = CameraAccessLifecycle(session: access)
         lifecycle.setActive(true, owner: UUID())
         await settle(access)
-        let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
+        let endpoint = try XCTUnwrap(HomeBaseEndpoint(host: "127.0.0.1", port: 1))
         let client = HomeBaseWebSocketClient(endpoint: endpoint)
         let camera = try XCTUnwrap(CameraVideoCatalog.cameras(in: [], includesArtificial: true).first)
         let group = CameraGroupPlayback(client: client, initialSession: CameraGroupSession(camera: camera, client: client))
@@ -646,7 +646,7 @@ final class CameraAccessLifecycleTests: XCTestCase {
         let auth = CameraPageTestAuthenticator(error: .authenticationCancelled)
         let session = CameraAccessSession(credentials: CameraPageTestCredentials(), authenticator: auth, environment: .device)
         let client = HomeBaseWebSocketClient(endpoint: try XCTUnwrap(
-            HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1")))
+            HomeBaseEndpoint(host: "127.0.0.1", port: 1)))
         let cameras = CameraVideoCatalog.cameras(in: [
             HBTopologyDeviceDescriptor(identifier: "front-camera", addressableName: "FrontCamera",
                 displayName: "Front Camera", metadata: [CameraLiveVideoCapability.availableMetadataKey: true]),

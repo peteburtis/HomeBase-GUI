@@ -13,6 +13,7 @@ struct ContentView: View {
     @State private var isShowingServers = false
     @State private var pendingPairingNotice: PairingNotice?
     @State private var pairingNotice: PairingNotice?
+    @State private var pairingError: String?
 
     var body: some View {
         presentingServerPicker {
@@ -29,18 +30,20 @@ struct ContentView: View {
             }
         }
         .onOpenURL { url in
-            guard let endpoint = HomeBasePairingCode.endpoint(from: url) else {
+            guard let endpoint = HomeBasePairingCode.invitation(from: url) else {
+                pairingError = HomeBaseAuthenticationError.invalidPairingURL.localizedDescription
                 return
             }
-
-            let server = serverStore.add(endpoint)
-            serverStore.select(server)
-            let notice = PairingNotice(server: server)
-            if isShowingServers {
-                pendingPairingNotice = notice
-                isShowingServers = false
-            } else {
-                pairingNotice = notice
+            Task {
+                do {
+                    let server = try await serverStore.add(endpoint)
+                    serverStore.select(server)
+                    let notice = PairingNotice(server: server)
+                    if isShowingServers {
+                        pendingPairingNotice = notice
+                        isShowingServers = false
+                    } else { pairingNotice = notice }
+                } catch { pairingError = error.localizedDescription }
             }
         }
         .alert(item: $pairingNotice) { notice in
@@ -50,6 +53,9 @@ struct ContentView: View {
                 dismissButton: .default(Text("OK"))
             )
         }
+        .alert("Unable to Pair", isPresented: Binding(get: { pairingError != nil }, set: { if !$0 { pairingError = nil } })) {
+            Button("OK") { pairingError = nil }
+        } message: { Text(pairingError ?? "") }
     }
 
     @ViewBuilder
@@ -116,6 +122,7 @@ private struct ServerSelectionView: View {
     @State private var isShowingScanner = false
     @State private var isShowingManualEntry = false
     @State private var pairedServer: PairedServer?
+    @State private var pairingError: String?
 
     var body: some View {
         NavigationStack {
@@ -147,14 +154,16 @@ private struct ServerSelectionView: View {
             }
         }
         .interactiveDismissDisabled(serverStore.selectedServer == nil)
+        .alert("Unable to Pair", isPresented: Binding(get: { pairingError != nil }, set: { if !$0 { pairingError = nil } })) {
+            Button("OK") { pairingError = nil }
+        } message: { Text(pairingError ?? "") }
 #if os(iOS)
         .fullScreenCover(
             isPresented: $isShowingScanner,
             onDismiss: pairingDidDismiss
         ) {
             PairingScannerView { endpoint in
-                pairedServer = serverStore.add(endpoint)
-                isShowingScanner = false
+                accept(endpoint)
             }
         }
 #else
@@ -163,8 +172,7 @@ private struct ServerSelectionView: View {
             onDismiss: pairingDidDismiss
         ) {
             ManualServerEntryView { endpoint in
-                pairedServer = serverStore.add(endpoint)
-                isShowingManualEntry = false
+                accept(endpoint)
             }
         }
 #endif
@@ -174,7 +182,7 @@ private struct ServerSelectionView: View {
         ContentUnavailableView {
             Label("No Paired Servers", systemImage: "server.rack")
         } description: {
-            Text("Scan a HomeBase pairing code or enter its LAN address to add a server.")
+            Text("Scan a HomeBase pairing code or paste its pairing URL to add a server.")
         } actions: {
             Button("Pair a Server", systemImage: "qrcode.viewfinder") {
                 beginPairing()
@@ -236,6 +244,20 @@ private struct ServerSelectionView: View {
 #else
         isShowingManualEntry = true
 #endif
+    }
+
+    private func accept(_ invitation: HomeBasePairingInvitation) {
+        Task {
+            do {
+                pairedServer = try await serverStore.add(invitation)
+                isShowingScanner = false
+                isShowingManualEntry = false
+            } catch {
+                isShowingScanner = false
+                isShowingManualEntry = false
+                pairingError = error.localizedDescription
+            }
+        }
     }
 
     private func pairingDidDismiss() {

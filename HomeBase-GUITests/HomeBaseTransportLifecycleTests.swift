@@ -67,24 +67,6 @@ final class HomeBaseTransportLifecycleTests: XCTestCase {
         catch { XCTAssertEqual((error as? URLError)?.code, .networkConnectionLost) }
     }
 
-    func testURLSessionTaskDelegateReportsActualUpgradeAndCompletion() async throws {
-        let lifecycle = HomeBaseTransportLifecycle()
-        let session = URLSession(configuration: .ephemeral)
-        defer { session.invalidateAndCancel() }
-        let socket = session.webSocketTask(with: URL(string: "ws://lifecycle.invalid")!)
-        socket.observeLifecycle(onOpen: { lifecycle.opened() }, onClose: { lifecycle.closed($0 ?? HomeBaseControlTransportError.closed) })
-        guard let delegate = socket.delegate as? HomeBaseWebSocketLifecycleDelegate else {
-            return XCTFail("The task must own a WebSocket upgrade delegate before resume")
-        }
-        // Invoke the real adapter's callbacks without starting network traffic.
-        delegate.urlSession(session, webSocketTask: socket, didOpenWithProtocol: "homebase.v2")
-        try await lifecycle.waitUntilReady()
-        delegate.urlSession(session, task: socket, didCompleteWithError: URLError(.networkConnectionLost))
-        await lifecycle.waitUntilClosed()
-        do { try await lifecycle.waitUntilReady(); XCTFail("Task completion must retire the carrier") }
-        catch { XCTAssertEqual((error as? URLError)?.code, .networkConnectionLost) }
-    }
-
     func testBluetoothFinishWakesCarrierObserversWithoutDetachingTwice() async throws {
         var detached = 0
         let transport = HomeBaseBluetoothTransport(sender: { _ in }, closer: { detached += 1 })

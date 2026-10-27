@@ -1345,7 +1345,7 @@ final class CameraGroupTests: XCTestCase {
     }
 
     private func makeClient() throws -> HomeBaseWebSocketClient {
-        HomeBaseWebSocketClient(endpoint: try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1")))
+        HomeBaseWebSocketClient(endpoint: try XCTUnwrap(HomeBaseEndpoint(host: "127.0.0.1", port: 1)))
     }
     private func makeGroup(clock: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }) throws -> CameraGroupPlayback {
         CameraGroupPlayback(client: try makeClient(), clock: clock)

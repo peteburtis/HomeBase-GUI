@@ -865,7 +865,7 @@ final class CameraLiveVideoTests: XCTestCase {
             window.isHidden = true; window.rootViewController = nil
             previousKeyWindow?.makeKey()
         }
-        let endpoint = try XCTUnwrap(HomeBasePairingCode.endpoint(from: "homebasews://127.0.0.1:1"))
+        let endpoint = try XCTUnwrap(HomeBaseEndpoint(host: "127.0.0.1", port: 1))
         let client = HomeBaseWebSocketClient(endpoint: endpoint)
         let camera = HBTopologyDeviceDescriptor(identifier: "orientation-test", addressableName: "OrientationTest", displayName: "Test Camera")
         let player = UIHostingController(rootView: CameraFullScreenLiveVideoView(device: camera, quality: .high, client: client)

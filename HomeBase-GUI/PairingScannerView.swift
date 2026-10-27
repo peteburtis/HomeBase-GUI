@@ -14,11 +14,11 @@ struct PairingScannerView: View {
     @State private var isShowingManualEntry: Bool
 
     private let hasCamera: Bool
-    let onPairingCode: (HomeBaseEndpoint) -> Void
+    let onPairingCode: (HomeBasePairingInvitation) -> Void
 
     init(
         hasCamera: Bool = AVCaptureDevice.default(for: .video) != nil,
-        onPairingCode: @escaping (HomeBaseEndpoint) -> Void
+        onPairingCode: @escaping (HomeBasePairingInvitation) -> Void
     ) {
         self.hasCamera = hasCamera
         self.onPairingCode = onPairingCode
@@ -38,7 +38,7 @@ struct PairingScannerView: View {
                 .foregroundStyle(.white)
             } else {
                 QRCodeScanner(cameraError: $cameraError) { payload in
-                    guard let endpoint = HomeBasePairingCode.endpoint(from: payload) else {
+                    guard let endpoint = HomeBasePairingCode.invitation(from: payload) else {
                         return
                     }
 
@@ -59,7 +59,7 @@ struct PairingScannerView: View {
                         .background(.black.opacity(0.65), in: Capsule())
                 }
 
-                Button("Enter Address Manually", systemImage: "keyboard") {
+                Button("Enter Pairing URL", systemImage: "keyboard") {
                     isShowingManualEntry = true
                 }
                 .buttonStyle(.borderedProminent)
@@ -228,7 +228,7 @@ private final class QRCodeScannerViewController: UIViewController, AVCaptureMeta
         for case let code as AVMetadataMachineReadableCodeObject in metadataObjects {
             guard code.type == .qr,
                   let payload = code.stringValue,
-                  HomeBasePairingCode.endpoint(from: payload) != nil else {
+                  HomeBasePairingCode.invitation(from: payload) != nil else {
                 continue
             }
 

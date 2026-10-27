@@ -36,7 +36,7 @@ struct CameraWindowRoot: View {
     init(request: CameraWindowRequest) {
         self.request = request
         _connection = StateObject(
-            wrappedValue: ServerConnectionModel(endpoint: request.endpoint)
+            wrappedValue: ServerConnectionModel(endpoint: request.endpoint, serverID: request.serverID)
         )
     }
 
