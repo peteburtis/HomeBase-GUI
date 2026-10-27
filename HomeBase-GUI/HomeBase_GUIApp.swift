@@ -50,6 +50,14 @@ struct HomeBase_GUIApp: App {
         }
 
 #if os(macOS)
+        Settings {
+            MacSettingsRoot()
+                .environmentObject(serverStore)
+                .cameraAccessLifecycle(cameraAccess)
+                .modifier(CameraSceneLifecycle(access: cameraAccess))
+        }
+        .defaultSize(width: 520, height: 600)
+
         WindowGroup("Camera", for: CameraWindowRequest.self) { request in
             if let request = request.wrappedValue {
                 CameraWindowRoot(request: request)

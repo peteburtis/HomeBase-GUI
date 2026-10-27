@@ -119,6 +119,10 @@ struct CameraPickerPopover: View {
     let canSelect: (CameraVideoDevice) -> Bool
     let select: (CameraVideoDevice) -> Void
 
+    private var cameraListHeight: CGFloat {
+        CGFloat(min(max(model.cameras.count, 1), 5)) * 48
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if model.isLoading { ProgressView().frame(maxWidth: .infinity) }
@@ -152,7 +156,8 @@ struct CameraPickerPopover: View {
                     }
                 }
             }
-            .frame(maxHeight: CGFloat(min(max(model.cameras.count, 1), 5)) * 48)
+            // A minimum makes the viewport grow when the async camera list arrives.
+            .frame(minHeight: cameraListHeight, maxHeight: cameraListHeight)
             HStack {
                 Spacer()
                 Toggle("Multiple", isOn: Binding(get: { multiple }, set: toggleMultiple))

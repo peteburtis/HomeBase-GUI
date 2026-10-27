@@ -132,6 +132,12 @@ struct TopologyGroupPlacement {
         )
     }
 
+    /// The complete catalog, independent of room membership and groups that
+    /// replace their constituent devices elsewhere in the navigation.
+    var allDeviceItems: [TopologyDeviceListItem] {
+        Self.sortedDeviceItems(topology.devices.map(TopologyDeviceListItem.device))
+    }
+
     private static func sortedDeviceItems(
         _ items: [TopologyDeviceListItem]
     ) -> [TopologyDeviceListItem] {

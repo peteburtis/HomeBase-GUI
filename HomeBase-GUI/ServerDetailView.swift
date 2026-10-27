@@ -8,7 +8,7 @@ import HomeBaseProtocol
 import SwiftUI
 
 struct ServerDetailView: View {
-    private enum Tab: Hashable { case home, cameras, scenes, triggers }
+    private enum ServerTab: Hashable { case home, cameras, scenes, triggers }
     @Environment(\.scenePhase) private var scenePhase
 #if os(iOS)
     @Environment(\.cameraViewerPresentation) private var cameraViewer
@@ -21,12 +21,22 @@ struct ServerDetailView: View {
     let showServers: () -> Void
     @StateObject private var connection: ServerConnectionModel
     @StateObject private var connectionStatusController = ConnectionStatusController()
-    @State private var selectedTab: Tab = .home
+
+#if os(macOS)
+    @State private var selectedDestination: MacSidebarDestination = .container(.allDevices)
+#else
+    @State private var selectedTab: ServerTab = .home
+#endif
     @State private var isShowingCamera = false
     @State private var homeDetailSelection: TopologyDetailDestination?
 
     private var cameraTabNeedsAccess: Bool {
+#if os(macOS)
+        selectedDestination == .cameras && connection.route == .webSocket
+            && !CameraVideoCatalog.cameras(in: connection.topology.devices).isEmpty
+#else
         selectedTab == .cameras && connection.route == .webSocket
+#endif
     }
 
     init(
@@ -55,81 +65,79 @@ struct ServerDetailView: View {
             in: connection.topology.devices
         )
 
-        TabView(selection: $selectedTab) {
-            NavigationSplitView {
-                NavigationStack {
-                    homeView
-                        .toolbar {
-                            ToolbarItem(placement: .navigation) {
-                                Button("Servers", systemImage: "list.bullet") {
-                                    showServers()
-                                }
-                            }
-                            ToolbarItem(placement: .primaryAction) {
-                                HomeSettingsButton(
-                                    destinations: S3CredentialSettingsModel.destinations(in: connection.topology.devices),
-                                    serverName: server.endpoint.host,
-                                    server: server, client: connection.client,
-                                    isConnected: connection.state == .connected && connection.route == .webSocket
-                                )
-                            }
-                        }
+        Group {
+#if os(macOS)
+            MacServerNavigationView(
+                connection: connection, selection: $selectedDestination
+            ) {
+                if cameras.isEmpty {
+                    ContentUnavailableView("No Cameras", systemImage: "video",
+                        description: Text("Cameras will appear here when they are available on this server."))
+                } else if connection.route == .bluetooth {
+                    ContentUnavailableView("Cameras need a network connection", systemImage: "wifi.slash",
+                        description: Text("Home controls are connected over Bluetooth. Video and recordings become available when the network connection returns."))
+                } else {
+                    VideoView(cameras: cameras, client: connection.client, server: server,
+                        onPresentationChanged: { isShowingCamera = $0 })
                 }
-            } detail: {
-                TopologyDetailDestinationView(
-                    selection: homeDetailSelection,
-                    topology: connection.presentedTopology,
-                    client: connection.client
-                )
+            } scenes: {
+                ScenesView(client: connection.client)
+            } triggers: {
+                TriggersView(client: connection.client)
             }
-                .connectionStatusScope(isActive: selectedTab == .home)
-                .tabItem {
-                    Label("Home", systemImage: "house")
-                }
-                .tag(Tab.home)
-
-            if !cameras.isEmpty {
-                Group {
-                    if connection.route == .bluetooth {
-                        ContentUnavailableView("Cameras need a network connection", systemImage: "wifi.slash",
-                            description: Text("Home controls are connected over Bluetooth. Video and recordings become available when the network connection returns."))
-                    } else {
-                        VideoView(cameras: cameras, client: connection.client, server: server,
-                            onPresentationChanged: { isShowingCamera = $0 })
+#else
+            TabView(selection: $selectedTab) {
+                homeNavigation
+                    .connectionStatusScope(isActive: selectedTab == .home)
+                    .tabItem {
+                        Label("Home", systemImage: "house")
                     }
-                }
-                .connectionStatusClearance()
-                .connectionStatusScope(isActive: selectedTab == .cameras)
-                .tabItem {
-                    Label("Cameras", systemImage: "video")
-                }
-                .tag(Tab.cameras)
+                    .tag(ServerTab.home)
+
+                if !cameras.isEmpty {
+                    Group {
+                        if connection.route == .bluetooth {
+                            ContentUnavailableView("Cameras need a network connection", systemImage: "wifi.slash",
+                                description: Text("Home controls are connected over Bluetooth. Video and recordings become available when the network connection returns."))
+                        } else {
+                            VideoView(cameras: cameras, client: connection.client, server: server,
+                                onPresentationChanged: { isShowingCamera = $0 })
+                        }
+                    }
+                    .connectionStatusClearance()
+                    .connectionStatusScope(isActive: selectedTab == .cameras)
+                    .tabItem {
+                        Label("Cameras", systemImage: "video")
+                    }
+                    .tag(ServerTab.cameras)
 #if os(iOS)
-                .badge(externalStreamingCount)
+                    .badge(externalStreamingCount)
 #endif
-            }
-
-            NavigationStack {
-                ScenesView(
-                    client: connection.client
-                )
-            }
-                .connectionStatusScope(isActive: selectedTab == .scenes)
-                .tabItem {
-                    Label("Scenes", systemImage: "sparkles")
                 }
-                .tag(Tab.scenes)
 
-            NavigationStack {
-                TriggersView(
-                    client: connection.client
-                )
-            }
-                .connectionStatusScope(isActive: selectedTab == .triggers)
-                .tabItem {
-                    Label("Triggers", systemImage: "bolt")
+                NavigationStack {
+                    ScenesView(
+                        client: connection.client
+                    )
                 }
-                .tag(Tab.triggers)
+                    .connectionStatusScope(isActive: selectedTab == .scenes)
+                    .tabItem {
+                        Label("Scenes", systemImage: "sparkles")
+                    }
+                    .tag(ServerTab.scenes)
+
+                NavigationStack {
+                    TriggersView(
+                        client: connection.client
+                    )
+                }
+                    .connectionStatusScope(isActive: selectedTab == .triggers)
+                    .tabItem {
+                        Label("Triggers", systemImage: "bolt")
+                    }
+                    .tag(ServerTab.triggers)
+            }
+#endif
         }
         .cameraAccessScope(
             // Bluetooth and pending routes cannot show video. Request access
@@ -137,12 +145,12 @@ struct ServerDetailView: View {
             isActive: cameraTabNeedsAccess,
             isPresentingCamera: isShowingCamera
         )
+#if os(iOS)
         .onChange(of: cameras.isEmpty) { _, isEmpty in
             if isEmpty && selectedTab == .cameras {
                 selectedTab = .home
             }
         }
-#if os(iOS)
         .onChange(of: viewerIsPresented) { _, presented in
             isShowingCamera = presented
         }
@@ -185,6 +193,34 @@ struct ServerDetailView: View {
         }
     }
 
+    @ViewBuilder
+    private var homeNavigation: some View {
+        NavigationSplitView {
+            NavigationStack {
+                homeView
+                    .toolbar {
+#if os(iOS)
+                        ToolbarItem(placement: .topBarTrailing) {
+                            HomeSettingsButton(
+                                destinations: S3CredentialSettingsModel.destinations(in: connection.topology.devices),
+                                serverName: server.endpoint.host,
+                                server: server, client: connection.client,
+                                isConnected: connection.state == .connected && connection.route == .webSocket
+                            )
+                        }
+#endif
+                        ServerToolbar(showServers: showServers)
+                    }
+            }
+        } detail: {
+            TopologyDetailDestinationView(
+                selection: homeDetailSelection,
+                topology: connection.presentedTopology,
+                client: connection.client
+            )
+        }
+    }
+
     private var homeView: some View {
         let topology = connection.presentedTopology
         let placement = TopologyGroupPlacement(topology: topology)
@@ -208,6 +244,21 @@ struct ServerDetailView: View {
         }
 
         return List(selection: $homeDetailSelection) {
+            Section {
+                NavigationLink {
+                    TopologyDetailView(
+                        allDevicesIn: topology,
+                        client: connection.client,
+                        selection: $homeDetailSelection
+                    )
+                } label: {
+                    Label("All Devices", systemImage: "square.grid.2x2")
+                }
+#if os(iOS) || os(visionOS)
+                .isDetailLink(false)
+#endif
+            }
+
             Section {
                 if visibleRooms.isEmpty {
                     Text(emptyRoomsMessage)

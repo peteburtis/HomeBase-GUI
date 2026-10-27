@@ -7,11 +7,19 @@ import XCTest
 
 @MainActor
 final class SplitNavigationPresentationTests: XCTestCase {
+    func testCompactAllDevicesIncludesGroupedAndUnassignedDevicesAndHiddenItems() async throws {
+        try await assertAllDevicesNavigation(sizeClass: .compact)
+    }
+
+    func testExpandedAllDevicesIncludesGroupedAndUnassignedDevicesAndHiddenItems() async throws {
+        try await assertAllDevicesNavigation(sizeClass: .regular)
+    }
+
     func testCompactDeviceStartsMonitoring() async throws {
         let fixture = try await makeFixture(sizeClass: .compact)
         defer { fixture.close() }
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
-        try await selectRow(0, in: split)
+        try await selectRow(0, section: 1, in: split)
         try await selectRow(0, in: split)
         XCTAssertTrue(titles(in: split).contains("Desk Lamp"))
         let requests = await fixture.requests.deviceDetailCount
@@ -25,7 +33,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         let fixture = try await makeFixture()
         defer { fixture.close() }
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
-        try await selectRow(0, in: XCTUnwrap(split.viewController(for: .primary)))
+        try await selectRow(0, section: 1, in: XCTUnwrap(split.viewController(for: .primary)))
         try await selectRow(0, in: XCTUnwrap(split.viewController(for: .primary)))
         let originalSubscriptions = await fixture.requests.activeControlSubscriptionIDs
         fixture.window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
@@ -76,7 +84,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
 
             // Visit again after Control All has populated the detail column.
             for _ in 0..<2 {
-                for (section, title) in [(0, "Study"), (1, "All Devices")] {
+                for (section, title) in [(0, "All Devices"), (1, "Study"), (2, "Entire Home")] {
                     try await selectRow(0, section: section, in: sidebar)
                     XCTAssertTrue(titles(in: sidebar).contains(title))
                     XCTAssertEqual(navigation.viewControllers.count, 2, "A root link must add exactly one sidebar screen.")
@@ -97,7 +105,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         XCTAssertFalse(split.isCollapsed)
 
         let sidebar = try XCTUnwrap(split.viewController(for: .primary))
-        try await selectRow(0, in: sidebar)
+        try await selectRow(0, section: 1, in: sidebar)
         XCTAssertTrue(titles(in: sidebar).contains("Study"), titles(in: sidebar).description)
         XCTAssertFalse(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("Study"))
 
@@ -112,7 +120,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         navigation.popViewController(animated: false)
         try await settle()
         XCTAssertTrue(titles(in: sidebar).contains("Home"))
-        try await selectRow(1, in: sidebar)
+        try await selectRow(1, section: 1, in: sidebar)
         XCTAssertTrue(titles(in: sidebar).contains("Workshop"))
         try await selectRow(1, in: sidebar)
         let currentDetail = try XCTUnwrap(split.viewController(for: .secondary))
@@ -126,7 +134,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         let fixture = try await makeFixture()
         defer { fixture.close() }
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
-        try await selectRow(0, in: XCTUnwrap(split.viewController(for: .primary)))
+        try await selectRow(0, section: 1, in: XCTUnwrap(split.viewController(for: .primary)))
         try await selectRow(0, in: XCTUnwrap(split.viewController(for: .primary)))
 
         fixture.window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
@@ -150,7 +158,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
         XCTAssertTrue(split.isCollapsed)
         XCTAssertTrue(titles(in: split).contains("Home"), titles(in: split).description)
-        try await selectRow(0, in: split)
+        try await selectRow(0, section: 1, in: split)
         XCTAssertTrue(titles(in: split).contains("Study"), titles(in: split).description)
         try await selectRow(0, in: split)
         XCTAssertTrue(titles(in: split).contains("Desk Lamp"), titles(in: split).description)
@@ -172,12 +180,12 @@ final class SplitNavigationPresentationTests: XCTestCase {
         defer { fixture.close() }
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
         let sidebar = try XCTUnwrap(split.viewController(for: .primary))
-        try await selectRow(0, section: 1, in: sidebar)
+        try await selectRow(0, section: 2, in: sidebar)
         try await selectRow(0, section: 1, in: sidebar)
         XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("Desk Lamp"))
         try await selectRow(1, section: 1, in: sidebar)
         XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("Workshop Sensor"))
-        XCTAssertTrue(titles(in: sidebar).contains("All Devices"))
+        XCTAssertTrue(titles(in: sidebar).contains("Entire Home"))
         let navigation = try XCTUnwrap(descendant(UINavigationController.self, in: sidebar))
         XCTAssertEqual(navigation.viewControllers.count, 2, "Device selections must not accumulate in the sidebar stack.")
     }
@@ -187,7 +195,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         defer { fixture.close() }
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
         let sidebar = try XCTUnwrap(split.viewController(for: .primary))
-        try await selectRow(0, section: 1, in: sidebar)
+        try await selectRow(0, section: 2, in: sidebar)
         let detail = try XCTUnwrap(split.viewController(for: .secondary))
         try await selectRow(0, section: 1, in: detail)
         XCTAssertTrue(titles(in: detail).contains("all-devices"))
@@ -196,7 +204,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         let currentDetail = try XCTUnwrap(split.viewController(for: .secondary))
         XCTAssertTrue(titles(in: currentDetail).contains("Desk Lamp"))
         XCTAssertFalse(titles(in: currentDetail).contains("all-devices"), "A new selection must replace the old detail's drill-down without a forced stack identity reset.")
-        XCTAssertTrue(titles(in: sidebar).contains("All Devices"))
+        XCTAssertTrue(titles(in: sidebar).contains("Entire Home"))
     }
 
     func testHomeNavigationAtSystemWindowSize() async throws {
@@ -214,7 +222,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
             try await settle()
         }
         let sidebar = split.isCollapsed ? split : try XCTUnwrap(split.viewController(for: .primary))
-        try await selectRow(0, in: sidebar)
+        try await selectRow(0, section: 1, in: sidebar)
         XCTAssertTrue(titles(in: sidebar).contains("Study"))
         try await selectRow(0, in: sidebar)
         let detail = split.isCollapsed ? split : try XCTUnwrap(split.viewController(for: .secondary))
@@ -233,23 +241,23 @@ final class SplitNavigationPresentationTests: XCTestCase {
         defer { fixture.close() }
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
         let sidebar = try XCTUnwrap(split.viewController(for: .primary))
-        try await selectRow(0, section: 1, in: sidebar)
+        try await selectRow(0, section: 2, in: sidebar)
         let list = try collection(in: sidebar)
         XCTAssertEqual(list.numberOfSections, 2, "Control All and Devices; no inline group controls.")
         XCTAssertTrue(list.indexPathsForSelectedItems?.contains(IndexPath(item: 0, section: 0)) == true)
-        XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("All Devices"))
+        XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("Entire Home"))
         snapshot(fixture, name: "Group — expanded Control All")
 
         try await selectRow(0, section: 1, in: sidebar)
         XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("Desk Lamp"))
         try await selectRow(0, in: sidebar)
-        XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("All Devices"))
+        XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("Entire Home"))
 
         try await selectRow(0, section: 1, in: sidebar)
         let navigation = try XCTUnwrap(descendant(UINavigationController.self, in: sidebar))
         navigation.popViewController(animated: false)
         try await settle()
-        try await selectRow(0, section: 1, in: sidebar)
+        try await selectRow(0, section: 2, in: sidebar)
         XCTAssertTrue(try collection(in: sidebar).indexPathsForSelectedItems?.contains(IndexPath(item: 0, section: 0)) == true)
         let writes = await fixture.requests.controlWriteCount
         XCTAssertEqual(writes, 0, "Opening or selecting Control All must never issue a control command.")
@@ -259,9 +267,9 @@ final class SplitNavigationPresentationTests: XCTestCase {
         let fixture = try await makeFixture(sizeClass: .compact)
         defer { fixture.close() }
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
-        try await selectRow(0, section: 1, in: split)
+        try await selectRow(0, section: 2, in: split)
         let navigation = try XCTUnwrap(descendant(UINavigationController.self, in: split))
-        XCTAssertTrue(titles(in: navigation).contains("All Devices"))
+        XCTAssertTrue(titles(in: navigation).contains("Entire Home"))
         XCTAssertEqual(try collection(in: navigation).numberOfSections, 3, "Inline Controls, Advanced, and Devices.")
         XCTAssertEqual(navigation.viewControllers.count, 2, "Opening a group must not push a separate Control All screen.")
         snapshot(fixture, name: "Group — compact inline controls")
@@ -278,14 +286,14 @@ final class SplitNavigationPresentationTests: XCTestCase {
         let fixture = try await makeFixture()
         defer { fixture.close() }
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
-        try await selectRow(0, section: 1, in: XCTUnwrap(split.viewController(for: .primary)))
-        XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("All Devices"))
+        try await selectRow(0, section: 2, in: XCTUnwrap(split.viewController(for: .primary)))
+        XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("Entire Home"))
 
         fixture.window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
         fixture.host.traitOverrides.horizontalSizeClass = .compact
         try await settle()
         XCTAssertTrue(split.isCollapsed)
-        XCTAssertTrue(titles(in: split).contains("All Devices"), titles(in: split).description)
+        XCTAssertTrue(titles(in: split).contains("Entire Home"), titles(in: split).description)
         snapshot(fixture, name: "Group — collapsed presentation")
         XCTAssertEqual(try collection(in: split).numberOfSections, 3)
         XCTAssertEqual(
@@ -301,7 +309,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         XCTAssertFalse(split.isCollapsed)
         let sidebar = try XCTUnwrap(split.viewController(for: .primary))
         XCTAssertEqual(try collection(in: sidebar).numberOfSections, 2)
-        XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("All Devices"))
+        XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("Entire Home"))
 
         try await selectRow(0, section: 1, in: sidebar)
         fixture.host.traitOverrides.horizontalSizeClass = .compact
@@ -321,10 +329,10 @@ final class SplitNavigationPresentationTests: XCTestCase {
             try await settle()
         }
         let sidebar = split.isCollapsed ? split : try XCTUnwrap(split.viewController(for: .primary))
-        try await selectRow(0, section: 1, in: sidebar)
+        try await selectRow(0, section: 2, in: sidebar)
         XCTAssertEqual(try collection(in: sidebar).numberOfSections, split.isCollapsed ? 3 : 2)
         if !split.isCollapsed {
-            XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("All Devices"))
+            XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("Entire Home"))
         }
         snapshot(fixture, name: "Group — system window size")
     }
@@ -333,7 +341,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         let fixture = try await makeFixture()
         defer { fixture.close() }
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
-        try await selectRow(0, section: 1, in: XCTUnwrap(split.viewController(for: .primary)))
+        try await selectRow(0, section: 2, in: XCTUnwrap(split.viewController(for: .primary)))
 
         for _ in 0..<3 {
             fixture.host.traitOverrides.horizontalSizeClass = .compact
@@ -344,7 +352,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
 
             fixture.host.traitOverrides.horizontalSizeClass = .regular
             try await settle()
-            XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("All Devices"))
+            XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("Entire Home"))
         }
 
         fixture.host.traitOverrides.horizontalSizeClass = .compact
@@ -363,7 +371,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         defer { fixture.close() }
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
         let sidebar = try XCTUnwrap(split.viewController(for: .primary))
-        try await selectRow(0, section: 1, in: sidebar)
+        try await selectRow(0, section: 2, in: sidebar)
         let navigation = try XCTUnwrap(descendant(UINavigationController.self, in: sidebar))
         navigation.popViewController(animated: false)
         try await settle()
@@ -380,7 +388,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         let fixture = try await makeFixture()
         defer { fixture.close() }
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
-        try await selectRow(0, section: 1, in: XCTUnwrap(split.viewController(for: .primary)))
+        try await selectRow(0, section: 2, in: XCTUnwrap(split.viewController(for: .primary)))
         try await selectRow(0, section: 1, in: XCTUnwrap(split.viewController(for: .secondary)))
         XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("all-devices"))
 
@@ -390,7 +398,7 @@ final class SplitNavigationPresentationTests: XCTestCase {
         let navigation = try XCTUnwrap(descendant(UINavigationController.self, in: split))
         navigation.popViewController(animated: false)
         try await settle()
-        XCTAssertTrue(titles(in: split).contains("All Devices"))
+        XCTAssertTrue(titles(in: split).contains("Entire Home"))
         XCTAssertEqual(navigation.viewControllers.count, 2)
         XCTAssertEqual(try collection(in: navigation).numberOfSections, 3)
     }
@@ -399,7 +407,10 @@ final class SplitNavigationPresentationTests: XCTestCase {
         let fixture = try await makeFixture()
         defer { fixture.close() }
         let tabs = try XCTUnwrap(descendant(UITabBarController.self, in: fixture.host))
-        XCTAssertEqual(tabs.viewControllers?.count, 4)
+        // SwiftUI supplies UITab models; UIKit need not populate the legacy
+        // viewControllers array before their content is selected.
+        XCTAssertEqual(tabs.tabs.count, 4)
+        XCTAssertEqual(tabs.tabs.map(\.title), ["Home", "Cameras", "Scenes", "Triggers"])
 
         for (index, title) in [(2, "Scenes"), (3, "Triggers")] {
             let controller = try await selectTab(index, in: tabs)
@@ -420,15 +431,15 @@ final class SplitNavigationPresentationTests: XCTestCase {
         defer { fixture.close() }
         let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
         let sidebar = try XCTUnwrap(split.viewController(for: .primary))
-        try await selectRow(0, section: 1, in: sidebar)
-        XCTAssertTrue(titles(in: sidebar).contains("All Devices"))
+        try await selectRow(0, section: 2, in: sidebar)
+        XCTAssertTrue(titles(in: sidebar).contains("Entire Home"))
         try await selectRow(0, section: 1, in: XCTUnwrap(split.viewController(for: .secondary)))
         XCTAssertTrue(try titles(in: XCTUnwrap(split.viewController(for: .secondary))).contains("all-devices"))
 
         let navigation = try XCTUnwrap(descendant(UINavigationController.self, in: sidebar))
         navigation.popViewController(animated: false)
         try await settle()
-        try await selectRow(0, in: sidebar)
+        try await selectRow(0, section: 1, in: sidebar)
         try await selectRow(0, section: 1, in: sidebar)
         XCTAssertTrue(titles(in: sidebar).contains("Hidden"))
         try await selectRow(0, in: sidebar)
@@ -453,6 +464,62 @@ final class SplitNavigationPresentationTests: XCTestCase {
         let names = await fixture.requests.triggerDetailNames
         XCTAssertTrue(names.contains("Alpha"))
         XCTAssertTrue(names.contains("Beta"), "A new selection must create its own live detail model.")
+    }
+
+    private func assertAllDevicesNavigation(sizeClass: UIUserInterfaceSizeClass) async throws {
+        let fixture = try await makeFixture(sizeClass: sizeClass)
+        defer { fixture.close() }
+        let split = try XCTUnwrap(descendant(UISplitViewController.self, in: fixture.host))
+        XCTAssertEqual(split.isCollapsed, sizeClass == .compact)
+        let sidebar = split.isCollapsed ? split : try XCTUnwrap(split.viewController(for: .primary))
+        let navigation = try XCTUnwrap(descendant(UINavigationController.self, in: sidebar))
+        XCTAssertEqual(try collection(in: sidebar).numberOfItems(inSection: 0), 1)
+
+        try await selectRow(0, in: sidebar)
+        XCTAssertTrue(titles(in: sidebar).contains("All Devices"))
+        XCTAssertEqual(navigation.viewControllers.count, 2)
+        let list = try collection(in: sidebar)
+        XCTAssertEqual(list.numberOfSections, 2, "The complete catalog has Devices and Hidden, without synthetic Control All or Advanced rows.")
+        XCTAssertEqual(list.numberOfItems(inSection: 0), 5, "Include physical constituents of device-presenting groups and unassigned devices; keep the hidden device separate.")
+        XCTAssertEqual(list.numberOfItems(inSection: 1), 1)
+        let initialDetails = await fixture.requests.deviceDetailCount
+        let initialSubscriptions = await fixture.requests.activeControlDevices
+        XCTAssertEqual(initialDetails, 0, "Opening All Devices must not invent a device-control endpoint.")
+        XCTAssertTrue(initialSubscriptions.isEmpty)
+
+        // Camera sorts first. These positions verify display-name ordering while
+        // exercising ordinary, grouped, and unassigned physical devices.
+        for (row, title, identifier) in [
+            (1, "Desk Lamp", "lamp"),
+            (2, "Grouped Relay", "grouped-relay"),
+            (3, "Unassigned Outlet", "unassigned-outlet"),
+            (4, "Workshop Sensor", "sensor")
+        ] {
+            try await selectRow(row, in: sidebar)
+            let detail = split.isCollapsed ? split : try XCTUnwrap(split.viewController(for: .secondary))
+            XCTAssertTrue(titles(in: detail).contains(title), titles(in: detail).description)
+            let monitoredDevices = await fixture.requests.activeControlDevices
+            XCTAssertEqual(monitoredDevices, [identifier], "Selection must monitor the physical device and release the preceding selection.")
+            if split.isCollapsed {
+                navigation.popViewController(animated: false)
+                try await settle()
+            }
+            XCTAssertTrue(titles(in: sidebar).contains("All Devices"))
+            XCTAssertEqual(navigation.viewControllers.count, 2, "Device selection must preserve the catalog's navigation history.")
+        }
+
+        try await selectRow(0, section: 1, in: sidebar)
+        XCTAssertTrue(titles(in: sidebar).contains("Hidden"))
+        try await selectRow(0, in: sidebar)
+        let hiddenDetail = split.isCollapsed ? split : try XCTUnwrap(split.viewController(for: .secondary))
+        XCTAssertTrue(titles(in: hiddenDetail).contains("Hidden Lamp"))
+        let hiddenSubscriptions = await fixture.requests.activeControlDevices
+        let subscriptionStarts = await fixture.requests.controlSubscriptionStarts
+        let writes = await fixture.requests.controlWriteCount
+        XCTAssertEqual(hiddenSubscriptions, ["hidden-lamp"])
+        XCTAssertEqual(subscriptionStarts, 5, "Only the five explicitly selected devices should start monitoring.")
+        XCTAssertEqual(writes, 0, "Browsing the catalog, hidden items, and device details must not issue control commands.")
+        snapshot(fixture, name: "All Devices — \(sizeClass == .compact ? "compact" : "expanded") hidden device")
     }
 
     private func makeFixture(sizeClass: UIUserInterfaceSizeClass? = .regular, hasControls: Bool = true) async throws -> Fixture {
@@ -652,17 +719,27 @@ private nonisolated final class NavigationFixtureSocket: HomeBaseControlSocket, 
                     .init(identifier: "hidden-lamp", addressableName: "hidden-lamp", displayName: "Hidden Lamp", metadata: ["hidden": true]),
                     .init(identifier: "sensor", addressableName: "sensor", displayName: "Workshop Sensor"),
                     .init(identifier: "camera", addressableName: "camera", displayName: "Camera",
-                          metadata: ["cameraLiveVideo": true])
+                          metadata: ["cameraLiveVideo": true]),
+                    .init(identifier: "unassigned-outlet", addressableName: "unassigned-outlet", displayName: "Unassigned Outlet"),
+                    .init(identifier: "grouped-relay", addressableName: "grouped-relay", displayName: "Grouped Relay")
                 ],
                 rooms: [
                     .init(identifier: "study", displayName: "Study", members: [.init(kind: .device, identifier: "lamp"), .init(kind: .device, identifier: "hidden-lamp")], resolvedDeviceIdentifiers: ["lamp", "hidden-lamp"]),
                     .init(identifier: "workshop", displayName: "Workshop", members: [.init(kind: .device, identifier: "sensor"), .init(kind: .device, identifier: "camera")], resolvedDeviceIdentifiers: ["sensor", "camera"])
                 ],
-                groups: [.init(
-                    identifier: "all-devices", displayName: "All Devices", origin: .configured,
-                    role: .general, members: [.init(kind: .device, identifier: "lamp"), .init(kind: .device, identifier: "sensor")],
-                    resolvedDeviceIdentifiers: ["lamp", "sensor"], controlDeviceIdentifier: "all-devices"
-                )]
+                groups: [
+                    .init(
+                        identifier: "all-devices", displayName: "Entire Home", origin: .configured,
+                        role: .general, members: [.init(kind: .device, identifier: "lamp"), .init(kind: .device, identifier: "sensor")],
+                        resolvedDeviceIdentifiers: ["lamp", "sensor"], controlDeviceIdentifier: "all-devices"
+                    ),
+                    .init(
+                        identifier: "relay-group", displayName: "Relay Assembly", origin: .configured,
+                        role: .general, members: [.init(kind: .device, identifier: "grouped-relay")],
+                        resolvedDeviceIdentifiers: ["grouped-relay"], controlDeviceIdentifier: "relay-group",
+                        metadata: ["presentationDisposition": "device"]
+                    )
+                ]
             ))
         default:
             body = .failure(.init(code: "test_fixture", message: "No live controls in navigation fixture."))

@@ -18,6 +18,14 @@ struct ContentView: View {
     var body: some View {
         presentingServerPicker {
             applicationRoot
+#if os(macOS)
+                // An outer, closed inspector owns a stable trailing toolbar
+                // section independently of the selected screen's navigation.
+                .inspector(isPresented: .constant(false)) {
+                    Color.clear
+                        .toolbar { ServerToolbar(showServers: showServers) }
+                }
+#endif
         }
         .task {
             if serverStore.selectedServer == nil {
@@ -153,6 +161,7 @@ private struct ServerSelectionView: View {
                 }
             }
         }
+        .frame(minHeight: 320)
         .interactiveDismissDisabled(serverStore.selectedServer == nil)
         .alert("Unable to Pair", isPresented: Binding(get: { pairingError != nil }, set: { if !$0 { pairingError = nil } })) {
             Button("OK") { pairingError = nil }
@@ -271,15 +280,44 @@ private struct ServerSelectionView: View {
 
 private struct UnconfiguredServerTabView: View {
     let showServers: () -> Void
+#if os(macOS)
+    @State private var selectedDestination: MacSidebarDestination = .container(.allDevices)
+#endif
 
     var body: some View {
+#if os(macOS)
+        NavigationSplitView {
+            List(selection: Binding<MacSidebarDestination?>(
+                get: { selectedDestination },
+                set: { if let destination = $0 { selectedDestination = destination } }
+            )) {
+                Label("All Devices", systemImage: "square.grid.2x2")
+                    .tag(MacSidebarDestination.container(.allDevices))
+                Label("Cameras", systemImage: "video")
+                    .tag(MacSidebarDestination.cameras)
+                Label("Scenes", systemImage: "sparkles")
+                    .tag(MacSidebarDestination.scenes)
+                Label("Triggers", systemImage: "bolt")
+                    .tag(MacSidebarDestination.triggers)
+            }
+            .listStyle(.sidebar)
+            .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 300)
+        } detail: {
+            NavigationStack {
+                unavailableView
+                    .navigationTitle(selectedDestinationTitle)
+            }
+        }
+#else
         TabView {
             NavigationStack {
                 unavailableView
                     .navigationTitle("Home")
                     .toolbar {
+#if os(iOS)
+                        ToolbarItem(placement: .topBarTrailing) { HomeSettingsButton() }
+#endif
                         serverToolbar
-                        ToolbarItem(placement: .primaryAction) { HomeSettingsButton() }
                     }
             }
             .tabItem {
@@ -304,7 +342,19 @@ private struct UnconfiguredServerTabView: View {
                 Label("Triggers", systemImage: "bolt")
             }
         }
+#endif
     }
+
+#if os(macOS)
+    private var selectedDestinationTitle: String {
+        switch selectedDestination {
+        case .container(.allDevices): "All Devices"
+        case .scenes: "Scenes"
+        case .triggers: "Triggers"
+        default: "Cameras"
+        }
+    }
+#endif
 
     private var unavailableView: some View {
         ContentUnavailableView {
@@ -316,13 +366,8 @@ private struct UnconfiguredServerTabView: View {
         }
     }
 
-    @ToolbarContentBuilder
     private var serverToolbar: some ToolbarContent {
-        ToolbarItem(placement: .navigation) {
-            Button("Servers", systemImage: "list.bullet") {
-                showServers()
-            }
-        }
+        ServerToolbar(showServers: showServers)
     }
 }
 

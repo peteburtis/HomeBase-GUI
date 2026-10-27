@@ -115,6 +115,51 @@ final class S3CredentialSettingsModel: ObservableObject {
     }
 }
 
+#if os(macOS)
+struct MacSettingsRoot: View {
+    @EnvironmentObject private var serverStore: PairedServerStore
+
+    var body: some View {
+        Group {
+            if let server = serverStore.selectedServer {
+                MacServerSettingsView(server: server)
+                    .id(server.id)
+            } else {
+                S3CredentialSettingsView(destinations: [], serverName: nil)
+            }
+        }
+        .connectionStatusScopeDisabled()
+    }
+}
+
+private struct MacServerSettingsView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    let server: PairedServer
+    @StateObject private var connection: ServerConnectionModel
+
+    init(server: PairedServer) {
+        self.server = server
+        _connection = StateObject(wrappedValue: ServerConnectionModel(server: server))
+    }
+
+    var body: some View {
+        S3CredentialSettingsView(
+            destinations: S3CredentialSettingsModel.destinations(in: connection.topology.devices),
+            serverName: server.endpoint.host,
+            server: server, client: connection.client,
+            isConnected: connection.state == .connected && connection.route == .webSocket,
+            serverConnectionState: connection.state,
+            retryConnection: { Task { await connection.reactivate() } }
+        )
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await connection.reactivate()
+        }
+    }
+}
+#endif
+
+#if os(iOS)
 struct HomeSettingsButton: View {
     var destinations: [CameraS3Destination] = []
     var serverName: String? = nil
@@ -134,6 +179,7 @@ struct HomeSettingsButton: View {
             }
     }
 }
+#endif
 
 struct S3CredentialSettingsView: View {
     let destinations: [CameraS3Destination]
@@ -141,6 +187,8 @@ struct S3CredentialSettingsView: View {
     var server: PairedServer?
     var client: HomeBaseWebSocketClient?
     var isConnected: Bool
+    var serverConnectionState: ServerConnectionModel.State?
+    var retryConnection: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.cameraAccessSession) private var access
@@ -150,12 +198,15 @@ struct S3CredentialSettingsView: View {
     @State private var deletionTask: Task<Void, Never>?
 
     init(destinations: [CameraS3Destination], serverName: String?, model: S3CredentialSettingsModel? = nil,
-         server: PairedServer? = nil, client: HomeBaseWebSocketClient? = nil, isConnected: Bool = false) {
+         server: PairedServer? = nil, client: HomeBaseWebSocketClient? = nil, isConnected: Bool = false,
+         serverConnectionState: ServerConnectionModel.State? = nil, retryConnection: (() -> Void)? = nil) {
         self.destinations = destinations
         self.serverName = serverName
         self.server = server
         self.client = client
         self.isConnected = isConnected
+        self.serverConnectionState = serverConnectionState
+        self.retryConnection = retryConnection
         _model = StateObject(wrappedValue: model ?? S3CredentialSettingsModel())
     }
 
@@ -190,10 +241,21 @@ struct S3CredentialSettingsView: View {
                 }
                 Section {
                     if let serverName { LabeledContent("Selected server", value: serverName) }
+                    switch serverConnectionState {
+                    case .disconnected?, .connecting?:
+                        ProgressView("Loading server settings…")
+                    case .failed(let message)?:
+                        Text(message).foregroundStyle(.red)
+                        if let retryConnection { Button("Try Again", action: retryConnection) }
+                    case .connected?, nil:
+                        EmptyView()
+                    }
                     if destinations.isEmpty {
-                        Text(serverName == nil ? "Choose a server to see its S3 stores and policies."
-                             : "This server is not currently advertising any S3 recording stores.")
-                            .foregroundStyle(.secondary)
+                        if serverConnectionState == nil || serverConnectionState == .connected {
+                            Text(serverName == nil ? "Choose a server to see its S3 stores and policies."
+                                 : "This server is not currently advertising any S3 recording stores.")
+                                .foregroundStyle(.secondary)
+                        }
                     } else {
                         Text("Stores advertised by the selected server")
                             .foregroundStyle(.secondary)
@@ -211,10 +273,15 @@ struct S3CredentialSettingsView: View {
                     }
                 }
             }
+#if os(macOS)
+            .formStyle(.grouped)
+#endif
             .navigationTitle("Settings")
+#if os(iOS)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
+#endif
             .confirmationDialog("Delete saved S3 credentials?", isPresented: $confirmingDeletion,
                                 titleVisibility: .visible) {
                 Button("Delete Credentials", role: .destructive) {
@@ -235,7 +302,14 @@ struct S3CredentialSettingsView: View {
                 access?.credentialsDidChange(presence: .biometricProtected)
             }
         }
+#if os(macOS)
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await model.refresh()
+        }
+#else
         .task { await model.refresh() }
+#endif
         .onChange(of: scenePhase) { _, phase in
             if phase == .background { cancel() }
         }

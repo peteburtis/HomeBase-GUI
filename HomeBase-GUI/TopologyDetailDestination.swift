@@ -1,7 +1,7 @@
 import HomeBaseProtocol
 import SwiftUI
 
-/// Leaf selections update the detail column; containers stay in the sidebar stack.
+/// Leaf selections drive the detail column independently of container navigation.
 enum TopologyDetailDestination: Hashable {
     case device(String)
     case groupControls(String)

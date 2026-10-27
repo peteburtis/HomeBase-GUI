@@ -24,6 +24,22 @@ struct TopologyDetailView: View {
     @State private var hasFinishedAppearing = false
 
     init(
+        allDevicesIn topology: HBTopologyListResult,
+        client: HomeBaseWebSocketClient,
+        selection: Binding<TopologyDetailDestination?>
+    ) {
+        title = "All Devices"
+        emptyMessage = "No devices are available."
+        deviceItems = TopologyGroupPlacement(topology: topology).allDeviceItems
+        nestedGroups = []
+        self.topology = topology
+        self.client = client
+        controlDevice = nil
+        self.selection = selection
+        _controlModel = StateObject(wrappedValue: LiveDeviceControlsModel(device: nil, client: client))
+    }
+
+    init(
         room: HBTopologyRoomDescriptor,
         topology: HBTopologyListResult,
         client: HomeBaseWebSocketClient,
