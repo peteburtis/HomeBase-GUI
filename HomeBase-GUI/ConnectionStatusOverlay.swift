@@ -167,6 +167,13 @@ private struct ConnectionStatusHost: ViewModifier {
     private let gap: CGFloat = 12
 
     func body(content: Content) -> some View {
+#if os(macOS)
+        // The Mac sidebar owns the indicator. Keep status reporting available
+        // throughout the window without reserving space in its other columns.
+        content
+            .environment(\.connectionStatusController, controller)
+            .environment(\.connectionStatusBottomClearance, 0)
+#else
         content
             .environment(\.connectionStatusController, controller)
             .environment(\.connectionStatusBottomClearance,
@@ -193,6 +200,7 @@ private struct ConnectionStatusHost: ViewModifier {
                     }
                 }
             }
+#endif
     }
 
     private func bottomPadding(in bounds: CGRect) -> CGFloat {

@@ -2370,6 +2370,12 @@ private struct CameraFullScreenCameraContent: View {
                 viewerDismissalControls
             }
         }
+#elseif os(macOS)
+        if presentation.focusedSession != nil {
+            ToolbarItem(placement: .navigation) {
+                CameraPlayerCloseButton(returnsToCameras: true, action: closeViewer)
+            }
+        }
 #else
         ToolbarItem(placement: .navigation) {
             CameraPlayerCloseButton(returnsToCameras: presentation.focusedSession != nil, action: closeViewer)
@@ -2524,7 +2530,13 @@ private struct CameraFullScreenCameraContent: View {
         }
 #else
         if access.isUnlocked {
+#if os(macOS)
+            if presentation.focusedSession != nil {
+                ToolbarSpacer(.fixed, placement: .navigation)
+            }
+#else
             ToolbarSpacer(.fixed, placement: .navigation)
+#endif
             ToolbarItemGroup(placement: .navigation) {
                 backControl.disabled(!playbackActionsEnabled)
                 pauseControl

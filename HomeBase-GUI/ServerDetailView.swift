@@ -68,7 +68,9 @@ struct ServerDetailView: View {
         Group {
 #if os(macOS)
             MacServerNavigationView(
-                connection: connection, selection: $selectedDestination
+                connection: connection,
+                connectionStatusController: connectionStatusController,
+                selection: $selectedDestination
             ) {
                 if cameras.isEmpty {
                     ContentUnavailableView("No Cameras", systemImage: "video",

@@ -115,7 +115,7 @@ struct CameraPickerPopover: View {
     @ObservedObject var model: CameraPickerModel
     let selectedIDs: Set<String>
     let multiple: Bool
-    let toggleMultiple: (Bool) -> Void
+    let toggleMultiple: ((Bool) -> Void)?
     let canSelect: (CameraVideoDevice) -> Bool
     let select: (CameraVideoDevice) -> Void
 
@@ -158,10 +158,12 @@ struct CameraPickerPopover: View {
             }
             // A minimum makes the viewport grow when the async camera list arrives.
             .frame(minHeight: cameraListHeight, maxHeight: cameraListHeight)
-            HStack {
-                Spacer()
-                Toggle("Multiple", isOn: Binding(get: { multiple }, set: toggleMultiple))
-                    .toggleStyle(.button)
+            if let toggleMultiple {
+                HStack {
+                    Spacer()
+                    Toggle("Multiple", isOn: Binding(get: { multiple }, set: toggleMultiple))
+                        .toggleStyle(.button)
+                }
             }
         }
         .padding(20)

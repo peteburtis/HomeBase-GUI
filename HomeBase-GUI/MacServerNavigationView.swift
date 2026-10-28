@@ -10,6 +10,7 @@ enum MacSidebarDestination: Hashable {
 /// A shared sidebar with three columns for devices and two for feature pages.
 struct MacServerNavigationView<Cameras: View, Scenes: View, Triggers: View>: View {
     @ObservedObject var connection: ServerConnectionModel
+    let connectionStatusController: ConnectionStatusController
     @Binding var selection: MacSidebarDestination
     @ViewBuilder let cameras: () -> Cameras
     @ViewBuilder let scenes: () -> Scenes
@@ -67,6 +68,15 @@ struct MacServerNavigationView<Cameras: View, Scenes: View, Triggers: View>: Vie
     }
 
     private var sidebar: some View {
+        VStack(spacing: 0) {
+            sidebarList
+            SidebarConnectionStatus(controller: connectionStatusController)
+        }
+        .navigationTitle("Home")
+        .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 300)
+    }
+
+    private var sidebarList: some View {
         let placement = TopologyGroupPlacement(topology: topology)
         let rooms = topology.rooms.filter { !$0.metadata.hasHiddenFlag }
         let deviceGroups = placement.topLevelDeviceGroups.filter { !$0.metadata.hasHiddenFlag }
@@ -123,10 +133,7 @@ struct MacServerNavigationView<Cameras: View, Scenes: View, Triggers: View>: Vie
         }
         .listStyle(.sidebar)
         .accessibilityIdentifier("home.sidebar")
-        .navigationTitle("Home")
-        .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 300)
         .refreshable { await connection.refresh() }
-        .connectionStatusClearance()
     }
 
     private func reconcileSelection(in topology: HBTopologyListResult) {
@@ -143,6 +150,23 @@ struct MacServerNavigationView<Cameras: View, Scenes: View, Triggers: View>: Vie
         case .connected: "No rooms are configured."
         case .failed: "Rooms could not be loaded."
         case .disconnected, .connecting: "Rooms will appear after connecting."
+        }
+    }
+}
+
+private struct SidebarConnectionStatus: View {
+    @ObservedObject var controller: ConnectionStatusController
+
+    var body: some View {
+        if let presentation = controller.presentation {
+            ConnectionStatusOverlay(
+                presentation: presentation,
+                route: controller.route,
+                retry: controller.canRetry ? { controller.retry() } : nil
+            )
+            .accessibilityIdentifier("connection-status")
+            .padding(12)
+            .frame(maxWidth: .infinity)
         }
     }
 }

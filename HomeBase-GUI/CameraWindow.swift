@@ -28,6 +28,89 @@ struct CameraWindowRequest: Codable, Hashable {
 }
 
 #if os(macOS)
+/// A menu-created window has no scene value until its first camera is chosen.
+/// Discovery alone does not acquire camera access; the selected player owns
+/// that scope and uses the same authentication/recovery flow as the Cameras tab.
+struct CameraWindowScene: View {
+    @EnvironmentObject private var serverStore: PairedServerStore
+    @Binding var request: CameraWindowRequest?
+
+    var body: some View {
+        Group {
+            if let request {
+                CameraWindowRoot(request: request)
+            } else if let server = serverStore.selectedServer {
+                CameraWindowSelectionView(server: server) { camera in
+                    request = CameraWindowRequest(server: server, camera: camera)
+                }
+                .id(server.id)
+            } else {
+                ContentUnavailableView(
+                    "Please select a camera",
+                    systemImage: "video",
+                    description: Text("Select a server in the main window to choose a camera.")
+                )
+                .modifier(CameraWindowPlaceholderStyle())
+            }
+        }
+        .frame(minWidth: 640, minHeight: 420)
+    }
+}
+
+private struct CameraWindowSelectionView: View {
+    @StateObject private var connection: ServerConnectionModel
+    @StateObject private var picker: CameraPickerModel
+    @State private var showsPicker = false
+    let select: (CameraVideoDevice) -> Void
+
+    init(server: PairedServer, select: @escaping (CameraVideoDevice) -> Void) {
+        let connection = ServerConnectionModel(server: server)
+        _connection = StateObject(wrappedValue: connection)
+        _picker = StateObject(wrappedValue: CameraPickerModel { [client = connection.client] in
+            try await client.reactivate()
+            return try await client.listTopology().devices
+        })
+        self.select = select
+    }
+
+    var body: some View {
+        NavigationStack {
+            ContentUnavailableView {
+                Label("Please select a camera", systemImage: "video")
+            } actions: {
+                Button("Choose Camera") { showsPicker = true }
+            }
+            .modifier(CameraWindowPlaceholderStyle())
+            .navigationTitle("Camera")
+            .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button("Choose camera", systemImage: "video") { showsPicker = true }
+                        .popover(isPresented: $showsPicker) {
+                            CameraPickerPopover(
+                                model: picker, selectedIDs: [], multiple: false,
+                                toggleMultiple: nil, canSelect: { _ in true },
+                                select: { camera in
+                                    showsPicker = false
+                                    select(camera)
+                                }
+                            )
+                        }
+                }
+            }
+        }
+    }
+}
+
+private struct CameraWindowPlaceholderStyle: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .foregroundStyle(.white)
+            .background(Color.black.ignoresSafeArea())
+    }
+}
+
 struct CameraWindowRoot: View {
     @Environment(\.scenePhase) private var scenePhase
     let request: CameraWindowRequest

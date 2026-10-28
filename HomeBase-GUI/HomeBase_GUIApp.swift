@@ -59,11 +59,10 @@ struct HomeBase_GUIApp: App {
         .defaultSize(width: 520, height: 600)
 
         WindowGroup("Camera", for: CameraWindowRequest.self) { request in
-            if let request = request.wrappedValue {
-                CameraWindowRoot(request: request)
-                    .cameraAccessLifecycle(cameraAccess)
-                    .modifier(CameraSceneLifecycle(access: cameraAccess))
-            }
+            CameraWindowScene(request: request)
+                .environmentObject(serverStore)
+                .cameraAccessLifecycle(cameraAccess)
+                .modifier(CameraSceneLifecycle(access: cameraAccess))
         }
         .defaultSize(width: 960, height: 640)
         .windowResizability(.contentMinSize)
